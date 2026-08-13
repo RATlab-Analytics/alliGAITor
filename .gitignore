@@ -1,0 +1,27 @@
+# OS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# SLEAP projects and predictions
+*.slp
+/predictions/
+
+# Trained models (large binaries)
+/models/
+
+# Skeleton definitions
+skeleton.json
+minimal_skeleton.json
+
+# Raw and cropped training video data
+/training data/
+/Bottom-training-data/
+/bottom_training_data_cropped/
+/side-training-data/
+
+# One-off developer/debug scripts
+/tools/crop_tool_main.py
+/tools/make_video_split.py
