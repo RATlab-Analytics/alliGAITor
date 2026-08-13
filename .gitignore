@@ -25,3 +25,9 @@ minimal_skeleton.json
 # One-off developer/debug scripts
 /tools/crop_tool_main.py
 /tools/make_video_split.py
+
+# Pipeline outputs and raw calibration recordings (large; calibration.toml
+# itself is small and worth tracking once it exists)
+/predictions_3d/
+/calibration/*.mp4
+/calibration/*.mov
