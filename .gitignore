@@ -1,3 +1,5 @@
+.gitignore
+
 # OS
 .DS_Store
 
@@ -17,14 +19,12 @@ skeleton.json
 minimal_skeleton.json
 
 # Raw and cropped training video data
-/training data/
-/Bottom-training-data/
-/bottom_training_data_cropped/
-/side-training-data/
+/videos/
 
 # One-off developer/debug scripts
 /tools/crop_tool_main.py
 /tools/make_video_split.py
+/scripts
 
 # Pipeline outputs and raw calibration recordings (large; calibration.toml
 # itself is small and worth tracking once it exists)

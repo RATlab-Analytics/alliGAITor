@@ -3,6 +3,7 @@ sleap-io>=0.9.0
 numpy
 pandas
 PyYAML
+imageio-ffmpeg
 
 # Runs `sleap-nn predict` as a subprocess; install separately per
 # https://nn.sleap.ai for the correct PyTorch/accelerator build for this

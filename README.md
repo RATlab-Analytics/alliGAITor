@@ -16,7 +16,9 @@ The `alligaitor` package (`alligaitor/`) implements this pipeline; usage is belo
 pip install -r requirements.txt
 ```
 
-`sleap-nn` is intentionally not pinned in `requirements.txt` — install it separately with the PyTorch/accelerator build appropriate for this machine (see https://nn.sleap.ai).
+`sleap-nn` is intentionally not pinned in `requirements.txt` — install it separately with the PyTorch/accelerator build appropriate for this machine (see https://nn.sleap.ai). Inference also requires the `ffmpeg` binary on `PATH` (e.g. `brew install ffmpeg`); see the note in `requirements.txt`.
+
+Both models were trained on achromatic footage, so `alligaitor.inference.run_inference()` always re-encodes video to true grayscale content before prediction (`alligaitor/preprocessing.py`), independent of the channel count (`ensure_rgb`/`ensure_grayscale`) each model itself expects — see that module's docstring for why this can't be left to `sleap-nn`'s own flags.
 
 ## Configuration
 
