@@ -21,6 +21,9 @@ minimal_skeleton.json
 # Raw and cropped training video data
 /videos/
 
+# Run configs
+/configs/
+
 # One-off developer/debug scripts
 /tools/crop_tool_main.py
 /tools/make_video_split.py
