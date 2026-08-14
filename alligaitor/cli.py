@@ -1,4 +1,4 @@
- """Command-line entry point for the alliGAITor calibration and triangulation pipeline."""
+"""Command-line entry point for the alliGAITor calibration and triangulation pipeline."""
 
 from __future__ import annotations
 

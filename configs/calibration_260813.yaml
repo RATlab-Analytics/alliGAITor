@@ -6,14 +6,17 @@
 # -- swap them below if it turns out to matter for your session videos'
 # own left/right convention.
 #
-# Uses the H.264 "coded" re-encodes (calibration_video_260813-132431/coded/)
-# rather than the raw MJPEG captures: the raw files carry a capture-side bug
-# where each frame's PTS is stamped with wall-clock epoch time instead of a
-# relative timebase, which confuses players/tools and needs to be fixed at
-# the source (the v4l2 capture script) rather than worked around per file.
-# A true-lossless re-encode was tried and compared against these coded
-# files directly -- not enough of a quality difference over "coded" to be
-# worth the 1-1.5GB/camera file size for calibration purposes.
+# Uses a fresh H.264 re-encode of the raw MJPEG captures with an explicit
+# standard pix_fmt/color_range (coded_fixed/), not the original "coded/"
+# files: those turned out to be tagged pix_fmt=yuvj420p, color_range=pc
+# (full-range "JPEG" YUV) instead of the standard yuv420p/tv-range that
+# most H.264 decoders expect -- this is very likely why OpenCV/aniposelib
+# failed to open them ("Couldn't read video stream from file") even
+# though ffmpeg itself could. See the project chat history for the
+# full diagnosis, including the raw-file wall-clock-PTS timestamp bug
+# (fixed here too via -fflags +genpts) and why a true-lossless re-encode
+# was tried and rejected as not worth the file size over a normal CRF
+# encode for calibration purposes.
 #
 # Run with:
 #   python -m alligaitor.cli calibrate configs/calibration_260813.yaml
@@ -28,9 +31,9 @@ models:
 
 calibration:
   videos:
-    left: "../calibration_video_260813-132431/coded/calibration_cam0_coded.mp4"
-    right: "../calibration_video_260813-132431/coded/calibration_cam1_coded.mp4"
-    bottom: "../calibration_video_260813-132431/coded/calibration_cam2_coded.mp4"
+    left: "../videos/calibration_video_260813-132431/coded_fixed/calibration_cam0_fixed.mp4"
+    right: "../videos/calibration_video_260813-132431/coded_fixed/calibration_cam1_fixed.mp4"
+    bottom: "../videos/calibration_video_260813-132431/coded_fixed/calibration_cam2_fixed.mp4"
   output_path: "../calibration/calibration.toml"
 
 sessions: []
