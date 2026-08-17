@@ -29,6 +29,8 @@ minimal_skeleton.json
 /tools/make_video_split.py
 /scripts
 
+/_to_delete
+
 # Pipeline outputs and raw calibration recordings (large; calibration.toml
 # itself is small and worth tracking once it exists)
 /predictions_3d/

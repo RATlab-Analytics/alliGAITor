@@ -9,13 +9,13 @@ repo) or absolute paths.
 Examples:
 
     # Calibration-only config, no gait sessions yet.
-    python3 tools/calibration/make_config.py configs/calibration_260813.yaml \\
+    python3 tools/make_config.py configs/calibration_260813.yaml \\
         --calibration-left calibration_video_260813-132431/coded/calibration_cam0_coded.mp4 \\
         --calibration-right calibration_video_260813-132431/coded/calibration_cam1_coded.mp4 \\
         --calibration-bottom calibration_video_260813-132431/coded/calibration_cam2_coded.mp4
 
     # Same, plus one gait session.
-    python3 tools/calibration/make_config.py configs/my_config.yaml \\
+    python3 tools/make_config.py configs/my_config.yaml \\
         --calibration-left calib/left.mp4 --calibration-right calib/right.mp4 \\
         --calibration-bottom calib/bottom.mp4 \\
         --session 359a-BL side-training-data/359a-BL_cam0_coded.mp4 \\
