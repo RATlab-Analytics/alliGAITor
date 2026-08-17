@@ -10,6 +10,7 @@ import pandas as pd
 
 from alligaitor import calibration, inference, triangulation
 from alligaitor.config import CAMERA_ROLES, ModelConfig, PipelineConfig, SessionConfig
+from alligaitor.timing import video_fps
 from alligaitor.triangulation import Pose3D
 
 from aniposelib.cameras import CameraGroup
@@ -37,6 +38,7 @@ def run_session(
     session.output_dir.mkdir(parents=True, exist_ok=True)
 
     tracks = {}
+    fps_by_role = {}
     for role in CAMERA_ROLES:
         video_path = session.videos[role]
         model_dir = models.model_dir_for_role(role)
@@ -45,8 +47,9 @@ def run_session(
             video_path, model_dir, output_path=slp_path, device=device, tracking=tracking
         )
         tracks[role] = inference.load_predictions(slp_path)
+        fps_by_role[role] = video_fps(video_path)
 
-    pose_3d = triangulation.triangulate(tracks, cgroup)
+    pose_3d = triangulation.triangulate(tracks, cgroup, fps_by_role)
 
     csv_path = session.output_dir / f"{session.name}.pose_3d.csv"
     save_pose_3d_csv(pose_3d, csv_path)
