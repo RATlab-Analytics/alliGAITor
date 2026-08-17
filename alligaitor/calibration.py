@@ -48,19 +48,24 @@ BOARD_MARKER_LENGTH_MM = 11.0
 # A narrow alternative board geometry for the bottom camera's slit view,
 # sized from a measured ~0.7 px/mm scale at that camera's working distance
 # (derived from real detected marker corners against the above board's
-# known layout, 2026-08-17). Dropping from 8 squares across the board's
-# width to 3, at this 42mm square size, projects to ~23px per marker side
-# -- comfortably higher than the ~8px markers the 8-wide board produces
+# known layout, 2026-08-17). At this 35mm square size, markers project to
+# ~19px per side -- well above the ~8px markers the 8-wide board produces
 # there, which are too small to decode regardless of lighting or contrast
 # (a DICT_4X4_50 marker encodes a 6x6 cell grid; at 8px total that is
-# under one pixel per cell). Sized to 126mm x 168mm total so the printed
-# backing fits a Bambu Lab A1 mini's 180mm x 180mm build plate. Confirm
-# 126mm still fits the slit width before printing. Requires printing a
-# new physical target -- does not apply to already-recorded footage.
-STRIP_BOARD_SQUARES_X = 3
-STRIP_BOARD_SQUARES_Y = 4
-STRIP_BOARD_SQUARE_LENGTH_MM = 42.0
-STRIP_BOARD_MARKER_LENGTH_MM = 30.8
+# under one pixel per cell). 4x5 squares gives (4-1)*(5-1) = 12 usable
+# ChArUco corners -- calibrate_rows() needs >=9 on a frame to initialize a
+# camera's intrinsics and >=8 to use a frame for pose/extrinsics (see
+# MIN_CORNERS_INTRINSIC below), so this has real margin above both
+# thresholds rather than sitting exactly on one. Sized to 140mm x 175mm so
+# the printed backing fits a Bambu Lab A1 mini's 180mm x 180mm build
+# plate; this is the largest square size that keeps that margin within a
+# single plate. Confirm 140mm still fits the slit width before printing.
+# Requires printing a new physical target -- does not apply to
+# already-recorded footage.
+STRIP_BOARD_SQUARES_X = 4
+STRIP_BOARD_SQUARES_Y = 5
+STRIP_BOARD_SQUARE_LENGTH_MM = 35.0
+STRIP_BOARD_MARKER_LENGTH_MM = 25.7
 
 # aniposelib's CharucoBoard already overrides ArUco's default
 # DetectorParameters with adaptiveThreshWinSizeMin/Max/Step tuned for
