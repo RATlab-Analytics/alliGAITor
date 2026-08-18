@@ -15,6 +15,9 @@ folder video_crop.py lives in).
 Message-passing contract: a multiprocessing.Queue of small plain-data
 tuples, and a stop_event (multiprocessing.Event) checked between videos
 for a clean "finish the current video, then stop" cancel.
+
+RATlab-NOR is MIT-licensed (Copyright (c) 2026 Mitchell Carson); see
+../THIRD_PARTY_NOTICES.md for the full license text.
 """
 
 from __future__ import annotations

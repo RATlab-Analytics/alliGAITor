@@ -69,10 +69,26 @@ class CalibrationConfig:
         videos: Mapping of camera role to calibration video path.
         output_path: Where the resulting camera calibration (aniposelib
             ``CameraGroup``, saved as TOML) is written or loaded from.
+        board_preset: Which physical ChArUco board this recording used —
+            a key into :data:`alligaitor.calibration.BOARD_PRESETS`
+            (currently ``"original"``, the 8x8/15mm board, or ``"strip"``,
+            the narrow 4x5/35mm board sized for the bottom camera's slit
+            view). Different recordings may use different physical
+            boards; this says which one to expect when detecting corners
+            for this particular calibration.
+        min_corners_extrinsic: Minimum ChArUco corners a frame needs to
+            link two cameras' poses during calibration (see
+            :data:`alligaitor.calibration.MIN_CORNERS_EXTRINSIC`). Defaults
+            to aniposelib's own hardcoded value, 8; lower it for a
+            recording where the bottom camera's slit view can't reach 8
+            corners while a frame is simultaneously visible to a side
+            camera.
     """
 
     videos: Dict[str, Path]
     output_path: Path
+    board_preset: str = "original"
+    min_corners_extrinsic: int = 8
 
     def __post_init__(self) -> None:
         _require_roles(self.videos, "Calibration config")
@@ -128,6 +144,8 @@ class PipelineConfig:
         calibration = CalibrationConfig(
             videos={role: _resolve(base_dir, p) for role, p in calib_raw["videos"].items()},
             output_path=_resolve(base_dir, calib_raw["output_path"]),
+            board_preset=calib_raw.get("board_preset", "original"),
+            min_corners_extrinsic=calib_raw.get("min_corners_extrinsic", 8),
         )
 
         sessions = [

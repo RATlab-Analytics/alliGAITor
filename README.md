@@ -55,3 +55,7 @@ Copyright (C) 2026 Mitchell Carson
 
     You should have received a copy of the GNU General Public License
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+Portions of this codebase are adapted from permissively-licensed
+third-party projects; see `THIRD_PARTY_NOTICES.md` for attribution and
+the relevant license texts.

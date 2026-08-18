@@ -12,8 +12,9 @@ from pathlib import Path
 from typing import List
 
 import cv2
-from aniposelib.boards import CharucoBoard, get_video_params
+from aniposelib.boards import CharucoBoard, extract_points, extract_rtvecs, get_video_params, merge_rows
 from aniposelib.cameras import CameraGroup
+from aniposelib.utils import get_connections, get_initial_extrinsics
 
 from alligaitor.config import CAMERA_ROLES, CalibrationConfig
 from alligaitor.timing import shared_frame_key, video_fps
@@ -30,6 +31,23 @@ CALIBRATION_GRID_FPS = 10.0
 # min_corners_intrinsic, duplicated here to check it up front with a clear
 # error message instead of letting calibrate_rows fail on an empty zip.
 MIN_CORNERS_INTRINSIC = 9
+
+# aniposelib.cameras.CameraGroup.calibrate_rows hardcodes 8 as the minimum
+# ChArUco corners a frame needs to link two cameras' poses in the initial
+# calibration graph (and to contribute a point to bundle adjustment) --
+# this is not exposed as a parameter. calibrate() below reimplements that
+# method with this made configurable (see _calibrate_rows), since the
+# bottom camera's slit view can force a tradeoff between corner count and
+# staying in a side camera's field of view: on some recordings, no frame
+# reaches 8 corners on the bottom camera while also being visible to a
+# side camera at all. 4 is the practical floor (cv2.aruco's ChArUco pose
+# estimation needs at least 4 corners to solve for a pose); only lower a
+# given recording's CalibrationConfig.min_corners_extrinsic toward that
+# floor after confirming the recording has no frames clearing 8, since
+# lower corner counts give a noisier initial pose estimate for that frame
+# (bundle adjustment still refines it afterward, but a bad initial
+# extrinsics guess can still leave it in a bad local optimum).
+MIN_CORNERS_EXTRINSIC = 8
 
 # Board geometry, inferred from the printed board's filename
 # (calib.io_CHARUCO_200x150_8x8_15_11_DICT_4X4.pdf): an 8x8-square ChArUco
@@ -66,6 +84,20 @@ STRIP_BOARD_SQUARES_X = 4
 STRIP_BOARD_SQUARES_Y = 5
 STRIP_BOARD_SQUARE_LENGTH_MM = 35.0
 STRIP_BOARD_MARKER_LENGTH_MM = 25.7
+
+# Named board geometries, keyed by the ``board_preset`` a
+# CalibrationConfig can specify -- different recordings may have used
+# different physical printed boards. Each value is
+# (squares_x, squares_y, square_length_mm, marker_length_mm).
+BOARD_PRESETS = {
+    "original": (BOARD_SQUARES_X, BOARD_SQUARES_Y, BOARD_SQUARE_LENGTH_MM, BOARD_MARKER_LENGTH_MM),
+    "strip": (
+        STRIP_BOARD_SQUARES_X,
+        STRIP_BOARD_SQUARES_Y,
+        STRIP_BOARD_SQUARE_LENGTH_MM,
+        STRIP_BOARD_MARKER_LENGTH_MM,
+    ),
+}
 
 # aniposelib's CharucoBoard already overrides ArUco's default
 # DetectorParameters with adaptiveThreshWinSizeMin/Max/Step tuned for
@@ -155,6 +187,50 @@ def build_board(
     return board
 
 
+# Whether relax_for_small_markers should default on for each preset. The
+# BOTTOM_CAMERA_* relaxed detector parameters (in particular
+# minMarkerPerimeterRate=0.01, versus ArUco's own default of ~0.03) were
+# tuned for the original board's ~5-9px markers at the bottom camera's
+# working distance. Applied to the much larger "strip" board's markers
+# (~20px+), that low a perimeter floor does not improve detection -- it
+# was verified to make ArUco consider a much larger set of small, mostly
+# spurious low-detail contours as marker candidates across the whole
+# frame, which measured at ~4s/frame (worst case observed: hangs a full
+# calibration run) versus ~0.02s/frame with stock parameters on the same
+# footage, for no corner-count benefit (stock parameters found frames
+# with the board's full 12 corners on the same recording).
+PRESET_DEFAULT_RELAX_FOR_SMALL_MARKERS = {
+    "original": True,
+    "strip": False,
+}
+
+
+def build_board_for_preset(preset: str, relax_for_small_markers: bool | None = None) -> CharucoBoard:
+    """Construct the ChArUco board for a named geometry in :data:`BOARD_PRESETS`.
+
+    Args:
+        preset: Key into :data:`BOARD_PRESETS`.
+        relax_for_small_markers: Passed through to :func:`build_board`.
+            Defaults to this preset's entry in
+            :data:`PRESET_DEFAULT_RELAX_FOR_SMALL_MARKERS` when left as
+            ``None`` -- only the original board's markers are small enough
+            to need it, and applying it unnecessarily is not just wasted
+            effort but pathologically slow (see that dict's docstring).
+    """
+    if preset not in BOARD_PRESETS:
+        raise ValueError(f"Unknown board preset '{preset}'; expected one of {sorted(BOARD_PRESETS)}")
+    if relax_for_small_markers is None:
+        relax_for_small_markers = PRESET_DEFAULT_RELAX_FOR_SMALL_MARKERS[preset]
+    squares_x, squares_y, square_length_mm, marker_length_mm = BOARD_PRESETS[preset]
+    return build_board(
+        relax_for_small_markers=relax_for_small_markers,
+        squares_x=squares_x,
+        squares_y=squares_y,
+        square_length_mm=square_length_mm,
+        marker_length_mm=marker_length_mm,
+    )
+
+
 def _detect_video_by_time(
     board: CharucoBoard, video_path: Path, fps: float, grid_fps: float, skip: int = 1
 ) -> List[dict]:
@@ -191,7 +267,15 @@ def _detect_video_by_time(
         if not ret:
             break
         if frame_idx % skip == 0:
-            corners, ids = board.detect_image(frame)
+            try:
+                corners, ids = board.detect_image(frame)
+            except cv2.error:
+                # OpenCV's CharucoDetector.detectBoard() can throw
+                # (rather than return an empty result) on some frames --
+                # observed on the larger-marker "strip" board geometry,
+                # not just fail to find a board. Treat it as a miss on
+                # this frame rather than aborting the whole scan.
+                corners = ids = None
             if corners is not None and len(corners) > 0:
                 key = shared_frame_key(frame_idx, fps, grid_fps)
                 rows.append({"framenum": key, "corners": corners, "ids": ids})
@@ -199,6 +283,49 @@ def _detect_video_by_time(
     cap.release()
 
     return board.fill_points_rows(rows)
+
+
+def _calibrate_rows(
+    cgroup: CameraGroup,
+    all_rows: List[List[dict]],
+    board: CharucoBoard,
+    min_corners_intrinsic: int = MIN_CORNERS_INTRINSIC,
+    min_corners_extrinsic: int = MIN_CORNERS_EXTRINSIC,
+    verbose: bool = True,
+    **kwargs,
+) -> float:
+    """Equivalent to :meth:`CameraGroup.calibrate_rows`, with a configurable
+    extrinsics corner-count threshold (see :data:`MIN_CORNERS_EXTRINSIC`).
+
+    Adapted from ``aniposelib.cameras.CameraGroup.calibrate_rows``
+    (BSD 2-Clause License, Copyright (c) 2019-2023 Lili Karashchuk); see
+    ``THIRD_PARTY_NOTICES.md`` for the full license text.
+    """
+    for rows, camera in zip(all_rows, cgroup.cameras):
+        size = camera.get_size()
+        assert size is not None, f"Camera with name {camera.get_name()} has no specified frame size"
+        objp, imgp = board.get_all_calibration_points(rows)
+        mixed = [(o, i) for (o, i) in zip(objp, imgp) if len(o) >= min_corners_intrinsic]
+        objp, imgp = zip(*mixed)
+        matrix = cv2.initCameraMatrix2D(objp, imgp, tuple(size))
+        camera.set_camera_matrix(matrix.copy())
+        camera.zero_distortions()
+
+    for i, (row, cam) in enumerate(zip(all_rows, cgroup.cameras)):
+        all_rows[i] = board.estimate_pose_rows(cam, row)
+
+    new_rows = [[r for r in rows if r["ids"].size >= min_corners_extrinsic] for rows in all_rows]
+    merged = merge_rows(new_rows)
+    imgp, extra = extract_points(merged, board, min_cameras=2)
+
+    rtvecs = extract_rtvecs(merged)
+    if verbose:
+        print(get_connections(rtvecs, cgroup.get_names()))
+    rvecs, tvecs = get_initial_extrinsics(rtvecs, cgroup.get_names())
+    cgroup.set_rotations(rvecs)
+    cgroup.set_translations(tvecs)
+
+    return cgroup.bundle_adjust_iter(imgp, extra, verbose=verbose, **kwargs)
 
 
 def calibrate(
@@ -215,9 +342,13 @@ def calibrate(
     :mod:`alligaitor.timing`.
 
     Args:
-        config: Calibration video paths and the output path for the saved
-            calibration.
-        board: ChArUco board definition. Defaults to :func:`build_board`.
+        config: Calibration video paths, output path, which physical board
+            (``config.board_preset``) this recording used, and the
+            extrinsics corner-count floor (``config.min_corners_extrinsic``)
+            for this recording.
+        board: ChArUco board definition. Defaults to
+            ``build_board_for_preset(config.board_preset)``; pass this
+            explicitly to override the config's preset.
         grid_fps: Shared time-bucket rate used to match detections across
             cameras. Defaults to :data:`CALIBRATION_GRID_FPS`.
         skip: Process every ``skip``-th frame of each video.
@@ -227,7 +358,7 @@ def calibrate(
         saved to ``config.output_path``.
     """
     if board is None:
-        board = build_board()
+        board = build_board_for_preset(config.board_preset)
 
     cgroup = CameraGroup.from_names(list(CAMERA_ROLES))
 
@@ -247,7 +378,9 @@ def calibrate(
                 "calibration. Check board visibility and framing for this camera."
             )
 
-    error = cgroup.calibrate_rows(all_rows, board)
+    error = _calibrate_rows(
+        cgroup, all_rows, board, min_corners_extrinsic=config.min_corners_extrinsic
+    )
     print(f"Calibration complete. Mean reprojection error: {error:.4f} px")
 
     config.output_path.parent.mkdir(parents=True, exist_ok=True)
