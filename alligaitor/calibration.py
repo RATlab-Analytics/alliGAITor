@@ -12,7 +12,7 @@ calibration if a camera is repositioned.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Tuple, Union
+from typing import List, Union
 
 import cv2
 import numpy as np
@@ -54,22 +54,28 @@ MIN_CORNERS_INTRINSIC = 9
 
 # aniposelib hardcodes 8 as the minimum ChArUco corners a frame needs to
 # be considered for linking two cameras' poses in the initial calibration
-# graph (CameraGroup.calibrate_rows), AND separately hardcodes 7 as the
-# minimum inside CharucoBoard.estimate_pose_points -- below that, pose
-# estimation for that frame silently returns (None, None) regardless of
-# how many corners were actually detected. Neither is exposed as a
-# parameter. calibrate() below reimplements both call sites with this made
-# configurable (see _calibrate_rows and _estimate_pose_points), since the
-# bottom camera's slit view can force a tradeoff between corner count and
-# staying in a side camera's field of view: on some recordings, no frame
-# reaches 7-8 corners on the bottom camera while also being visible to a
-# side camera at all. 4 is the practical floor (cv2.solvePnP needs at
-# least 4 point correspondences); only lower a given recording's
-# CalibrationConfig.min_corners_extrinsic toward that floor after
-# confirming the recording has no frames clearing 8, since lower corner
-# counts give a noisier initial pose estimate for that frame (bundle
-# adjustment still refines it afterward, but a bad initial extrinsics
-# guess can still leave it in a bad local optimum).
+# graph (CameraGroup.calibrate_rows), and separately hardcodes 7 as the
+# minimum inside CharucoBoard.estimate_pose_points. This was previously
+# made configurable end to end for ChArUco recordings too, to trade corner
+# count against the bottom camera's slit-limited field of view -- but
+# lowering it there fed bundle adjustment noisier initial poses than just
+# accepting fewer usable frames, producing a worse calibration overall,
+# so ChArUco recordings (CalibrationConfig.calibration_standard ==
+# "charuco") now call aniposelib's own CameraGroup.calibrate_rows
+# directly and always use its hardcoded 7/8 floors.
+#
+# The AprilTag board (calibration_standard == "apriltag") is the actual
+# fix for the bottom camera's slit view (see AprilGridBoard's docstring),
+# and still needs this floor configurable -- not to push it below 8, but
+# because a raw id count means a different number of points for a bare
+# marker grid than for ChArUco (one AprilTag id is one marker, 4 points;
+# one ChArUco id is one interpolated corner, 1 point). It's stored on the
+# AprilGridBoard instance itself as min_points_extrinsic (see build_board_for_preset
+# and AprilGridBoard.estimate_pose_points) rather than passed down through
+# calibrate(), since aniposelib's own CalibrationObject.estimate_pose_rows()
+# calls board.estimate_pose_points(camera, corners, ids) with no way to
+# pass extra arguments through. 4 is the practical floor (cv2.solvePnP
+# needs at least 4 point correspondences).
 MIN_CORNERS_EXTRINSIC = 8
 
 # Board geometry, inferred from the printed board's filename
@@ -312,21 +318,30 @@ def build_apriltag_board(
     marker_length_mm: float = APRILTAG_MARKER_LENGTH_MM,
     marker_separation_mm: float = APRILTAG_MARKER_SEPARATION_MM,
     aruco_dict: int = APRILTAG_DICTIONARY,
+    min_points_extrinsic: int = MIN_CORNERS_EXTRINSIC,
 ) -> "AprilGridBoard":
     """Construct the flat AprilTag marker-grid board (see
     :data:`APRILTAG_MARKERS_X` and neighbors for the rationale behind the
-    default geometry)."""
+    default geometry).
+
+    Args:
+        min_points_extrinsic: Passed through to :class:`AprilGridBoard`;
+            see its docstring.
+    """
     return AprilGridBoard(
         markers_x=markers_x,
         markers_y=markers_y,
         marker_length=marker_length_mm,
         marker_separation=marker_separation_mm,
         aruco_dict=aruco_dict,
+        min_points_extrinsic=min_points_extrinsic,
     )
 
 
 def build_board_for_preset(
-    preset: str, relax_for_small_markers: bool | None = None
+    preset: str,
+    relax_for_small_markers: bool | None = None,
+    min_corners_extrinsic: int = MIN_CORNERS_EXTRINSIC,
 ) -> Union[CharucoBoard, "AprilGridBoard"]:
     """Construct the calibration board for a named geometry.
 
@@ -341,9 +356,13 @@ def build_board_for_preset(
             small enough to need it, and applying it unnecessarily is not
             just wasted effort but pathologically slow (see that dict's
             docstring).
+        min_corners_extrinsic: Passed through to :func:`build_apriltag_board`
+            as ``min_points_extrinsic`` for ``"apriltag"``; ignored for
+            ChArUco presets, which use aniposelib's own hardcoded floor
+            instead (see :func:`calibrate`).
     """
     if preset == "apriltag":
-        return build_apriltag_board()
+        return build_apriltag_board(min_points_extrinsic=min_corners_extrinsic)
     if preset not in BOARD_PRESETS:
         raise ValueError(
             f"Unknown board preset '{preset}'; expected 'apriltag' or one of {sorted(BOARD_PRESETS)}"
@@ -392,12 +411,21 @@ class AprilGridBoard(CalibrationObject):
         marker_separation: float,
         aruco_dict: int = APRILTAG_DICTIONARY,
         manually_verify: bool = False,
+        min_points_extrinsic: int = MIN_CORNERS_EXTRINSIC,
     ):
         self.markers_x = markers_x
         self.markers_y = markers_y
         self.marker_length = marker_length
         self.marker_separation = marker_separation
         self.manually_verify = manually_verify
+        # Minimum matched points estimate_pose_points() requires before
+        # attempting solvePnP -- see that method and MIN_CORNERS_EXTRINSIC.
+        # Stored on the board (rather than threaded through as a call
+        # argument) because aniposelib's own CalibrationObject.estimate_pose_rows()
+        # calls self.estimate_pose_points(camera, corners, ids) with no way
+        # to pass extra arguments through, and calibrate() below calls
+        # that unmodified inherited method directly.
+        self.min_points_extrinsic = min_points_extrinsic
 
         self.dictionary = cv2.aruco.getPredefinedDictionary(aruco_dict)
         self.board = cv2.aruco.GridBoard(
@@ -491,15 +519,25 @@ class AprilGridBoard(CalibrationObject):
                 return False
 
     def estimate_pose_points(self, camera, corners, ids):
-        """Generic base-class-satisfying implementation (not used by this
-        module's own calibration path, which calls :func:`_match_points` /
-        :func:`_estimate_pose_points` directly so the minimum-point floor
-        stays configurable end to end -- see :data:`MIN_CORNERS_EXTRINSIC`).
+        """Satisfies :meth:`CalibrationObject.estimate_pose_points`. Called
+        by aniposelib's own (unmodified) ``CalibrationObject.estimate_pose_rows()``
+        during calibration -- see :func:`_calibrate_rows`.
+
+        ``self.board.matchImagePoints()`` (OpenCV's ``cv2.aruco.Board``
+        method) resolves detected marker corners/ids to this board's fixed
+        object-point layout; this is the same correspondence lookup a
+        ChArUco board's own ``matchImagePoints()`` would do, just against a
+        marker grid instead of interpolated checkerboard corners. Requires
+        ``self.min_points_extrinsic`` matched points (4 is the practical
+        floor -- ``solvePnP`` needs at least 4 point correspondences) rather
+        than a fixed number, since a good calibration wants a much higher
+        bar than the bare minimum where the data supports it; see
+        :data:`MIN_CORNERS_EXTRINSIC`.
         """
         if corners is None or ids is None or len(corners) == 0:
             return None, None
         obj_points, img_points = self.board.matchImagePoints(corners, ids)
-        if obj_points is None or len(obj_points) < 4:
+        if obj_points is None or len(obj_points) < self.min_points_extrinsic:
             return None, None
         K = camera.get_camera_matrix()
         D = camera.get_distortions()
@@ -563,88 +601,6 @@ def _detect_video_by_time(
     return board.fill_points_rows(rows)
 
 
-def _match_points(board: CalibrationObject, corners, ids) -> Tuple[np.ndarray | None, np.ndarray | None]:
-    """Match detected corners/markers to a board's fixed object-point
-    layout, via OpenCV's own ``Board.matchImagePoints()`` -- exposed
-    identically on the ``cv2.aruco.CharucoBoard`` and ``cv2.aruco.GridBoard``
-    instances underlying, respectively, aniposelib's ``CharucoBoard`` and
-    this module's :class:`AprilGridBoard` (both store it as ``board.board``).
-    This is what lets both board types share one pose-estimation/
-    point-counting code path below, rather than needing board-type-specific
-    correspondence lookup logic (as aniposelib's own
-    ``CharucoBoard.estimate_pose_points`` has, via ``getChessboardCorners()``
-    -- verified numerically equivalent to that manual lookup for ChArUco,
-    2026-08-18).
-
-    Returns ``(obj_points, img_points)`` as ``(N, 3)``/``(N, 2)`` float32
-    arrays, or ``(None, None)`` if there is nothing to match.
-    """
-    if corners is None or ids is None or len(corners) == 0 or len(ids) == 0:
-        return None, None
-    obj_points, img_points = board.board.matchImagePoints(corners, ids)
-    if obj_points is None or len(obj_points) == 0:
-        return None, None
-    return obj_points.reshape(-1, 3).astype(np.float32), img_points.reshape(-1, 2).astype(np.float32)
-
-
-def _n_matched_points(board: CalibrationObject, row: dict) -> int:
-    """Number of points :func:`_match_points` can actually resolve for one
-    detection row -- the board-agnostic point count. Needed because raw
-    ``row["ids"].size`` means different things per board type: for ChArUco,
-    one id is one interpolated corner (one point); for :class:`AprilGridBoard`,
-    one id is one decoded marker (4 points). Using the raw id count as a
-    stand-in for point count -- as aniposelib itself does -- silently
-    undercounts AprilGridBoard detections by ~4x, making
-    ``min_corners_intrinsic``/``min_corners_extrinsic`` mean a different
-    number of points depending on which board a recording used.
-    """
-    obj_points, _ = _match_points(board, row["corners"], row["ids"])
-    return 0 if obj_points is None else len(obj_points)
-
-
-def _estimate_pose_points(camera, corners, ids, board: CalibrationObject, min_points: int):
-    """Board-agnostic equivalent of ``CharucoBoard.estimate_pose_points``,
-    via :func:`_match_points`, with the minimum *point* count (not corner-id
-    count -- see :func:`_n_matched_points`) needed to attempt a pose solve
-    made configurable (hardcoded to 7 corners upstream; see
-    :data:`MIN_CORNERS_EXTRINSIC`).
-
-    Loosely adapted from ``aniposelib.boards.CharucoBoard.estimate_pose_points``
-    (BSD 2-Clause License, Copyright (c) 2019-2023 Lili Karashchuk) --
-    the corner-count floor and ``solvePnP`` call are the same shape, but the
-    correspondence lookup itself is now ``_match_points()`` rather than a
-    port of that method's manual ``getChessboardCorners()`` loop; see
-    ``THIRD_PARTY_NOTICES.md`` for the full license text.
-    """
-    obj_points, img_points = _match_points(board, corners, ids)
-    if obj_points is None or len(obj_points) < min_points:
-        return None, None
-
-    K = camera.get_camera_matrix()
-    D = camera.get_distortions()
-    ret, rvec, tvec = cv2.solvePnP(obj_points, img_points, K, D)
-    if ret:
-        return rvec, tvec
-    return None, None
-
-
-def _estimate_pose_rows(camera, rows: List[dict], board: CalibrationObject, min_points: int) -> List[dict]:
-    """Equivalent to :meth:`CharucoBoard.estimate_pose_rows`, calling
-    :func:`_estimate_pose_points` instead of the board's own method so the
-    minimum-point floor is configurable end to end. Also stashes each row's
-    board-agnostic matched-point count (see :func:`_n_matched_points`) as
-    ``row["n_points"]``, since it needs the same ``_match_points()`` result
-    used here -- callers that need to filter rows by point count (e.g.
-    :func:`_calibrate_rows`) should use that instead of ``row["ids"].size``.
-    """
-    for row in rows:
-        rvec, tvec = _estimate_pose_points(camera, row["corners"], row["ids"], board, min_points)
-        row["rvec"] = rvec
-        row["tvec"] = tvec
-        row["n_points"] = _n_matched_points(board, row)
-    return rows
-
-
 def _mean_transform_robust(M_list, approx=None, error: float = 0.5):
     """Equivalent to ``aniposelib.utils.mean_transform_robust``, except it
     falls back to the un-filtered mean instead of crashing when every
@@ -656,7 +612,8 @@ def _mean_transform_robust(M_list, approx=None, error: float = 0.5):
     calls ``mean_transform(M_list_robust)`` unconditionally;
     ``mean_transform([])`` crashes deep inside ``cv2.Rodrigues`` with a
     confusing, unrelated-looking shape error instead of an empty-input
-    error, which is what actually surfaced this.
+    error, which is what actually surfaced this. Used only for the
+    ``"apriltag"`` calibration standard (see :func:`_calibrate_rows`).
 
     Adapted from ``aniposelib.utils.mean_transform_robust`` (BSD 2-Clause
     License, Copyright (c) 2019-2023 Lili Karashchuk); see
@@ -728,12 +685,31 @@ def _calibrate_rows(
     all_rows: List[List[dict]],
     board: CalibrationObject,
     min_corners_intrinsic: int = MIN_CORNERS_INTRINSIC,
-    min_corners_extrinsic: int = MIN_CORNERS_EXTRINSIC,
     verbose: bool = True,
     **kwargs,
 ) -> float:
-    """Equivalent to :meth:`CameraGroup.calibrate_rows`, with a configurable
-    extrinsics corner-count threshold (see :data:`MIN_CORNERS_EXTRINSIC`).
+    """Equivalent to :meth:`CameraGroup.calibrate_rows`, except the
+    extrinsics-linking row filter checks whether pose estimation actually
+    succeeded (``row["rvec"] is not None``) instead of upstream's
+    ``row["ids"].size >= 8``.
+
+    Used only for the ``"apriltag"`` calibration standard
+    (:data:`CalibrationConfig.calibration_standard`). Needed because
+    upstream's filter counts raw ArUco ids, which for :class:`AprilGridBoard`
+    means markers (4 points each), not points -- undercounting by ~4x
+    relative to what "8" is meant to represent, with no parameter to
+    override it. :meth:`AprilGridBoard.estimate_pose_points` already
+    enforces its own configurable point-count floor
+    (``board.min_points_extrinsic``, see :data:`MIN_CORNERS_EXTRINSIC`)
+    before returning a pose, so filtering on a successful pose applies
+    that same floor correctly -- everything else here (bundle adjustment,
+    row merging, point extraction, ``estimate_pose_rows`` itself) calls
+    straight into aniposelib, unmodified. ChArUco recordings call
+    :meth:`CameraGroup.calibrate_rows` itself instead of this function --
+    reusing this row-filter fix there too, by making the corner-count
+    floor configurable, was found to feed bundle adjustment noisier
+    initial poses and produce a worse calibration than just accepting
+    aniposelib's stock 7/8 floors.
 
     Adapted from ``aniposelib.cameras.CameraGroup.calibrate_rows``
     (BSD 2-Clause License, Copyright (c) 2019-2023 Lili Karashchuk); see
@@ -742,20 +718,15 @@ def _calibrate_rows(
     for rows, camera in zip(all_rows, cgroup.cameras):
         size = camera.get_size()
         assert size is not None, f"Camera with name {camera.get_name()} has no specified frame size"
-        objp, imgp = board.get_all_calibration_points(rows)
-        mixed = [(o, i) for (o, i) in zip(objp, imgp) if len(o) >= min_corners_intrinsic]
-        objp, imgp = zip(*mixed)
+        objp, imgp = board.get_all_calibration_points(rows, min_points=min_corners_intrinsic)
         matrix = cv2.initCameraMatrix2D(objp, imgp, tuple(size))
         camera.set_camera_matrix(matrix.copy())
         camera.zero_distortions()
 
-    for i, (row, cam) in enumerate(zip(all_rows, cgroup.cameras)):
-        all_rows[i] = _estimate_pose_rows(cam, row, board, min_corners_extrinsic)
+    for i, (rows, cam) in enumerate(zip(all_rows, cgroup.cameras)):
+        all_rows[i] = board.estimate_pose_rows(cam, rows)
 
-    # Point count (see _n_matched_points), not raw id count -- for
-    # AprilGridBoard, one id is one marker (4 points), so id count alone
-    # would silently undercount by ~4x here.
-    new_rows = [[r for r in rows if r["n_points"] >= min_corners_extrinsic] for rows in all_rows]
+    new_rows = [[r for r in rows if r["rvec"] is not None] for rows in all_rows]
     merged = merge_rows(new_rows)
     imgp, extra = extract_points(merged, board, min_cameras=2)
 
@@ -784,13 +755,15 @@ def calibrate(
 
     Args:
         config: Calibration video paths, output path, which physical board
-            (``config.board_preset``) this recording used, and the
-            extrinsics corner-count floor (``config.min_corners_extrinsic``)
-            for this recording.
+            (``config.board_preset``) this recording used, which extrinsics
+            algorithm to run (``config.calibration_standard``, derived from
+            ``board_preset``), and the extrinsics point-count floor
+            (``config.min_corners_extrinsic``) used only for the
+            ``"apriltag"`` standard (see :class:`AprilGridBoard`).
         board: Calibration board definition (a ChArUco board or
             :class:`AprilGridBoard`). Defaults to
-            ``build_board_for_preset(config.board_preset)``; pass this
-            explicitly to override the config's preset.
+            ``build_board_for_preset(config.board_preset, min_corners_extrinsic=config.min_corners_extrinsic)``;
+            pass this explicitly to override the config's preset.
         grid_fps: Shared time-bucket rate used to match detections across
             cameras. Defaults to :data:`CALIBRATION_GRID_FPS`.
         skip: Process every ``skip``-th frame of each video.
@@ -800,7 +773,9 @@ def calibrate(
         saved to ``config.output_path``.
     """
     if board is None:
-        board = build_board_for_preset(config.board_preset)
+        board = build_board_for_preset(
+            config.board_preset, min_corners_extrinsic=config.min_corners_extrinsic
+        )
 
     cgroup = CameraGroup.from_names(list(CAMERA_ROLES))
 
@@ -813,18 +788,25 @@ def calibrate(
         all_rows.append(_detect_video_by_time(board, video_path, fps, grid_fps, skip=skip))
 
     for role, rows in zip(CAMERA_ROLES, all_rows):
-        # Point count (see _n_matched_points), not raw id count -- see
-        # _calibrate_rows's new_rows filter for why.
-        if not any(_n_matched_points(board, row) >= MIN_CORNERS_INTRINSIC for row in rows):
+        # get_all_calibration_points() (aniposelib.boards.CalibrationObject,
+        # unmodified) counts actual filled points, not raw detected ids --
+        # correct for both board types, so no board-specific handling is
+        # needed here.
+        objp, _ = board.get_all_calibration_points(rows, min_points=MIN_CORNERS_INTRINSIC)
+        if not objp:
             raise ValueError(
                 f"No usable board detections for camera '{role}': no frame reached "
                 f"the {MIN_CORNERS_INTRINSIC}-point minimum needed for intrinsic "
                 "calibration. Check board visibility and framing for this camera."
             )
 
-    error = _calibrate_rows(
-        cgroup, all_rows, board, min_corners_extrinsic=config.min_corners_extrinsic
-    )
+    if config.calibration_standard == "apriltag":
+        # AprilGridBoard isn't a CharucoBoard, so it needs the row-filter
+        # fix in _calibrate_rows (see its docstring for why the same fix
+        # isn't also applied to ChArUco).
+        error = _calibrate_rows(cgroup, all_rows, board)
+    else:
+        error = cgroup.calibrate_rows(all_rows, board, min_corners_intrinsic=MIN_CORNERS_INTRINSIC)
     print(f"Calibration complete. Mean reprojection error: {error:.4f} px")
 
     config.output_path.parent.mkdir(parents=True, exist_ok=True)

@@ -78,14 +78,15 @@ class CalibrationConfig:
             ``"apriltag"`` for the bottom camera's 45-degree slit view).
             Different recordings may use different physical boards; this
             says which one to expect when detecting corners/markers for
-            this particular calibration.
-        min_corners_extrinsic: Minimum ChArUco corners a frame needs to
+            this particular calibration. Also determines
+            :attr:`calibration_standard`.
+        min_corners_extrinsic: Minimum matched points a frame needs to
             link two cameras' poses during calibration (see
-            :data:`alligaitor.calibration.MIN_CORNERS_EXTRINSIC`). Defaults
-            to aniposelib's own hardcoded value, 8; lower it for a
-            recording where the bottom camera's slit view can't reach 8
-            corners while a frame is simultaneously visible to a side
-            camera.
+            :data:`alligaitor.calibration.MIN_CORNERS_EXTRINSIC`). Only
+            used when :attr:`calibration_standard` is ``"apriltag"`` —
+            ChArUco calibration always uses aniposelib's own hardcoded
+            floor (8) instead, since making it configurable there was
+            found to make calibration quality worse rather than better.
     """
 
     videos: Dict[str, Path]
@@ -95,6 +96,18 @@ class CalibrationConfig:
 
     def __post_init__(self) -> None:
         _require_roles(self.videos, "Calibration config")
+
+    @property
+    def calibration_standard(self) -> str:
+        """Which calibration algorithm
+        :func:`alligaitor.calibration.calibrate` should run for this
+        recording: ``"apriltag"`` for the ``"apriltag"`` board preset, or
+        ``"charuco"`` for every ChArUco board preset. Derived from
+        ``board_preset`` rather than stored separately, since the two
+        can't disagree — a recording's calibration algorithm is
+        determined by which physical board it used.
+        """
+        return "apriltag" if self.board_preset == "apriltag" else "charuco"
 
 
 @dataclass
