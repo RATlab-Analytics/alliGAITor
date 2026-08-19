@@ -11,6 +11,7 @@ calibration if a camera is repositioned.
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from typing import List, Union
 
@@ -35,6 +36,7 @@ from aniposelib.utils import (
     select_matrices,
 )
 from scipy.linalg import inv
+from tqdm import tqdm
 
 from alligaitor.config import CAMERA_ROLES, CalibrationConfig
 from alligaitor.timing import shared_frame_key, video_fps
@@ -548,7 +550,12 @@ class AprilGridBoard(CalibrationObject):
 
 
 def _detect_video_by_time(
-    board: CalibrationObject, video_path: Path, fps: float, grid_fps: float, skip: int = 1
+    board: CalibrationObject,
+    video_path: Path,
+    fps: float,
+    grid_fps: float,
+    skip: int = 1,
+    progress_desc: str | None = None,
 ) -> List[dict]:
     """Detect board corners/markers per frame, keyed by shared time bucket.
 
@@ -567,6 +574,8 @@ def _detect_video_by_time(
         grid_fps: Shared time-bucket rate (see
             :func:`alligaitor.timing.shared_frame_key`).
         skip: Process every ``skip``-th frame.
+        progress_desc: Label shown on the frames-processed progress bar
+            (e.g. the camera role); pass ``None`` to omit the bar.
 
     Returns:
         Detection rows in the format
@@ -576,26 +585,34 @@ def _detect_video_by_time(
     if not cap.isOpened():
         raise FileNotFoundError(f"Could not open video: {video_path}")
 
+    # Some containers report an inaccurate/zero frame count from metadata
+    # alone; fall back to an unbounded bar (still shows a live count and
+    # rate, just no percentage/ETA) rather than a misleading total.
+    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    total = n_frames if n_frames > 0 else None
+
     rows = []
     frame_idx = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if frame_idx % skip == 0:
-            try:
-                corners, ids = board.detect_image(frame)
-            except cv2.error:
-                # OpenCV's CharucoDetector.detectBoard() can throw
-                # (rather than return an empty result) on some frames --
-                # observed on the larger-marker "strip" board geometry,
-                # not just fail to find a board. Treat it as a miss on
-                # this frame rather than aborting the whole scan.
-                corners = ids = None
-            if corners is not None and len(corners) > 0:
-                key = shared_frame_key(frame_idx, fps, grid_fps)
-                rows.append({"framenum": key, "corners": corners, "ids": ids})
-        frame_idx += 1
+    with tqdm(total=total, desc=progress_desc, unit="frame", disable=progress_desc is None) as pbar:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_idx % skip == 0:
+                try:
+                    corners, ids = board.detect_image(frame)
+                except cv2.error:
+                    # OpenCV's CharucoDetector.detectBoard() can throw
+                    # (rather than return an empty result) on some frames --
+                    # observed on the larger-marker "strip" board geometry,
+                    # not just fail to find a board. Treat it as a miss on
+                    # this frame rather than aborting the whole scan.
+                    corners = ids = None
+                if corners is not None and len(corners) > 0:
+                    key = shared_frame_key(frame_idx, fps, grid_fps)
+                    rows.append({"framenum": key, "corners": corners, "ids": ids})
+            frame_idx += 1
+            pbar.update(1)
     cap.release()
 
     return board.fill_points_rows(rows)
@@ -785,7 +802,11 @@ def calibrate(
         params = get_video_params(str(video_path))
         camera.set_size((params["width"], params["height"]))
         fps = video_fps(video_path)
-        all_rows.append(_detect_video_by_time(board, video_path, fps, grid_fps, skip=skip))
+        all_rows.append(
+            _detect_video_by_time(
+                board, video_path, fps, grid_fps, skip=skip, progress_desc=f"{role} ({video_path.name})"
+            )
+        )
 
     for role, rows in zip(CAMERA_ROLES, all_rows):
         # get_all_calibration_points() (aniposelib.boards.CalibrationObject,
@@ -821,3 +842,63 @@ def load(config: CalibrationConfig) -> CameraGroup:
             f"No calibration found at {config.output_path}. Run calibration first."
         )
     return CameraGroup.load(str(config.output_path))
+
+
+def world_up_direction(cgroup: CameraGroup, side_roles: tuple = ("left", "right")) -> np.ndarray:
+    """Estimate true world "up" in a calibrated rig's 3D reference frame.
+
+    The reconstruction's coordinate frame is set by wherever the
+    calibration board happened to be held during calibration, which does
+    not track gravity -- the board is not guaranteed to sit flat on the
+    platform, or even to hold one consistent orientation across a whole
+    calibration recording. So no fixed coordinate axis (x/y/z) can be
+    assumed to point "up" in general.
+
+    The side cameras, however, are mounted level and looking roughly
+    horizontally across the platform, so each one's own image-vertical
+    axis reliably points along true world vertical regardless of board
+    orientation. In OpenCV's camera convention (x right, y down, z
+    forward, with world points transformed as ``x_cam = R @ x_world +
+    t``), "up" in a camera's own image is ``-y`` in its local frame; this
+    maps back into the world frame as ``R.T @ [0, -1, 0]``. Averaging
+    that estimate across every available side camera and normalizing
+    gives one robust world-up unit vector, used by :mod:`alligaitor.gait`
+    to tell a planted paw (near the platform) from a raised one.
+
+    Args:
+        cgroup: Calibrated camera group.
+        side_roles: Which camera roles to treat as "side" cameras for
+            this estimate (the bottom camera is excluded by default: it
+            looks up through the platform at a steep, only roughly-known
+            angle, rather than level).
+
+    Returns:
+        A unit vector in the calibration's 3D reference frame.
+    """
+    names = cgroup.get_names()
+    ups = []
+    for role in side_roles:
+        if role not in names:
+            continue
+        cam = cgroup.cameras[names.index(role)]
+        rotation, _ = cv2.Rodrigues(cam.get_rotation())
+        cam_up_in_world = rotation.T @ np.array([0.0, -1.0, 0.0])
+        ups.append(cam_up_in_world / np.linalg.norm(cam_up_in_world))
+
+    if not ups:
+        raise ValueError(
+            f"No side camera ({side_roles}) found in calibration (has {names}); "
+            "cannot estimate world up direction."
+        )
+
+    if len(ups) > 1:
+        agreement = float(np.clip(np.dot(ups[0], ups[1]), -1.0, 1.0))
+        disagreement_deg = np.degrees(np.arccos(agreement))
+        if disagreement_deg > 25:
+            warnings.warn(
+                f"Side cameras disagree on world 'up' by {disagreement_deg:.1f} degrees; "
+                "check for a rolled or mismounted camera."
+            )
+
+    up = np.mean(ups, axis=0)
+    return up / np.linalg.norm(up)

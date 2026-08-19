@@ -11,9 +11,9 @@ cameras have not been physically moved.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
 
 import yaml
 
@@ -119,23 +119,88 @@ class SessionConfig:
         videos: Mapping of camera role to this session's video path.
         output_dir: Directory where 2D predictions and 3D output for this
             session are written.
+        rat_id: Which rat this trial belongs to. Video/session names
+            (e.g. ``"359a-BL"``) encode a trial letter and condition, not
+            a reliable rat identity, so this is a separate, explicit
+            field rather than something parsed from ``name``. Defaults to
+            ``name`` (i.e. each session is its own rat) when not given.
+            Sessions sharing a ``rat_id`` within one group are combined
+            onto that rat's tab in the gait-metrics spreadsheet (see
+            :mod:`alligaitor.gait`), one row per trial.
     """
 
     name: str
     videos: Dict[str, Path]
     output_dir: Path
+    rat_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         _require_roles(self.videos, f"Session '{self.name}'")
+        if not self.rat_id:
+            self.rat_id = self.name
+
+
+@dataclass
+class GaitConfig:
+    """Tunable thresholds for stance/swing (paw ground-contact) detection.
+
+    A paw is considered planted on a frame when both its frame-to-frame
+    speed and its height above the platform stay below their respective
+    thresholds; see :mod:`alligaitor.gait` for how these feed into stride,
+    step, and ground-contact-time calculations.
+
+    Attributes:
+        speed_threshold_mm_s: Maximum frame-to-frame speed, in mm/s, for a
+            paw to count as planted.
+        height_threshold_mm: Maximum height above this trial's estimated
+            platform surface (see ``platform_baseline_percentile``), in
+            mm, for a paw to count as planted.
+        platform_baseline_percentile: Percentile of a paw's height trace,
+            within one trial, used to estimate that platform's surface
+            height for that paw -- low enough to reflect genuine contact
+            frames without being thrown off by a handful of outlier low
+            readings.
+        min_contact_frames: Minimum number of consecutive frames a paw
+            must satisfy both thresholds to count as a real stance phase,
+            filtering out single-frame tracking jitter.
+
+    Note there is no fixed "which axis is up" setting here: the
+    calibration board's orientation (not gravity) sets the reconstruction's
+    coordinate frame, so height is measured against a world-up direction
+    derived from the calibrated rig instead -- see
+    :func:`alligaitor.calibration.world_up_direction` and
+    :func:`alligaitor.gait.compute_trial_metrics`.
+    """
+
+    speed_threshold_mm_s: float = 50.0
+    height_threshold_mm: float = 5.0
+    platform_baseline_percentile: float = 5.0
+    min_contact_frames: int = 2
 
 
 @dataclass
 class PipelineConfig:
-    """Top-level configuration: models, calibration, and one or more sessions."""
+    """Top-level configuration: models, calibration, and one or more sessions.
+
+    Attributes:
+        models: Trained model directories.
+        calibration: Calibration recordings and output path.
+        sessions: The group's trials -- one video-triplet per crossing.
+        name: Group identifier, used to name the gait-metrics workbook.
+            Defaults to the config file's stem.
+        output_xlsx: Where the gait-metrics workbook for this group (one
+            tab per distinct ``rat_id`` across ``sessions``) is written.
+            Defaults to ``<config dir>/reports/<name>.gait_metrics.xlsx``.
+        gait: Stance/swing detection thresholds shared by every session
+            in this group.
+    """
 
     models: ModelConfig
     calibration: CalibrationConfig
     sessions: List[SessionConfig]
+    name: str = "group"
+    output_xlsx: Optional[Path] = None
+    gait: GaitConfig = field(default_factory=GaitConfig)
 
     @classmethod
     def from_yaml(cls, path: PathLike) -> "PipelineConfig":
@@ -169,8 +234,25 @@ class PipelineConfig:
                 name=session_raw["name"],
                 videos={role: _resolve(base_dir, p) for role, p in session_raw["videos"].items()},
                 output_dir=_resolve(base_dir, session_raw["output_dir"]),
+                rat_id=session_raw.get("rat_id"),
             )
             for session_raw in raw["sessions"]
         ]
 
-        return cls(models=models, calibration=calibration, sessions=sessions)
+        name = raw.get("name", path.stem)
+        output_xlsx_raw = raw.get("output_xlsx")
+        output_xlsx = (
+            _resolve(base_dir, output_xlsx_raw)
+            if output_xlsx_raw
+            else base_dir / "reports" / f"{name}.gait_metrics.xlsx"
+        )
+        gait = GaitConfig(**raw.get("gait", {}))
+
+        return cls(
+            models=models,
+            calibration=calibration,
+            sessions=sessions,
+            name=name,
+            output_xlsx=output_xlsx,
+            gait=gait,
+        )

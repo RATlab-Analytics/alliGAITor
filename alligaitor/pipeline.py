@@ -50,14 +50,18 @@ def run_session(
         fps_by_role[role] = video_fps(video_path)
 
     pose_3d = triangulation.triangulate(tracks, cgroup, fps_by_role)
+    # Matches triangulation.align_tracks_by_time's choice of reference
+    # timeline: the pose is resampled onto the slowest camera's own frame
+    # times, so that view's fps gives the true seconds-per-row of pose_3d.
+    reference_fps = min(fps_by_role.values())
 
     csv_path = session.output_dir / f"{session.name}.pose_3d.csv"
-    save_pose_3d_csv(pose_3d, csv_path)
+    save_pose_3d_csv(pose_3d, reference_fps, csv_path)
     return csv_path
 
 
-def save_pose_3d_csv(pose_3d: Pose3D, csv_path: Path) -> None:
-    """Write a triangulated pose to a long-format CSV: frame, node, x, y, z, error."""
+def save_pose_3d_csv(pose_3d: Pose3D, fps: float, csv_path: Path) -> None:
+    """Write a triangulated pose to a long-format CSV: frame, time_s, node, x, y, z, error."""
     n_frames, n_nodes, _ = pose_3d.points.shape
     frame_idx, node_idx = np.meshgrid(np.arange(n_frames), np.arange(n_nodes), indexing="ij")
     node_names = np.array(pose_3d.node_names)
@@ -65,6 +69,7 @@ def save_pose_3d_csv(pose_3d: Pose3D, csv_path: Path) -> None:
     df = pd.DataFrame(
         {
             "frame": frame_idx.ravel(),
+            "time_s": frame_idx.ravel() / fps,
             "node": node_names[node_idx.ravel()],
             "x": pose_3d.points[..., 0].ravel(),
             "y": pose_3d.points[..., 1].ravel(),
@@ -76,14 +81,55 @@ def save_pose_3d_csv(pose_3d: Pose3D, csv_path: Path) -> None:
     df.to_csv(csv_path, index=False)
 
 
+def _load_or_calibrate(calib_config) -> CameraGroup:
+    if calib_config.output_path.exists():
+        return calibration.load(calib_config)
+    return calibration.calibrate(calib_config)
+
+
 def run_pipeline(config: PipelineConfig, device: str = "auto", tracking: bool = False) -> List[Path]:
     """Run calibration (loading a saved one if present) and triangulate every session."""
-    if config.calibration.output_path.exists():
-        cgroup = calibration.load(config.calibration)
-    else:
-        cgroup = calibration.calibrate(config.calibration)
-
+    cgroup = _load_or_calibrate(config.calibration)
     return [
         run_session(session, config.models, cgroup, device=device, tracking=tracking)
         for session in config.sessions
     ]
+
+
+def run_group(config: PipelineConfig, device: str = "auto", tracking: bool = False) -> Path:
+    """Run the full pipeline for every session in a group and write its gait-metrics workbook.
+
+    This is the entry point a job queue (see the module docstring in
+    :mod:`alligaitor.gait`) should call per queued group: it triangulates
+    every session, computes gait metrics for each from its 3D trajectory,
+    and writes one Excel workbook for the group with one tab per distinct
+    ``rat_id``.
+
+    Returns:
+        Path to the written gait-metrics workbook.
+    """
+    from alligaitor import gait  # local import: avoids a pipeline<->gait import cycle
+
+    cgroup = _load_or_calibrate(config.calibration)
+    # The calibration board's own orientation doesn't track gravity (it
+    # isn't guaranteed to sit flat on the platform, or even to hold one
+    # orientation through a whole calibration recording), so "up" in this
+    # rig's 3D reference frame is derived from the side cameras' known
+    # mounting instead of assumed to be a fixed x/y/z axis.
+    up_direction = calibration.world_up_direction(cgroup)
+
+    trials = []
+    for session in config.sessions:
+        csv_path = run_session(session, config.models, cgroup, device=device, tracking=tracking)
+        trial = gait.compute_trial_metrics(
+            csv_path,
+            session_name=session.name,
+            rat_id=session.rat_id,
+            up_direction=up_direction,
+            config=config.gait,
+        )
+        gait.save_paw_events_csv(trial, session.output_dir / f"{session.name}.paw_events.csv")
+        trials.append(trial)
+
+    gait.write_group_report(trials, config.output_xlsx)
+    return config.output_xlsx
