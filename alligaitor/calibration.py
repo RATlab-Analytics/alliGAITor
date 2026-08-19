@@ -1,20 +1,40 @@
 """Multi-camera calibration for the alliGAITor rig, built on aniposelib.
 
 Calibration is performed once against the fixed three-camera rig (left
-side, right side, bottom-up) using a printed ChArUco board, and the
-resulting camera parameters are reused for triangulating every session
-recorded with that rig. Re-run calibration if a camera is repositioned.
+side, right side, bottom-up) using a printed calibration board -- either a
+ChArUco board or, for recordings where the bottom camera can only see the
+board at a steep angle through the tunnel slit, a flat AprilTag marker-grid
+board (see :class:`AprilGridBoard`) -- and the resulting camera parameters
+are reused for triangulating every session recorded with that rig. Re-run
+calibration if a camera is repositioned.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List
+from typing import List, Tuple, Union
 
 import cv2
-from aniposelib.boards import CharucoBoard, extract_points, extract_rtvecs, get_video_params, merge_rows
+import numpy as np
+from aniposelib.boards import (
+    CalibrationObject,
+    CharucoBoard,
+    extract_points,
+    extract_rtvecs,
+    get_video_params,
+    merge_rows,
+)
 from aniposelib.cameras import CameraGroup
-from aniposelib.utils import get_connections, get_initial_extrinsics
+from aniposelib.utils import (
+    find_calibration_pairs,
+    get_calibration_graph,
+    get_connections,
+    get_rtvec,
+    make_M,
+    mean_transform,
+    select_matrices,
+)
+from scipy.linalg import inv
 
 from alligaitor.config import CAMERA_ROLES, CalibrationConfig
 from alligaitor.timing import shared_frame_key, video_fps
@@ -32,21 +52,24 @@ CALIBRATION_GRID_FPS = 10.0
 # error message instead of letting calibrate_rows fail on an empty zip.
 MIN_CORNERS_INTRINSIC = 9
 
-# aniposelib.cameras.CameraGroup.calibrate_rows hardcodes 8 as the minimum
-# ChArUco corners a frame needs to link two cameras' poses in the initial
-# calibration graph (and to contribute a point to bundle adjustment) --
-# this is not exposed as a parameter. calibrate() below reimplements that
-# method with this made configurable (see _calibrate_rows), since the
+# aniposelib hardcodes 8 as the minimum ChArUco corners a frame needs to
+# be considered for linking two cameras' poses in the initial calibration
+# graph (CameraGroup.calibrate_rows), AND separately hardcodes 7 as the
+# minimum inside CharucoBoard.estimate_pose_points -- below that, pose
+# estimation for that frame silently returns (None, None) regardless of
+# how many corners were actually detected. Neither is exposed as a
+# parameter. calibrate() below reimplements both call sites with this made
+# configurable (see _calibrate_rows and _estimate_pose_points), since the
 # bottom camera's slit view can force a tradeoff between corner count and
 # staying in a side camera's field of view: on some recordings, no frame
-# reaches 8 corners on the bottom camera while also being visible to a
-# side camera at all. 4 is the practical floor (cv2.aruco's ChArUco pose
-# estimation needs at least 4 corners to solve for a pose); only lower a
-# given recording's CalibrationConfig.min_corners_extrinsic toward that
-# floor after confirming the recording has no frames clearing 8, since
-# lower corner counts give a noisier initial pose estimate for that frame
-# (bundle adjustment still refines it afterward, but a bad initial
-# extrinsics guess can still leave it in a bad local optimum).
+# reaches 7-8 corners on the bottom camera while also being visible to a
+# side camera at all. 4 is the practical floor (cv2.solvePnP needs at
+# least 4 point correspondences); only lower a given recording's
+# CalibrationConfig.min_corners_extrinsic toward that floor after
+# confirming the recording has no frames clearing 8, since lower corner
+# counts give a noisier initial pose estimate for that frame (bundle
+# adjustment still refines it afterward, but a bad initial extrinsics
+# guess can still leave it in a bad local optimum).
 MIN_CORNERS_EXTRINSIC = 8
 
 # Board geometry, inferred from the printed board's filename
@@ -85,10 +108,88 @@ STRIP_BOARD_SQUARES_Y = 5
 STRIP_BOARD_SQUARE_LENGTH_MM = 35.0
 STRIP_BOARD_MARKER_LENGTH_MM = 25.7
 
+# A flat AprilTag marker-grid board -- the replacement for the "strip"
+# ChArUco board above at the bottom camera's fixed 45-degree viewing angle
+# (the rig's cameras are physically perpendicular, so this angle is not
+# adjustable; a rigid or folded two-face target was ruled out, so this
+# stays a single flat plane like every other board here).
+#
+# ChArUco calibration needs a clean geometric corner *interpolation* step
+# (fitting a checkerboard corner from the surrounding squares) on top of
+# marker decoding, and that interpolation is what was failing on real
+# 45-degree/blurred/compressed bottom-camera footage even when markers
+# were individually legible (see calib_big_01/calib_big_red_01
+# measurements, 2026-08-17/18). A bare marker grid has no such step: each
+# AprilTag marker's 4 corners come directly from decoding that one marker,
+# so there is nothing here that depends on multiple markers being crisp
+# simultaneously. AprilTag's own decoder (DICT_APRILTAG_36H11 has the
+# largest inter-code Hamming distance of the AprilTag families OpenCV
+# ships) is also substantially more blur/compression-tolerant than
+# ChArUco's checkerboard-corner search: a synthetic test replicating this
+# rig's approximate bottom-camera conditions -- foreshortened ~cos(45deg),
+# downscaled to a ~15mm-wide on-sensor footprint, Gaussian-blurred, and
+# JPEG-recompressed at quality 60 -- still decoded all 6 markers cleanly
+# (2026-08-18).
+#
+# 2 columns x 3 rows of 46mm markers is the largest size that fits the
+# same <=140mm x 175mm footprint the printed "strip" ChArUco board above
+# used -- that board's physical footprint is a hard constraint (it's sized
+# to the paddle the board mounts on to go through the slit, not just the
+# 3D-printer-plate check the strip board's own comment describes), so this
+# board must match or beat it, not just clear the plate/slit checks
+# independently. 8mm marker separation and a 10mm outer margin are both
+# required white "quiet zone" -- AprilTag detection needs white space
+# *around* a marker to find its border in the first place; a synthetic
+# test with zero outer margin (markers flush to the printed edge) failed
+# to detect 2 of 6 markers outright, while every margin tested from 4mm up
+# detected all 6 (2026-08-18). 10mm was chosen over the tested minimum
+# (4mm) for extra tolerance against real-world lighting/glare at the
+# board's physical edge, which a synthetic test can't reproduce. With
+# sep=8mm and margin=10mm fixed, 46mm is the largest whole-mm marker size
+# that keeps the long axis (3 markers) at or under 175mm; solving the
+# short axis (2 markers) for the same size leaves it well under 140mm.
+#
+# Footprint: (2*46 + 1*8 + 2*10) = 120mm wide x (3*46 + 2*8 + 2*10) = 174mm
+# long -- at or under the 140mm x 175mm target on both axes, and still
+# ~79% larger than the strip board's 25.7mm squares (to compensate for the
+# same 45-degree foreshortening: 46mm * cos(45deg) ~= 32.5mm effective,
+# still bigger than the strip board's un-foreshortened 25.7mm). Not yet
+# validated against real footage (no AprilTag board has been printed or
+# recorded against yet); adjust APRILTAG_MARKER_LENGTH_MM/
+# APRILTAG_MARKER_SEPARATION_MM and re-check real detections before
+# committing to a final print.
+#
+# ChArUco calibration needs a clean geometric corner *interpolation* step
+# (fitting a checkerboard corner from the surrounding squares) on top of
+# marker decoding, and that interpolation is what was failing on real
+# 45-degree/blurred/compressed bottom-camera footage even when markers
+# were individually legible (see calib_big_01/calib_big_red_01
+# measurements, 2026-08-17/18). A bare marker grid has no such step: each
+# AprilTag marker's 4 corners come directly from decoding that one marker,
+# so there is nothing here that depends on multiple markers being crisp
+# simultaneously. AprilTag's own decoder (DICT_APRILTAG_36H11 has the
+# largest inter-code Hamming distance of the AprilTag families OpenCV
+# ships) is also substantially more blur/compression-tolerant than
+# ChArUco's checkerboard-corner search: a synthetic test replicating this
+# rig's approximate bottom-camera conditions -- foreshortened ~cos(45deg),
+# downscaled to a ~15mm-wide on-sensor footprint, Gaussian-blurred, and
+# JPEG-recompressed at quality 60 -- still decoded all 6 markers cleanly
+# (2026-08-18); re-verified at 46mm after this resize with the same
+# result.
+APRILTAG_DICTIONARY = cv2.aruco.DICT_APRILTAG_36h11
+APRILTAG_MARKERS_X = 2
+APRILTAG_MARKERS_Y = 3
+APRILTAG_MARKER_LENGTH_MM = 46.0
+APRILTAG_MARKER_SEPARATION_MM = 8.0
+APRILTAG_MARGIN_MM = 10.0
+
 # Named board geometries, keyed by the ``board_preset`` a
 # CalibrationConfig can specify -- different recordings may have used
-# different physical printed boards. Each value is
-# (squares_x, squares_y, square_length_mm, marker_length_mm).
+# different physical printed boards. Each ChArUco value is
+# (squares_x, squares_y, square_length_mm, marker_length_mm); the
+# ``"apriltag"`` preset is handled separately in build_board_for_preset()
+# since AprilGridBoard doesn't fit that same tuple shape (see its
+# docstring).
 BOARD_PRESETS = {
     "original": (BOARD_SQUARES_X, BOARD_SQUARES_Y, BOARD_SQUARE_LENGTH_MM, BOARD_MARKER_LENGTH_MM),
     "strip": (
@@ -205,20 +306,48 @@ PRESET_DEFAULT_RELAX_FOR_SMALL_MARKERS = {
 }
 
 
-def build_board_for_preset(preset: str, relax_for_small_markers: bool | None = None) -> CharucoBoard:
-    """Construct the ChArUco board for a named geometry in :data:`BOARD_PRESETS`.
+def build_apriltag_board(
+    markers_x: int = APRILTAG_MARKERS_X,
+    markers_y: int = APRILTAG_MARKERS_Y,
+    marker_length_mm: float = APRILTAG_MARKER_LENGTH_MM,
+    marker_separation_mm: float = APRILTAG_MARKER_SEPARATION_MM,
+    aruco_dict: int = APRILTAG_DICTIONARY,
+) -> "AprilGridBoard":
+    """Construct the flat AprilTag marker-grid board (see
+    :data:`APRILTAG_MARKERS_X` and neighbors for the rationale behind the
+    default geometry)."""
+    return AprilGridBoard(
+        markers_x=markers_x,
+        markers_y=markers_y,
+        marker_length=marker_length_mm,
+        marker_separation=marker_separation_mm,
+        aruco_dict=aruco_dict,
+    )
+
+
+def build_board_for_preset(
+    preset: str, relax_for_small_markers: bool | None = None
+) -> Union[CharucoBoard, "AprilGridBoard"]:
+    """Construct the calibration board for a named geometry.
 
     Args:
-        preset: Key into :data:`BOARD_PRESETS`.
-        relax_for_small_markers: Passed through to :func:`build_board`.
-            Defaults to this preset's entry in
-            :data:`PRESET_DEFAULT_RELAX_FOR_SMALL_MARKERS` when left as
-            ``None`` -- only the original board's markers are small enough
-            to need it, and applying it unnecessarily is not just wasted
-            effort but pathologically slow (see that dict's docstring).
+        preset: ``"apriltag"`` for the flat AprilTag marker-grid board (see
+            :func:`build_apriltag_board`), or a key into
+            :data:`BOARD_PRESETS` for a named ChArUco board geometry.
+        relax_for_small_markers: Passed through to :func:`build_board` for
+            ChArUco presets; ignored for ``"apriltag"``. Defaults to this
+            preset's entry in :data:`PRESET_DEFAULT_RELAX_FOR_SMALL_MARKERS`
+            when left as ``None`` -- only the original board's markers are
+            small enough to need it, and applying it unnecessarily is not
+            just wasted effort but pathologically slow (see that dict's
+            docstring).
     """
+    if preset == "apriltag":
+        return build_apriltag_board()
     if preset not in BOARD_PRESETS:
-        raise ValueError(f"Unknown board preset '{preset}'; expected one of {sorted(BOARD_PRESETS)}")
+        raise ValueError(
+            f"Unknown board preset '{preset}'; expected 'apriltag' or one of {sorted(BOARD_PRESETS)}"
+        )
     if relax_for_small_markers is None:
         relax_for_small_markers = PRESET_DEFAULT_RELAX_FOR_SMALL_MARKERS[preset]
     squares_x, squares_y, square_length_mm, marker_length_mm = BOARD_PRESETS[preset]
@@ -231,10 +360,159 @@ def build_board_for_preset(preset: str, relax_for_small_markers: bool | None = N
     )
 
 
+class AprilGridBoard(CalibrationObject):
+    """A flat grid of independently-decodable AprilTag markers, with no
+    checkerboard/corner-interpolation step -- see the module-level
+    ``APRILTAG_*`` constants for why this replaces ChArUco for the bottom
+    camera's fixed 45-degree slit view.
+
+    Implements aniposelib's :class:`~aniposelib.boards.CalibrationObject`
+    interface the same way :class:`~aniposelib.boards.CharucoBoard` does,
+    so it plugs into aniposelib's existing ``merge_rows``/``extract_points``
+    machinery, :meth:`get_all_calibration_points`, etc. unmodified -- this
+    is an original implementation of that public abstract interface, not a
+    port of any CharucoBoard/GridBoard logic, so it isn't covered by the
+    aniposelib attribution in ``THIRD_PARTY_NOTICES.md``.
+
+    Every possible point on the board needs a fixed, stable index for
+    aniposelib's correspondence machinery (``get_empty_detection()`` /
+    ``get_object_points()`` must be the same length and order on every
+    call). ChArUco gets this for free -- one interpolated corner per index.
+    A bare marker grid doesn't have interpolated corners, so this class
+    treats each of the board's ``n_markers`` markers as 4 consecutive point
+    slots (its 4 corners, in ``cv2.aruco.GridBoard``'s own per-marker
+    corner order): marker id ``i`` occupies slots ``[4*i, 4*i+4)``.
+    """
+
+    def __init__(
+        self,
+        markers_x: int,
+        markers_y: int,
+        marker_length: float,
+        marker_separation: float,
+        aruco_dict: int = APRILTAG_DICTIONARY,
+        manually_verify: bool = False,
+    ):
+        self.markers_x = markers_x
+        self.markers_y = markers_y
+        self.marker_length = marker_length
+        self.marker_separation = marker_separation
+        self.manually_verify = manually_verify
+
+        self.dictionary = cv2.aruco.getPredefinedDictionary(aruco_dict)
+        self.board = cv2.aruco.GridBoard(
+            [markers_x, markers_y], marker_length, marker_separation, self.dictionary
+        )
+
+        # AprilTag's own quad-detection + decoding is a different algorithm
+        # from the generic ArUco corner-refinement CharucoBoard uses above
+        # (CORNER_REFINE_CONTOUR) -- CORNER_REFINE_APRILTAG is OpenCV's
+        # refinement mode tuned specifically for it.
+        self.detector_params = cv2.aruco.DetectorParameters()
+        self.detector_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_APRILTAG
+        self.detector = cv2.aruco.ArucoDetector(self.dictionary, self.detector_params)
+
+        # Build the fixed per-point object-point template by marker id
+        # (not by getObjPoints()'s array order, which happened to match id
+        # order in testing but isn't documented to be guaranteed) -- see
+        # this class's docstring for the 4-points-per-marker-id layout.
+        ids = np.asarray(self.board.getIds()).ravel()
+        self.n_markers = len(ids)
+        obj_points_by_marker = self.board.getObjPoints()
+        self.objPoints = np.zeros((self.n_markers * 4, 3), dtype=np.float64)
+        for marker_id, pts in zip(ids, obj_points_by_marker):
+            self.objPoints[4 * marker_id : 4 * marker_id + 4] = np.asarray(pts, dtype=np.float64).reshape(4, 3)
+
+        self.empty_detection = np.full((self.n_markers * 4, 1, 2), np.nan)
+
+    def get_size(self):
+        return (self.markers_x, self.markers_y)
+
+    def get_empty_detection(self):
+        return np.copy(self.empty_detection)
+
+    def get_object_points(self):
+        return self.objPoints
+
+    def draw(self, size, margin_mm: float | None = None):
+        """Render a printable board image. ``size`` is ``(width, height)``
+        in pixels; ``margin_mm`` defaults to :data:`APRILTAG_MARGIN_MM`
+        (the outer white quiet zone AprilTag detection needs -- see that
+        constant's docstring). Caller is responsible for choosing ``size``
+        with a pixel scale consistent with this board's mm dimensions."""
+        if margin_mm is None:
+            margin_mm = APRILTAG_MARGIN_MM
+        board_width_mm = self.markers_x * self.marker_length + (self.markers_x - 1) * self.marker_separation
+        px_per_mm = size[0] / (board_width_mm + 2 * margin_mm)
+        margin_px = int(round(margin_mm * px_per_mm))
+        return self.board.generateImage(size, marginSize=margin_px, borderBits=1)
+
+    def fill_points(self, corners, ids):
+        out = self.get_empty_detection()
+        if corners is None or ids is None or len(corners) == 0:
+            return out
+        for marker_id, marker_corners in zip(np.asarray(ids).ravel(), corners):
+            if 0 <= marker_id < self.n_markers:
+                out[4 * marker_id : 4 * marker_id + 4] = np.asarray(marker_corners, dtype=np.float64).reshape(4, 1, 2)
+        return out
+
+    def detect_image(self, image):
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image
+
+        try:
+            corners, ids, _ = self.detector.detectMarkers(gray)
+        except cv2.error:
+            corners = ids = None
+
+        if ids is None or len(ids) == 0:
+            return [], []
+
+        if self.manually_verify and not self.manually_verify_board_detection(gray, corners, ids):
+            return [], []
+
+        return corners, ids
+
+    def manually_verify_board_detection(self, image, corners, ids=None):
+        height, width = image.shape[:2]
+        image = cv2.aruco.drawDetectedMarkers(np.asarray(image).copy(), corners, ids)
+        cv2.putText(
+            image, '(a) Accept (d) Reject', (int(width / 1.35), int(height / 16)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, 255, 1, cv2.LINE_AA,
+        )
+        cv2.imshow('verify_detection', image)
+        while True:
+            key = cv2.waitKey(0) & 0xFF
+            if key == ord('a'):
+                return True
+            elif key == ord('d'):
+                return False
+
+    def estimate_pose_points(self, camera, corners, ids):
+        """Generic base-class-satisfying implementation (not used by this
+        module's own calibration path, which calls :func:`_match_points` /
+        :func:`_estimate_pose_points` directly so the minimum-point floor
+        stays configurable end to end -- see :data:`MIN_CORNERS_EXTRINSIC`).
+        """
+        if corners is None or ids is None or len(corners) == 0:
+            return None, None
+        obj_points, img_points = self.board.matchImagePoints(corners, ids)
+        if obj_points is None or len(obj_points) < 4:
+            return None, None
+        K = camera.get_camera_matrix()
+        D = camera.get_distortions()
+        ret, rvec, tvec = cv2.solvePnP(obj_points, img_points, K, D)
+        if ret:
+            return rvec, tvec
+        return None, None
+
+
 def _detect_video_by_time(
-    board: CharucoBoard, video_path: Path, fps: float, grid_fps: float, skip: int = 1
+    board: CalibrationObject, video_path: Path, fps: float, grid_fps: float, skip: int = 1
 ) -> List[dict]:
-    """Detect ChArUco corners per frame, keyed by shared time bucket.
+    """Detect board corners/markers per frame, keyed by shared time bucket.
 
     Equivalent to :meth:`CharucoBoard.detect_video`, except each detection
     row's ``framenum`` is a time bucket shared across cameras (see
@@ -285,10 +563,170 @@ def _detect_video_by_time(
     return board.fill_points_rows(rows)
 
 
+def _match_points(board: CalibrationObject, corners, ids) -> Tuple[np.ndarray | None, np.ndarray | None]:
+    """Match detected corners/markers to a board's fixed object-point
+    layout, via OpenCV's own ``Board.matchImagePoints()`` -- exposed
+    identically on the ``cv2.aruco.CharucoBoard`` and ``cv2.aruco.GridBoard``
+    instances underlying, respectively, aniposelib's ``CharucoBoard`` and
+    this module's :class:`AprilGridBoard` (both store it as ``board.board``).
+    This is what lets both board types share one pose-estimation/
+    point-counting code path below, rather than needing board-type-specific
+    correspondence lookup logic (as aniposelib's own
+    ``CharucoBoard.estimate_pose_points`` has, via ``getChessboardCorners()``
+    -- verified numerically equivalent to that manual lookup for ChArUco,
+    2026-08-18).
+
+    Returns ``(obj_points, img_points)`` as ``(N, 3)``/``(N, 2)`` float32
+    arrays, or ``(None, None)`` if there is nothing to match.
+    """
+    if corners is None or ids is None or len(corners) == 0 or len(ids) == 0:
+        return None, None
+    obj_points, img_points = board.board.matchImagePoints(corners, ids)
+    if obj_points is None or len(obj_points) == 0:
+        return None, None
+    return obj_points.reshape(-1, 3).astype(np.float32), img_points.reshape(-1, 2).astype(np.float32)
+
+
+def _n_matched_points(board: CalibrationObject, row: dict) -> int:
+    """Number of points :func:`_match_points` can actually resolve for one
+    detection row -- the board-agnostic point count. Needed because raw
+    ``row["ids"].size`` means different things per board type: for ChArUco,
+    one id is one interpolated corner (one point); for :class:`AprilGridBoard`,
+    one id is one decoded marker (4 points). Using the raw id count as a
+    stand-in for point count -- as aniposelib itself does -- silently
+    undercounts AprilGridBoard detections by ~4x, making
+    ``min_corners_intrinsic``/``min_corners_extrinsic`` mean a different
+    number of points depending on which board a recording used.
+    """
+    obj_points, _ = _match_points(board, row["corners"], row["ids"])
+    return 0 if obj_points is None else len(obj_points)
+
+
+def _estimate_pose_points(camera, corners, ids, board: CalibrationObject, min_points: int):
+    """Board-agnostic equivalent of ``CharucoBoard.estimate_pose_points``,
+    via :func:`_match_points`, with the minimum *point* count (not corner-id
+    count -- see :func:`_n_matched_points`) needed to attempt a pose solve
+    made configurable (hardcoded to 7 corners upstream; see
+    :data:`MIN_CORNERS_EXTRINSIC`).
+
+    Loosely adapted from ``aniposelib.boards.CharucoBoard.estimate_pose_points``
+    (BSD 2-Clause License, Copyright (c) 2019-2023 Lili Karashchuk) --
+    the corner-count floor and ``solvePnP`` call are the same shape, but the
+    correspondence lookup itself is now ``_match_points()`` rather than a
+    port of that method's manual ``getChessboardCorners()`` loop; see
+    ``THIRD_PARTY_NOTICES.md`` for the full license text.
+    """
+    obj_points, img_points = _match_points(board, corners, ids)
+    if obj_points is None or len(obj_points) < min_points:
+        return None, None
+
+    K = camera.get_camera_matrix()
+    D = camera.get_distortions()
+    ret, rvec, tvec = cv2.solvePnP(obj_points, img_points, K, D)
+    if ret:
+        return rvec, tvec
+    return None, None
+
+
+def _estimate_pose_rows(camera, rows: List[dict], board: CalibrationObject, min_points: int) -> List[dict]:
+    """Equivalent to :meth:`CharucoBoard.estimate_pose_rows`, calling
+    :func:`_estimate_pose_points` instead of the board's own method so the
+    minimum-point floor is configurable end to end. Also stashes each row's
+    board-agnostic matched-point count (see :func:`_n_matched_points`) as
+    ``row["n_points"]``, since it needs the same ``_match_points()`` result
+    used here -- callers that need to filter rows by point count (e.g.
+    :func:`_calibrate_rows`) should use that instead of ``row["ids"].size``.
+    """
+    for row in rows:
+        rvec, tvec = _estimate_pose_points(camera, row["corners"], row["ids"], board, min_points)
+        row["rvec"] = rvec
+        row["tvec"] = tvec
+        row["n_points"] = _n_matched_points(board, row)
+    return rows
+
+
+def _mean_transform_robust(M_list, approx=None, error: float = 0.5):
+    """Equivalent to ``aniposelib.utils.mean_transform_robust``, except it
+    falls back to the un-filtered mean instead of crashing when every
+    candidate transform in ``M_list`` falls outside ``error`` of
+    ``approx``. Observed on this rig's bottom-camera/side-camera pairs:
+    their few, oblique-angle pose estimates can scatter widely enough
+    that none clear aniposelib's fixed 0.5 threshold, even though the
+    pair is otherwise usable. aniposelib's own ``mean_transform_robust``
+    calls ``mean_transform(M_list_robust)`` unconditionally;
+    ``mean_transform([])`` crashes deep inside ``cv2.Rodrigues`` with a
+    confusing, unrelated-looking shape error instead of an empty-input
+    error, which is what actually surfaced this.
+
+    Adapted from ``aniposelib.utils.mean_transform_robust`` (BSD 2-Clause
+    License, Copyright (c) 2019-2023 Lili Karashchuk); see
+    ``THIRD_PARTY_NOTICES.md`` for the full license text.
+    """
+    if approx is None:
+        M_list_robust = M_list
+    else:
+        M_list_robust = [M for M in M_list if np.max(np.abs((M - approx)[:3, :3])) < error]
+    if not M_list_robust:
+        M_list_robust = M_list
+    return mean_transform(M_list_robust)
+
+
+def _get_transform(rtvecs, left: int, right: int):
+    """Equivalent to ``aniposelib.utils.get_transform``, using
+    :func:`_mean_transform_robust` instead of the upstream function that
+    can crash on a small, scattered sample (see its docstring).
+
+    Adapted from ``aniposelib.utils.get_transform`` (BSD 2-Clause
+    License, Copyright (c) 2019-2023 Lili Karashchuk); see
+    ``THIRD_PARTY_NOTICES.md`` for the full license text.
+    """
+    L = []
+    for dix in range(rtvecs.shape[1]):
+        d = rtvecs[:, dix]
+        good = ~np.isnan(d[:, 0])
+        if good[left] and good[right]:
+            M_left = make_M(d[left, 0:3], d[left, 3:6])
+            M_right = make_M(d[right, 0:3], d[right, 3:6])
+            M = np.matmul(M_left, inv(M_right))
+            L.append(M)
+    L_best = select_matrices(L)
+    M_mean = mean_transform(L_best)
+    return _mean_transform_robust(L, M_mean, error=0.5)
+
+
+def _get_initial_extrinsics(rtvecs, cam_names=None):
+    """Equivalent to ``aniposelib.utils.get_initial_extrinsics``, using
+    :func:`_get_transform` for each camera pair instead of the upstream
+    function.
+
+    Adapted from ``aniposelib.utils.get_initial_extrinsics`` (BSD 2-Clause
+    License, Copyright (c) 2019-2023 Lili Karashchuk); see
+    ``THIRD_PARTY_NOTICES.md`` for the full license text.
+    """
+    graph = get_calibration_graph(rtvecs, cam_names)
+    pairs = find_calibration_pairs(graph, source=0)
+
+    extrinsics = dict()
+    source = pairs[0][0]
+    extrinsics[source] = np.identity(4)
+    for a, b in pairs:
+        ext = _get_transform(rtvecs, b, a)
+        extrinsics[b] = np.matmul(ext, extrinsics[a])
+
+    n_cams = rtvecs.shape[0]
+    rvecs = []
+    tvecs = []
+    for cnum in range(n_cams):
+        rvec, tvec = get_rtvec(extrinsics[cnum])
+        rvecs.append(rvec)
+        tvecs.append(tvec)
+    return np.array(rvecs), np.array(tvecs)
+
+
 def _calibrate_rows(
     cgroup: CameraGroup,
     all_rows: List[List[dict]],
-    board: CharucoBoard,
+    board: CalibrationObject,
     min_corners_intrinsic: int = MIN_CORNERS_INTRINSIC,
     min_corners_extrinsic: int = MIN_CORNERS_EXTRINSIC,
     verbose: bool = True,
@@ -312,16 +750,19 @@ def _calibrate_rows(
         camera.zero_distortions()
 
     for i, (row, cam) in enumerate(zip(all_rows, cgroup.cameras)):
-        all_rows[i] = board.estimate_pose_rows(cam, row)
+        all_rows[i] = _estimate_pose_rows(cam, row, board, min_corners_extrinsic)
 
-    new_rows = [[r for r in rows if r["ids"].size >= min_corners_extrinsic] for rows in all_rows]
+    # Point count (see _n_matched_points), not raw id count -- for
+    # AprilGridBoard, one id is one marker (4 points), so id count alone
+    # would silently undercount by ~4x here.
+    new_rows = [[r for r in rows if r["n_points"] >= min_corners_extrinsic] for rows in all_rows]
     merged = merge_rows(new_rows)
     imgp, extra = extract_points(merged, board, min_cameras=2)
 
     rtvecs = extract_rtvecs(merged)
     if verbose:
         print(get_connections(rtvecs, cgroup.get_names()))
-    rvecs, tvecs = get_initial_extrinsics(rtvecs, cgroup.get_names())
+    rvecs, tvecs = _get_initial_extrinsics(rtvecs, cgroup.get_names())
     cgroup.set_rotations(rvecs)
     cgroup.set_translations(tvecs)
 
@@ -330,11 +771,11 @@ def _calibrate_rows(
 
 def calibrate(
     config: CalibrationConfig,
-    board: CharucoBoard | None = None,
+    board: CalibrationObject | None = None,
     grid_fps: float = CALIBRATION_GRID_FPS,
     skip: int = 1,
 ) -> CameraGroup:
-    """Calibrate the three-camera rig from role-named ChArUco board videos.
+    """Calibrate the three-camera rig from role-named calibration board videos.
 
     Detections are matched across cameras by estimated recording time
     (frame index divided by each video's own frame rate), not by raw frame
@@ -346,7 +787,8 @@ def calibrate(
             (``config.board_preset``) this recording used, and the
             extrinsics corner-count floor (``config.min_corners_extrinsic``)
             for this recording.
-        board: ChArUco board definition. Defaults to
+        board: Calibration board definition (a ChArUco board or
+            :class:`AprilGridBoard`). Defaults to
             ``build_board_for_preset(config.board_preset)``; pass this
             explicitly to override the config's preset.
         grid_fps: Shared time-bucket rate used to match detections across
@@ -371,10 +813,12 @@ def calibrate(
         all_rows.append(_detect_video_by_time(board, video_path, fps, grid_fps, skip=skip))
 
     for role, rows in zip(CAMERA_ROLES, all_rows):
-        if not any(len(row["ids"]) >= MIN_CORNERS_INTRINSIC for row in rows):
+        # Point count (see _n_matched_points), not raw id count -- see
+        # _calibrate_rows's new_rows filter for why.
+        if not any(_n_matched_points(board, row) >= MIN_CORNERS_INTRINSIC for row in rows):
             raise ValueError(
-                f"No usable ChArUco detections for camera '{role}': no frame reached "
-                f"the {MIN_CORNERS_INTRINSIC}-corner minimum needed for intrinsic "
+                f"No usable board detections for camera '{role}': no frame reached "
+                f"the {MIN_CORNERS_INTRINSIC}-point minimum needed for intrinsic "
                 "calibration. Check board visibility and framing for this camera."
             )
 

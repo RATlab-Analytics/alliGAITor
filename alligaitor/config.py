@@ -69,13 +69,16 @@ class CalibrationConfig:
         videos: Mapping of camera role to calibration video path.
         output_path: Where the resulting camera calibration (aniposelib
             ``CameraGroup``, saved as TOML) is written or loaded from.
-        board_preset: Which physical ChArUco board this recording used —
-            a key into :data:`alligaitor.calibration.BOARD_PRESETS`
-            (currently ``"original"``, the 8x8/15mm board, or ``"strip"``,
-            the narrow 4x5/35mm board sized for the bottom camera's slit
-            view). Different recordings may use different physical
-            boards; this says which one to expect when detecting corners
-            for this particular calibration.
+        board_preset: Which physical calibration board this recording
+            used — either ``"apriltag"`` (the flat AprilTag marker-grid
+            board, see :class:`alligaitor.calibration.AprilGridBoard`) or
+            a key into :data:`alligaitor.calibration.BOARD_PRESETS` for a
+            ChArUco board (currently ``"original"``, the 8x8/15mm board, or
+            ``"strip"``, the narrow 4x5/35mm board — both superseded by
+            ``"apriltag"`` for the bottom camera's 45-degree slit view).
+            Different recordings may use different physical boards; this
+            says which one to expect when detecting corners/markers for
+            this particular calibration.
         min_corners_extrinsic: Minimum ChArUco corners a frame needs to
             link two cameras' poses during calibration (see
             :data:`alligaitor.calibration.MIN_CORNERS_EXTRINSIC`). Defaults

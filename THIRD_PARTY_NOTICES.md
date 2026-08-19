@@ -9,11 +9,39 @@ not affect alliGAITor's own licensing.
 
 ## aniposelib
 
-Adapted in `alligaitor/calibration.py`: `_calibrate_rows()` is a
-line-for-line port of `aniposelib.cameras.CameraGroup.calibrate_rows()`,
-with the minimum ChArUco corner count required to link two cameras'
-poses (hardcoded to 8 upstream) exposed as a parameter. Everywhere else,
-alliGAITor calls aniposelib as an unmodified library dependency.
+Adapted in `alligaitor/calibration.py`:
+
+- `_calibrate_rows()` is a line-for-line port of
+  `aniposelib.cameras.CameraGroup.calibrate_rows()`, with the minimum
+  ChArUco corner count required to link two cameras' poses (hardcoded to
+  8 upstream) exposed as a parameter.
+- `_estimate_pose_points()` / `_estimate_pose_rows()` are loosely adapted
+  from `aniposelib.boards.CharucoBoard.estimate_pose_points()` /
+  `estimate_pose_rows()`: the corner-count floor (7, inside
+  `estimate_pose_points` upstream) is exposed as a parameter, same as
+  before, but the correspondence lookup itself was replaced with a
+  board-agnostic `_match_points()` helper (built on OpenCV's own
+  `Board.matchImagePoints()`, verified numerically equivalent to
+  upstream's manual `getChessboardCorners()`-based lookup for ChArUco)
+  so the same code path also serves `AprilGridBoard` (see below), whose
+  markers aren't one-point-per-id the way ChArUco corners are.
+- `AprilGridBoard` (the flat AprilTag marker-grid board added
+  2026-08-18) is an original implementation of aniposelib's public
+  `CalibrationObject` abstract interface — modeled on the same
+  interface `CharucoBoard` implements, but not a port of any of
+  `CharucoBoard`'s or `cv2.aruco.GridBoard`'s own method bodies — so it
+  isn't separately listed here.
+- `_mean_transform_robust()` / `_get_transform()` /
+  `_get_initial_extrinsics()` port the corresponding functions in
+  `aniposelib.utils`, with one behavior change: if every candidate
+  transform for a camera pair falls outside the (fixed, upstream)
+  robust-averaging error threshold, the port falls back to the
+  unfiltered mean instead of crashing (upstream calls
+  `mean_transform([])` on the empty result, which fails deep inside
+  `cv2.Rodrigues` with a confusing, unrelated-looking shape error).
+
+Everywhere else, alliGAITor calls aniposelib as an unmodified library
+dependency.
 
 > BSD 2-Clause License
 >
