@@ -8,12 +8,32 @@ from typing import List
 import numpy as np
 import pandas as pd
 
-from alligaitor import calibration, inference, triangulation
+from alligaitor import calibration, cropping, inference, triangulation
 from alligaitor.config import CAMERA_ROLES, ModelConfig, PipelineConfig, SessionConfig
+from alligaitor.inference import PoseTrack2D
 from alligaitor.timing import video_fps
 from alligaitor.triangulation import Pose3D
 
 from aniposelib.cameras import CameraGroup
+
+
+def load_track(video_path: Path, slp_path: Path) -> PoseTrack2D:
+    """Load one camera view's 2D predictions, corrected into its uncropped source frame.
+
+    ``slp_path`` was predicted on ``video_path``, which is typically a
+    crop (the models are trained on cropped footage), so its keypoints
+    come out in that crop's own local pixel coordinates. Triangulation
+    needs coordinates in the same *uncropped* frame calibration was
+    computed against, so this adds back ``video_path``'s crop offset
+    (see :mod:`alligaitor.cropping`) -- a no-op if ``video_path`` isn't a
+    tracked crop.
+    """
+    track = inference.load_predictions(slp_path)
+    offset_x, offset_y = cropping.crop_offset_for_video(video_path)
+    if offset_x or offset_y:
+        track.points[..., 0] += offset_x
+        track.points[..., 1] += offset_y
+    return track
 
 
 def run_session(
@@ -46,7 +66,7 @@ def run_session(
         inference.run_inference(
             video_path, model_dir, output_path=slp_path, device=device, tracking=tracking
         )
-        tracks[role] = inference.load_predictions(slp_path)
+        tracks[role] = load_track(video_path, slp_path)
         fps_by_role[role] = video_fps(video_path)
 
     pose_3d = triangulation.triangulate(tracks, cgroup, fps_by_role)
@@ -111,12 +131,6 @@ def run_group(config: PipelineConfig, device: str = "auto", tracking: bool = Fal
     from alligaitor import gait  # local import: avoids a pipeline<->gait import cycle
 
     cgroup = _load_or_calibrate(config.calibration)
-    # The calibration board's own orientation doesn't track gravity (it
-    # isn't guaranteed to sit flat on the platform, or even to hold one
-    # orientation through a whole calibration recording), so "up" in this
-    # rig's 3D reference frame is derived from the side cameras' known
-    # mounting instead of assumed to be a fixed x/y/z axis.
-    up_direction = calibration.world_up_direction(cgroup)
 
     trials = []
     for session in config.sessions:
@@ -125,7 +139,6 @@ def run_group(config: PipelineConfig, device: str = "auto", tracking: bool = Fal
             csv_path,
             session_name=session.name,
             rat_id=session.rat_id,
-            up_direction=up_direction,
             config=config.gait,
         )
         gait.save_paw_events_csv(trial, session.output_dir / f"{session.name}.paw_events.csv")

@@ -15,14 +15,12 @@ crossing:
 Coordinates are taken directly from the 3D reconstruction, which is
 already metric (the calibration board's square size is specified in mm),
 so no separate pixel-to-length ratio is needed. Ground-contact detection
-does need to know which way is "up" in that reconstruction, though, and
-the calibration board's own orientation can't tell it that (the board
-isn't guaranteed to sit flat on the platform, or to hold one orientation
-through a whole calibration recording) -- so every function here that
-needs it takes an explicit ``up_direction`` unit vector, derived once per
-rig from the side cameras' known, level mounting (see
-:func:`alligaitor.calibration.world_up_direction`) rather than assumed to
-be a fixed coordinate axis.
+is speed-only (see :class:`alligaitor.config.GaitConfig`): a
+height-above-platform check was tried and dropped, since drawing (or
+reasoning about) an accurate height threshold requires knowing each
+frame's actual depth across the tunnel's width, and a fixed reference
+was visually misleading for paws at a different depth than it was
+computed from.
 
 :func:`alligaitor.pipeline.run_group` is the intended entry point for a
 future GUI job queue: it runs the full 2D/3D pipeline for every session in
@@ -95,13 +93,18 @@ class TrialMetrics:
     paw_events: Dict[str, PawEvents]
 
 
-def load_pose_3d(csv_path: PathLike) -> tuple[np.ndarray, Dict[str, np.ndarray]]:
+def load_pose_3d(
+    csv_path: PathLike,
+) -> "tuple[np.ndarray, Dict[str, np.ndarray], Dict[str, np.ndarray]]":
     """Load a ``pose_3d.csv`` into per-node arrays indexed by frame.
 
     Returns:
-        A ``(times, positions)`` pair: ``times`` is seconds per frame
-        index, and ``positions`` maps node name to an ``(n_frames, 3)``
-        array of that node's ``x``/``y``/``z``, ``NaN`` where untriangulated.
+        A ``(times, positions, reprojection_error_px)`` triple: ``times``
+        is seconds per frame index; ``positions`` maps node name to an
+        ``(n_frames, 3)`` array of that node's ``x``/``y``/``z``, ``NaN``
+        where untriangulated; ``reprojection_error_px`` maps node name to
+        an ``(n_frames,)`` array of that frame's mean reprojection error
+        (see :class:`alligaitor.triangulation.Pose3D`), ``NaN`` to match.
     """
     df = pd.read_csv(csv_path)
     n_frames = int(df["frame"].max()) + 1
@@ -110,11 +113,16 @@ def load_pose_3d(csv_path: PathLike) -> tuple[np.ndarray, Dict[str, np.ndarray]]
     times[df["frame"].to_numpy()] = df["time_s"].to_numpy()
 
     positions = {}
+    reprojection_error_px = {}
     for node, sub in df.groupby("node"):
         arr = np.full((n_frames, 3), np.nan)
         arr[sub["frame"].to_numpy()] = sub[["x", "y", "z"]].to_numpy()
         positions[node] = arr
-    return times, positions
+
+        err = np.full(n_frames, np.nan)
+        err[sub["frame"].to_numpy()] = sub["reprojection_error_px"].to_numpy()
+        reprojection_error_px[node] = err
+    return times, positions, reprojection_error_px
 
 
 def _crossing_time_and_speed(
@@ -148,18 +156,14 @@ def _crossing_time_and_speed(
     return float(crossing_time_s), float(average_speed_mm_s), forward
 
 
-def _detect_paw_events(
-    times: np.ndarray, xyz: np.ndarray, up_direction: np.ndarray, config: GaitConfig
-) -> PawEvents:
+def _detect_paw_events(times: np.ndarray, xyz: np.ndarray, config: GaitConfig) -> PawEvents:
     """Segment one paw's trajectory into stance phases.
 
-    A frame counts as planted when the paw is triangulated, its
+    A frame counts as planted when the paw is triangulated and its
     frame-to-frame speed (backward difference) is below
-    ``config.speed_threshold_mm_s``, and its height above this trial's
-    estimated platform surface -- its position projected onto
-    ``up_direction`` -- is below ``config.height_threshold_mm``. Runs of
-    fewer than ``config.min_contact_frames`` planted frames are dropped
-    as tracking jitter rather than counted as real stance phases.
+    ``config.speed_threshold_mm_s``. Runs of fewer than
+    ``config.min_contact_frames`` planted frames are dropped as tracking
+    jitter rather than counted as real stance phases.
     """
     n = len(times)
     empty = PawEvents(np.array([], dtype=int), np.array([], dtype=int), np.array([]), np.array([]))
@@ -174,11 +178,7 @@ def _detect_paw_events(
     with np.errstate(invalid="ignore", divide="ignore"):
         speed[1:] = disp / dt
 
-    height = xyz @ up_direction
-    baseline = np.nanpercentile(np.where(valid, height, np.nan), config.platform_baseline_percentile)
-    height_agl = height - baseline
-
-    planted = valid & (speed < config.speed_threshold_mm_s) & (height_agl < config.height_threshold_mm)
+    planted = valid & (speed < config.speed_threshold_mm_s)
 
     runs = []
     start = None
@@ -238,7 +238,6 @@ def compute_trial_metrics(
     csv_path: PathLike,
     session_name: str,
     rat_id: str,
-    up_direction: np.ndarray,
     config: Optional[GaitConfig] = None,
 ) -> TrialMetrics:
     """Compute one trial's gait metrics from its triangulated ``pose_3d.csv``.
@@ -250,16 +249,11 @@ def compute_trial_metrics(
         rat_id: Which rat this trial belongs to (see
             :attr:`alligaitor.config.SessionConfig.rat_id`); sessions
             sharing a ``rat_id`` land on the same spreadsheet tab.
-        up_direction: Unit vector, in this trial's 3D reference frame,
-            pointing away from the platform surface -- see
-            :func:`alligaitor.calibration.world_up_direction`. Shared by
-            every session calibrated against the same rig, not
-            recomputed per trial.
         config: Stance/swing detection thresholds; defaults to
             :class:`GaitConfig`'s own defaults.
     """
     config = config or GaitConfig()
-    times, positions = load_pose_3d(csv_path)
+    times, positions, _ = load_pose_3d(csv_path)
 
     missing = [node for node in (REFERENCE_NODE, *PAW_NODES) if node not in positions]
     if missing:
@@ -267,7 +261,7 @@ def compute_trial_metrics(
 
     crossing_time_s, average_speed_mm_s, forward = _crossing_time_and_speed(times, positions[REFERENCE_NODE])
 
-    events = {paw: _detect_paw_events(times, positions[paw], up_direction, config) for paw in PAW_NODES}
+    events = {paw: _detect_paw_events(times, positions[paw], config) for paw in PAW_NODES}
 
     stride_length_mm, step_length_mm, ground_contact_time_s = {}, {}, {}
     n_contacts, n_strides, n_steps = {}, {}, {}
@@ -300,6 +294,23 @@ def compute_trial_metrics(
         n_steps=n_steps,
         paw_events=events,
     )
+
+
+def planted_mask(trial: TrialMetrics, n_frames: int) -> Dict[str, np.ndarray]:
+    """Per-paw boolean array, ``True`` on frames within a detected stance phase.
+
+    Expands :attr:`TrialMetrics.paw_events`' touchdown/liftoff frame pairs
+    into a full per-frame mask -- e.g. for a validation video to color a
+    paw node by its ground-contact state frame by frame.
+    """
+    masks = {}
+    for paw in PAW_NODES:
+        mask = np.zeros(n_frames, dtype=bool)
+        ev = trial.paw_events[paw]
+        for touchdown, liftoff in zip(ev.touchdown_frames, ev.liftoff_frames):
+            mask[touchdown : liftoff + 1] = True
+        masks[paw] = mask
+    return masks
 
 
 def save_paw_events_csv(trial: TrialMetrics, csv_path: PathLike) -> None:

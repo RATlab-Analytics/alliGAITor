@@ -144,37 +144,27 @@ class SessionConfig:
 class GaitConfig:
     """Tunable thresholds for stance/swing (paw ground-contact) detection.
 
-    A paw is considered planted on a frame when both its frame-to-frame
-    speed and its height above the platform stay below their respective
-    thresholds; see :mod:`alligaitor.gait` for how these feed into stride,
-    step, and ground-contact-time calculations.
+    A paw is considered planted on a frame when its frame-to-frame speed
+    stays below ``speed_threshold_mm_s``; see :mod:`alligaitor.gait` for
+    how that feeds into stride, step, and ground-contact-time
+    calculations.
+
+    A height-above-platform check was tried and dropped: drawing an
+    accurate height-threshold reference line requires knowing the current
+    frame's actual depth across the tunnel's width, and a single-anchor
+    approximation was visually misleading (a paw on the far side of the
+    tunnel could appear to cross a threshold line that was only valid for
+    a different depth) -- speed alone avoids that failure mode.
 
     Attributes:
         speed_threshold_mm_s: Maximum frame-to-frame speed, in mm/s, for a
             paw to count as planted.
-        height_threshold_mm: Maximum height above this trial's estimated
-            platform surface (see ``platform_baseline_percentile``), in
-            mm, for a paw to count as planted.
-        platform_baseline_percentile: Percentile of a paw's height trace,
-            within one trial, used to estimate that platform's surface
-            height for that paw -- low enough to reflect genuine contact
-            frames without being thrown off by a handful of outlier low
-            readings.
         min_contact_frames: Minimum number of consecutive frames a paw
-            must satisfy both thresholds to count as a real stance phase,
+            must satisfy that threshold to count as a real stance phase,
             filtering out single-frame tracking jitter.
-
-    Note there is no fixed "which axis is up" setting here: the
-    calibration board's orientation (not gravity) sets the reconstruction's
-    coordinate frame, so height is measured against a world-up direction
-    derived from the calibrated rig instead -- see
-    :func:`alligaitor.calibration.world_up_direction` and
-    :func:`alligaitor.gait.compute_trial_metrics`.
     """
 
     speed_threshold_mm_s: float = 50.0
-    height_threshold_mm: float = 5.0
-    platform_baseline_percentile: float = 5.0
     min_contact_frames: int = 2
 
 
