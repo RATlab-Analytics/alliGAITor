@@ -4,6 +4,9 @@ pulled in from object_picker.py and object_setup_dialog.py -- neither of
 which exists here, and both of which carry a lot of NOR-specific
 object-hitbox logic alliGAITor doesn't need. Extracted down to just the
 three functions crop_setup_dialog.py actually uses.
+
+RATlab-NOR is MIT-licensed (Copyright (c) 2026 Mitchell Carson); see
+../THIRD_PARTY_NOTICES.md for the full license text.
 """
 
 from __future__ import annotations

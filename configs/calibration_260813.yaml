@@ -1,0 +1,39 @@
+# alliGAITor pipeline config for the 2026-08-13 calibration recording.
+#
+# Camera mapping for this rig (confirmed 2026-08-13): cam2 is bottom;
+# cam0/cam1 are the two side cameras. Which of cam0/cam1 is "left" vs
+# "right" is arbitrary (the side model is used for both roles either way)
+# -- swap them below if it turns out to matter for your session videos'
+# own left/right convention.
+#
+# Uses a fresh H.264 re-encode of the raw MJPEG captures with an explicit
+# standard pix_fmt/color_range (coded_fixed/), not the original "coded/"
+# files: those turned out to be tagged pix_fmt=yuvj420p, color_range=pc
+# (full-range "JPEG" YUV) instead of the standard yuv420p/tv-range that
+# most H.264 decoders expect -- this is very likely why OpenCV/aniposelib
+# failed to open them ("Couldn't read video stream from file") even
+# though ffmpeg itself could. See the project chat history for the
+# full diagnosis, including the raw-file wall-clock-PTS timestamp bug
+# (fixed here too via -fflags +genpts) and why a true-lossless re-encode
+# was tried and rejected as not worth the file size over a normal CRF
+# encode for calibration purposes.
+#
+# Run with:
+#   python -m alligaitor.cli calibrate configs/calibration_260813.yaml
+#
+# Add gait-recording sessions under `sessions:` below (see
+# configs/session_example.yaml for the schema) once you're ready to run
+# the full 3D pipeline against real footage using this calibration.
+
+models:
+  side_model_dir: "../models/alliGAITor_side_ConvNeXt_slim_v1.0.0.n=315"
+  bottom_model_dir: "../models/alliGAITor_bottom_slim_v0.4.1-beta"
+
+calibration:
+  videos:
+    left: "../videos/calibration_video_260813-132431/coded_fixed/calibration_cam0_fixed.mp4"
+    right: "../videos/calibration_video_260813-132431/coded_fixed/calibration_cam1_fixed.mp4"
+    bottom: "../videos/calibration_video_260813-132431/coded_fixed/calibration_cam2_fixed.mp4"
+  output_path: "../calibration/calibration.toml"
+
+sessions: []

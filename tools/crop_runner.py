@@ -12,6 +12,9 @@ Supports two modes (mutually exclusive):
 
 Ported from RATlab-NOR's gui/crop_runner.py unchanged apart from the
 nor_classifier_dir -> tools_dir rename (see crop_worker_process.py).
+
+RATlab-NOR is MIT-licensed (Copyright (c) 2026 Mitchell Carson); see
+../THIRD_PARTY_NOTICES.md for the full license text.
 """
 
 from __future__ import annotations

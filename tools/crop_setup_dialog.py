@@ -34,6 +34,9 @@ Ported from RATlab-NOR's gui/crop_setup_dialog.py, with two changes:
      native-frame pixel coordinates throughout (the same coordinates
      video_crop.crop_video() takes); only paintEvent and the mouse
      handlers convert to/from the current display scale.
+
+RATlab-NOR is MIT-licensed (Copyright (c) 2026 Mitchell Carson); see
+../THIRD_PARTY_NOTICES.md for the full license text.
 """
 
 from __future__ import annotations
