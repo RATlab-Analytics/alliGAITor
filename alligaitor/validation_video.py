@@ -4,8 +4,12 @@ Stacks a session's three camera views vertically (left, bottom, right --
 each the same cropped, model-input clip :mod:`alligaitor.inference`
 actually ran on) with the triangulated skeleton reprojected back into
 every view: skeleton edges, paw nodes colored by ground-contact state (and
-red wherever the contributing cameras substantially disagree), and an
-accumulating footprint marker at each detected touchdown.
+red wherever the contributing cameras substantially disagree), an
+accumulating footprint marker at each detected touchdown, and a
+per-camera warning banner wherever that specific camera's dropped
+detection looks like it broke up a real stance phase into fragments too
+short to survive :attr:`alligaitor.config.GaitConfig.min_contact_frames`
+(see :func:`alligaitor.gait.find_camera_caused_discards`).
 
 Meant as the audit trail for tuning :class:`alligaitor.config.GaitConfig`
 by eye rather than by staring at numbers alone: every color and marker
@@ -22,7 +26,7 @@ import cv2
 import numpy as np
 from aniposelib.cameras import CameraGroup
 
-from alligaitor import cropping, gait
+from alligaitor import cropping, gait, pipeline, triangulation
 from alligaitor.config import CAMERA_ROLES, GaitConfig, SessionConfig
 from alligaitor.gait import PAW_NODES, TrialMetrics
 from alligaitor.timing import video_fps
@@ -45,9 +49,73 @@ _PAW_SWING_COLOR = (255, 140, 0)
 _PAW_CONTACT_COLOR = (0, 200, 0)
 _DISAGREEMENT_COLOR = (0, 0, 255)
 _FOOTPRINT_COLOR = (255, 0, 255)
+_DROP_WARNING_COLOR = (0, 0, 220)
 
 _NODE_RADIUS = 5
 _FOOTPRINT_RADIUS = 4
+
+
+def _camera_drop_warnings(
+    session: SessionConfig,
+    times: np.ndarray,
+    positions: Dict[str, np.ndarray],
+    config: GaitConfig,
+) -> Dict[str, Dict[int, List[str]]]:
+    """Per role, per (shared-timeline) frame, which paw(s) that camera's
+    dropped detection plausibly cost a stance phase -- see
+    :func:`alligaitor.gait.find_camera_caused_discards`.
+
+    Reloads and re-aligns each role's raw 2D predictions (the same cached
+    ``<role>.predictions.slp`` triangulation used) to see which camera(s)
+    actually had a valid detection on each frame, independent of whether
+    the fused 3D point survived. ``positions`` is bridged the same way
+    :func:`alligaitor.gait.compute_trial_metrics` bridges it (see
+    :func:`alligaitor.gait.bridge_short_gaps`) before looking for
+    discards, so this diagnostic only flags gaps actually long enough to
+    have mattered to the real classification -- a short gap the trial's
+    own stance detection already bridged over isn't a discard to warn
+    about.
+    """
+    tracks = {}
+    fps_by_role = {}
+    for role in CAMERA_ROLES:
+        slp_path = session.output_dir / f"{role}.predictions.slp"
+        tracks[role] = pipeline.load_track(session.videos[role], slp_path)
+        fps_by_role[role] = video_fps(session.videos[role])
+    aligned = triangulation.align_tracks_by_time(tracks, fps_by_role)
+
+    warnings_by_role: Dict[str, Dict[int, List[str]]] = {role: {} for role in CAMERA_ROLES}
+    for paw in PAW_NODES:
+        node_idx = {role: aligned[role].node_names.index(paw) for role in CAMERA_ROLES}
+        cam_valid = {
+            role: ~np.isnan(aligned[role].points[:, node_idx[role], :]).any(axis=1) for role in CAMERA_ROLES
+        }
+        bridged = gait.bridge_short_gaps(positions[paw], config.max_bridge_gap_frames)
+        exclude_camera = gait.FAR_SIDE_CAMERA[paw]
+        discards = gait.find_camera_caused_discards(
+            times, bridged, cam_valid, config, exclude_camera=exclude_camera
+        )
+        for discard in discards:
+            # discard.dropped_by is the union of whichever camera(s) were
+            # missing at the window's start vs. end boundary -- not every
+            # camera in that set was necessarily missing on every frame
+            # in between. Re-check per frame so a camera that had a
+            # perfectly good detection partway through the window (see
+            # frames 80-81 in the 79-82 example this was built against)
+            # isn't shown as having dropped it there too.
+            for f in range(discard.start_frame, discard.end_frame + 1):
+                for role in CAMERA_ROLES:
+                    if role != exclude_camera and not cam_valid[role][f]:
+                        warnings_by_role[role].setdefault(f, []).append(paw)
+    return warnings_by_role
+
+
+def _draw_drop_warning(panel: np.ndarray, paws: List[str]) -> None:
+    text = "DROPPED: " + ", ".join(sorted(set(paws)))
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+    x0 = max(panel.shape[1] - tw - 12, 0)
+    cv2.rectangle(panel, (x0 - 4, 2), (panel.shape[1] - 2, th + 12), _DROP_WARNING_COLOR, -1)
+    cv2.putText(panel, text, (x0, th + 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
 
 def _reproject_footprints(
@@ -124,6 +192,7 @@ def export_validation_video(
     crop_offset = {role: cropping.crop_offset_for_video(session.videos[role]) for role in CAMERA_ROLES}
 
     footprints_by_role = _reproject_footprints(positions, trial, cgroup, cam_index, crop_offset)
+    drop_warnings_by_role = _camera_drop_warnings(session, times, positions, config)
 
     caps = {role: cv2.VideoCapture(str(session.videos[role])) for role in CAMERA_ROLES}
     native_frame_counts = {role: int(caps[role].get(cv2.CAP_PROP_FRAME_COUNT)) for role in CAMERA_ROLES}
@@ -184,6 +253,11 @@ def export_validation_video(
                     panel, f"{role}  frame {native_idx}/{native_frame_counts[role] - 1}",
                     (4, panel.shape[0] - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1,
                 )
+
+                active_drops = drop_warnings_by_role.get(role, {}).get(i)
+                if active_drops:
+                    _draw_drop_warning(panel, active_drops)
+
                 panels.append(panel)
 
             max_w = max(p.shape[1] for p in panels)
@@ -192,7 +266,11 @@ def export_validation_video(
             cv2.putText(composite, f"t={t:.3f}s", (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
             if writer is None:
-                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                # "mp4v" (MPEG-4 Part 2) writes a technically-valid stream
+                # but many players (QuickTime, Safari, in-app previews)
+                # render it as garbled macroblocks rather than falling
+                # back gracefully -- "avc1" (H.264) is broadly playable.
+                fourcc = cv2.VideoWriter_fourcc(*"avc1")
                 writer = cv2.VideoWriter(str(output_path), fourcc, fps_by_role[reference_role], (composite.shape[1], composite.shape[0]))
             writer.write(composite)
     finally:

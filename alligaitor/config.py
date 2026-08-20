@@ -162,10 +162,21 @@ class GaitConfig:
         min_contact_frames: Minimum number of consecutive frames a paw
             must satisfy that threshold to count as a real stance phase,
             filtering out single-frame tracking jitter.
+        max_bridge_gap_frames: Untriangulated runs of at most this many
+            frames, bounded by a valid frame on both sides, are linearly
+            interpolated before speed/stance is computed at all -- jitter
+            and brief per-camera dropouts will always happen even with
+            good models, and this keeps a real stance phase from being
+            fragmented into pieces too short to individually survive
+            ``min_contact_frames`` just because of a momentary gap.
+            Longer gaps are left as real gaps (see
+            :func:`alligaitor.gait.find_camera_caused_discards`). ``0``
+            disables bridging entirely.
     """
 
     speed_threshold_mm_s: float = 50.0
     min_contact_frames: int = 2
+    max_bridge_gap_frames: int = 2
 
 
 @dataclass

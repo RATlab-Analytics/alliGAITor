@@ -69,6 +69,15 @@ def run_session(
         tracks[role] = load_track(video_path, slp_path)
         fps_by_role[role] = video_fps(video_path)
 
+    # triangulation.triangulate_axis_prioritized() also exists (see its
+    # docstring), but isn't used here: on real data it barely applies to
+    # paws at all (they almost never have all three cameras valid
+    # simultaneously) and measurably worsens body-node reprojection
+    # error, apparently because the calibration's side cameras disagree
+    # on world "up" by ~30 degrees (see
+    # calibration.world_up_direction's own warning), undermining the
+    # "sides are reliable for height" assumption it's built on. Revisit
+    # once that calibration issue is understood/fixed.
     pose_3d = triangulation.triangulate(tracks, cgroup, fps_by_role)
     # Matches triangulation.align_tracks_by_time's choice of reference
     # timeline: the pose is resampled onto the slowest camera's own frame

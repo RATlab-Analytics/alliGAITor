@@ -16,10 +16,11 @@ otherwise correspond to frame index ``i`` in another's.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
+import cv2
 import numpy as np
-from aniposelib.cameras import CameraGroup
+from aniposelib.cameras import Camera, CameraGroup
 
 from alligaitor.config import CAMERA_ROLES
 from alligaitor.inference import PoseTrack2D
@@ -132,6 +133,28 @@ def align_tracks_by_time(
     return aligned
 
 
+def _stacked_2d_points(
+    tracks: Dict[str, PoseTrack2D], cgroup: CameraGroup, fps_by_role: Dict[str, float]
+) -> "Tuple[List[str], List[str], np.ndarray]":
+    """Shared groundwork for triangulation: validate inputs, align views
+    onto a shared timeline, and stack them into aniposelib's expected
+    ``(n_cams, n_frames, n_nodes, 2)`` layout, cameras ordered to match
+    ``cgroup.get_names()``. Returns ``(node_order, cam_names, stacked)``.
+    """
+    missing = [role for role in CAMERA_ROLES if role not in tracks]
+    if missing:
+        raise ValueError(f"Missing camera view(s) for triangulation: {missing}")
+    missing_fps = [role for role in CAMERA_ROLES if role not in fps_by_role]
+    if missing_fps:
+        raise ValueError(f"Missing frame rate for camera view(s): {missing_fps}")
+
+    aligned = align_tracks_by_time(tracks, fps_by_role)
+    node_order = _canonical_node_order(aligned)
+    cam_names = cgroup.get_names()
+    stacked = np.stack([_reindex(aligned[role], node_order) for role in cam_names], axis=0)
+    return node_order, cam_names, stacked
+
+
 def triangulate(
     tracks: Dict[str, PoseTrack2D], cgroup: CameraGroup, fps_by_role: Dict[str, float]
 ) -> Pose3D:
@@ -152,22 +175,9 @@ def triangulate(
     Returns:
         The triangulated 3D trajectory, at the slowest camera's frame rate.
     """
-    missing = [role for role in CAMERA_ROLES if role not in tracks]
-    if missing:
-        raise ValueError(f"Missing camera view(s) for triangulation: {missing}")
-    missing_fps = [role for role in CAMERA_ROLES if role not in fps_by_role]
-    if missing_fps:
-        raise ValueError(f"Missing frame rate for camera view(s): {missing_fps}")
+    node_order, cam_names, stacked = _stacked_2d_points(tracks, cgroup, fps_by_role)
+    n_frames, n_nodes = stacked.shape[1], stacked.shape[2]
 
-    aligned = align_tracks_by_time(tracks, fps_by_role)
-
-    node_order = _canonical_node_order(aligned)
-    n_frames = next(iter(aligned.values())).points.shape[0]
-    n_nodes = len(node_order)
-
-    cam_names = cgroup.get_names()
-    # (n_cams, n_frames, n_nodes, 2)
-    stacked = np.stack([_reindex(aligned[role], node_order) for role in cam_names], axis=0)
     # aniposelib expects (n_cams, n_points, 2); flatten frames and nodes together.
     points_2d = stacked.reshape(len(cam_names), n_frames * n_nodes, 2)
 
@@ -178,3 +188,139 @@ def triangulate(
     error = error_flat.reshape(n_frames, n_nodes)
 
     return Pose3D(node_names=node_order, points=points_3d, reprojection_error=error)
+
+
+def _camera_ray_world(cam: Camera, point_2d: np.ndarray) -> "Tuple[np.ndarray, np.ndarray]":
+    """The 3D ray (origin, unit direction) through one camera's optical
+    center and a single 2D pixel, in the calibration's reference frame.
+
+    ``cv2.undistortPoints`` (what :meth:`Camera.undistort_points` wraps),
+    called without a projection matrix, returns *normalized* camera-plane
+    coordinates rather than pixel coordinates -- i.e. already
+    ``K^-1``-applied and distortion-corrected -- so ``[x, y, 1]`` in that
+    space is directly a ray direction in the camera's own frame.
+    """
+    undistorted = cam.undistort_points(point_2d.reshape(1, 2)).reshape(2)
+    direction_cam = np.array([undistorted[0], undistorted[1], 1.0])
+    rotation, _ = cv2.Rodrigues(cam.get_rotation())
+    origin = -rotation.T @ cam.get_translation().reshape(3)
+    direction = rotation.T @ direction_cam
+    direction = direction / np.linalg.norm(direction)
+    return origin, direction
+
+
+def _ray_plane_intersection(
+    origin: np.ndarray, direction: np.ndarray, up_direction: np.ndarray, height: float
+) -> Optional[np.ndarray]:
+    """Where a ray crosses the horizontal plane at ``height`` (in the same
+    ``xyz @ up_direction`` convention used throughout the gait pipeline),
+    or ``None`` if the ray runs (near-)parallel to that plane.
+    """
+    denom = float(direction @ up_direction)
+    if abs(denom) < 1e-6:
+        return None
+    s = (height - float(origin @ up_direction)) / denom
+    return origin + s * direction
+
+
+def triangulate_axis_prioritized(
+    tracks: Dict[str, PoseTrack2D],
+    cgroup: CameraGroup,
+    fps_by_role: Dict[str, float],
+    up_direction: np.ndarray,
+    blend_weight: float = 0.5,
+) -> Pose3D:
+    """Like :func:`triangulate`, but for every (frame, node) where all
+    three cameras have a valid 2D detection, blends in a two-stage,
+    axis-prioritized reconstruction alongside aniposelib's uniform
+    multi-view least squares: height (position along ``up_direction``)
+    comes from triangulating the two side cameras alone, and X/Y comes
+    from intersecting the bottom camera's own ray with the plane at that
+    height.
+
+    This exists because the three cameras are not equally well
+    conditioned for every axis. The bottom camera's image plane is
+    roughly parallel to the platform, so it strongly constrains X/Y but
+    is poorly conditioned along its own near-vertical optical axis; the
+    side cameras are the reverse -- their image-vertical axis *is* world
+    up (see :func:`alligaitor.calibration.world_up_direction`, which is
+    derived from exactly that). Uniform least-squares triangulation
+    blends all three rays roughly symmetrically, which can land a point
+    between what each view actually saw rather than trusting whichever
+    view is actually reliable for a given axis -- consistent with
+    reprojected points visibly drifting off a paw that every single 2D
+    model tracked accurately.
+
+    The two estimates are blended in 3D (not hard-swapped) because a pure
+    axis-prioritized point turned out to have a real cost verified
+    against this rig's own data: on frames where the three 2D detections
+    already agree well, both methods land within a fraction of a
+    millimeter of each other, so blending changes essentially nothing.
+    But on frames where the detections disagree with each other (real
+    per-frame tracking noise, not a calibration issue -- verified by
+    checking the *uniform* method's own per-camera reprojection error on
+    such frames, which is large too), uniform least-squares damps that
+    disagreement by spreading it across all three views, while a hard
+    axis-prioritized commitment has no such redundancy and fully
+    inherits whichever camera's noise it trusted. Blending keeps some of
+    that damping while still leaning toward the better-conditioned view
+    per axis.
+
+    Falls back entirely to :func:`triangulate`'s standard result wherever
+    fewer than all three cameras have a valid detection (including the
+    degenerate case where the bottom camera's ray turns out
+    near-parallel to the height plane) -- axis-prioritized weighting
+    isn't meaningful, or even possible, with less than the full
+    three-view case.
+
+    Args:
+        tracks: Same as :func:`triangulate`.
+        cgroup: Same as :func:`triangulate`.
+        fps_by_role: Same as :func:`triangulate`.
+        up_direction: Unit vector, in the calibration's reference frame,
+            pointing away from the platform surface.
+        blend_weight: How much of the axis-prioritized estimate to blend
+            in, from ``0.0`` (pure uniform least squares -- identical to
+            :func:`triangulate`) to ``1.0`` (pure axis-prioritized, the
+            original hard-commit version). ``0.5`` is an even blend.
+
+    Returns:
+        The triangulated 3D trajectory, at the slowest camera's frame rate.
+    """
+    baseline = triangulate(tracks, cgroup, fps_by_role)
+    node_order, cam_names, stacked = _stacked_2d_points(tracks, cgroup, fps_by_role)
+    n_frames, n_nodes = stacked.shape[1], stacked.shape[2]
+    cam_idx = {role: cam_names.index(role) for role in CAMERA_ROLES}
+
+    pts_left = stacked[cam_idx["left"]].reshape(-1, 2)
+    pts_right = stacked[cam_idx["right"]].reshape(-1, 2)
+    pts_bottom = stacked[cam_idx["bottom"]].reshape(-1, 2)
+    all_three_valid = (
+        ~np.isnan(pts_left).any(axis=1) & ~np.isnan(pts_right).any(axis=1) & ~np.isnan(pts_bottom).any(axis=1)
+    )
+
+    points = baseline.points.reshape(-1, 3).copy()
+    if all_three_valid.any():
+        side_group = CameraGroup([cgroup.cameras[cam_idx["left"]], cgroup.cameras[cam_idx["right"]]])
+        bottom_cam = cgroup.cameras[cam_idx["bottom"]]
+
+        idx = np.flatnonzero(all_three_valid)
+        side_points = np.stack([pts_left[idx], pts_right[idx]], axis=0)  # (2, n_selected, 2)
+        side_points_3d = side_group.triangulate(side_points, undistort=True)  # (n_selected, 3)
+        heights = side_points_3d @ up_direction
+
+        for k, i in enumerate(idx):
+            origin, direction = _camera_ray_world(bottom_cam, pts_bottom[i])
+            intersection = _ray_plane_intersection(origin, direction, up_direction, float(heights[k]))
+            if intersection is not None:
+                points[i] = (1 - blend_weight) * points[i] + blend_weight * intersection
+            # else: near-parallel bottom ray -- keep the baseline point.
+
+    points_2d = stacked.reshape(len(cam_names), n_frames * n_nodes, 2)
+    error_flat = cgroup.reprojection_error(points, points_2d, mean=True)
+
+    return Pose3D(
+        node_names=node_order,
+        points=points.reshape(n_frames, n_nodes, 3),
+        reprojection_error=error_flat.reshape(n_frames, n_nodes),
+    )
