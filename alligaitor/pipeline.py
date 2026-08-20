@@ -116,6 +116,25 @@ def _load_or_calibrate(calib_config) -> CameraGroup:
     return calibration.calibrate(calib_config)
 
 
+def aligned_camera_validity(session: SessionConfig) -> "dict":
+    """Per paw, per camera role, whether that camera had a valid 2D
+    detection on each shared-timeline frame -- reloads and re-aligns
+    each role's cached ``<role>.predictions.slp`` (must already exist,
+    e.g. from :func:`run_session`) rather than rerunning inference. See
+    :func:`alligaitor.gait.cam_valid_by_paw_from_aligned`.
+    """
+    from alligaitor import gait  # local import: avoids a pipeline<->gait import cycle
+
+    tracks = {}
+    fps_by_role = {}
+    for role in CAMERA_ROLES:
+        slp_path = session.output_dir / f"{role}.predictions.slp"
+        tracks[role] = load_track(session.videos[role], slp_path)
+        fps_by_role[role] = video_fps(session.videos[role])
+    aligned = triangulation.align_tracks_by_time(tracks, fps_by_role)
+    return gait.cam_valid_by_paw_from_aligned(aligned)
+
+
 def run_pipeline(config: PipelineConfig, device: str = "auto", tracking: bool = False) -> List[Path]:
     """Run calibration (loading a saved one if present) and triangulate every session."""
     cgroup = _load_or_calibrate(config.calibration)
@@ -150,6 +169,10 @@ def run_group(config: PipelineConfig, device: str = "auto", tracking: bool = Fal
             rat_id=session.rat_id,
             config=config.gait,
         )
+
+        times, positions, _ = gait.load_pose_3d(csv_path)
+        trial = gait.restrict_to_consecutive_runs(trial, times, positions, config.gait)
+
         gait.save_paw_events_csv(trial, session.output_dir / f"{session.name}.paw_events.csv")
         trials.append(trial)
 

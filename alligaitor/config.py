@@ -160,8 +160,15 @@ class GaitConfig:
         speed_threshold_mm_s: Maximum frame-to-frame speed, in mm/s, for a
             paw to count as planted.
         min_contact_frames: Minimum number of consecutive frames a paw
-            must satisfy that threshold to count as a real stance phase,
-            filtering out single-frame tracking jitter.
+            must satisfy that threshold to count as a real stance phase.
+            Originally meant to filter out single-frame tracking jitter,
+            but on real data (this rig, ~12.5fps) speed cleanly separates
+            into two well-defined clusters with almost nothing between
+            them -- a single frame landing in the low cluster is real
+            evidence of a (likely brief) stance, not noise near a fuzzy
+            boundary, and requiring 2 consecutive frames was discarding
+            most genuine forepaw stances (which are often only one frame
+            long at this frame rate). Defaults to ``1`` accordingly.
         max_bridge_gap_frames: Untriangulated runs of at most this many
             frames, bounded by a valid frame on both sides, are linearly
             interpolated before speed/stance is computed at all -- jitter
@@ -172,11 +179,22 @@ class GaitConfig:
             Longer gaps are left as real gaps (see
             :func:`alligaitor.gait.find_camera_caused_discards`). ``0``
             disables bridging entirely.
+        min_consecutive_steps: A paw's reported stride/step/ground-contact
+            averages are computed only from steps that are part of a run
+            of at least this many consecutive accepted stance events with
+            no camera-caused discard (see
+            :func:`alligaitor.gait.find_camera_caused_discards`) in the
+            swing between any pair -- an isolated good detection that
+            isn't part of such a run doesn't count, and a paw with no
+            qualifying run at all reports ``NaN`` rather than an average
+            built from too little (or too suspect) data. See
+            :func:`alligaitor.gait.restrict_to_consecutive_runs`.
     """
 
     speed_threshold_mm_s: float = 50.0
-    min_contact_frames: int = 2
+    min_contact_frames: int = 1
     max_bridge_gap_frames: int = 2
+    min_consecutive_steps: int = 5
 
 
 @dataclass

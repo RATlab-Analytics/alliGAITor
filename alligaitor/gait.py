@@ -34,14 +34,15 @@ exactly the frames this module treated as ground contact.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
 
-from alligaitor.config import GaitConfig
+from alligaitor.config import CAMERA_ROLES, GaitConfig
+from alligaitor.inference import PoseTrack2D
 
 PathLike = Union[str, Path]
 
@@ -278,16 +279,13 @@ def _detect_paw_events(times: np.ndarray, xyz: np.ndarray, config: GaitConfig) -
 
 @dataclass
 class DiscardedStance:
-    """A raw stance candidate too short to survive ``min_contact_frames``,
-    where a triangulation gap right at its boundary looks like the cause.
+    """An untriangulated gap that could plausibly be hiding a real step.
 
     Attributes:
-        start_frame: First frame of the affected window -- the discarded
-            run itself, extended back to the gap frame that broke it.
-        end_frame: Last frame of the affected window, similarly extended
-            forward if the frame right after the run is also a gap.
-        dropped_by: Camera role(s) missing a valid detection at whichever
-            gap frame(s) caused the discard.
+        start_frame: First frame of the gap.
+        end_frame: Last frame of the gap.
+        dropped_by: Camera role(s) missing a valid detection somewhere
+            in the gap.
     """
 
     start_frame: int
@@ -296,76 +294,224 @@ class DiscardedStance:
 
 
 def find_camera_caused_discards(
-    times: np.ndarray,
-    xyz: np.ndarray,
+    bridged_xyz: np.ndarray,
     cam_valid: Dict[str, np.ndarray],
-    config: GaitConfig,
     exclude_camera: Optional[str] = None,
 ) -> List[DiscardedStance]:
-    """Find discarded stance candidates a camera dropout plausibly caused.
+    """Find every untriangulated gap bounded by a triangulated frame on
+    both sides, and which camera(s) -- other than ``exclude_camera`` --
+    were missing somewhere in it.
 
-    A raw candidate run of planted frames (see :func:`_raw_stance_candidates`)
-    either survives ``min_contact_frames`` filtering or it doesn't; this
-    looks at *why* the discarded ones were short. Speed is a backward
-    difference, so a frame right after a triangulation gap has no valid
-    predecessor to measure speed against and can never itself be
-    classified planted, even though its own position is perfectly good --
-    walking back from a short run through that chain of
-    "position known, speed undefined" frames finds the actual gap
-    responsible, and ``cam_valid`` says which camera(s) were missing
-    there. The same check runs forward one frame, since a gap
-    immediately after a run also cuts it short.
+    ``bridged_xyz`` should already have short gaps interpolated (see
+    :func:`bridge_short_gaps`), so what's left here is exactly the
+    gaps long/unresolved enough to matter -- the same trajectory
+    :func:`_qualifying_runs` uses to decide whether two detected steps
+    can be trusted as truly consecutive. (An earlier version of this
+    function instead looked for stance candidates *rejected* by
+    ``min_contact_frames`` for being too short; that check went silently
+    vacuous once ``min_contact_frames`` defaulted to 1, since nothing is
+    ever too short to survive anymore. Checking the bridged trajectory
+    directly for real gaps doesn't depend on that threshold at all.)
+
+    A gap touching either end of the trial (no bounding valid frame on
+    one side) isn't reported -- there's no before/after step it could
+    plausibly be separating.
 
     Args:
-        times: This paw's per-frame timestamps.
-        xyz: This paw's ``(n_frames, 3)`` triangulated positions.
+        bridged_xyz: One paw's ``(n_frames, 3)`` bridged positions.
         cam_valid: Per camera role, an ``(n_frames,)`` boolean array --
             whether that camera had a valid (aligned) 2D detection for
             this paw on each frame. See
             :func:`alligaitor.triangulation.align_tracks_by_time`.
-        config: The same :class:`GaitConfig` used to detect stance.
         exclude_camera: A camera role never counted as having dropped the
             paw -- e.g. :data:`FAR_SIDE_CAMERA`\\ [paw], since that
-            camera not seeing this paw is expected, not a failure. A gap
-            frame always has at least 2 missing cameras by construction
-            (triangulation needs >=2 valid), so excluding one never
-            empties a window's attribution entirely.
+            camera not seeing this paw is expected, not a failure. A
+            genuine gap always has at least one non-excluded camera
+            missing somewhere in it: triangulation needs >=2 valid
+            cameras, so if both non-excluded cameras were valid
+            throughout, there'd be no gap to find in the first place.
     """
-    n = len(times)
-    _, speed, runs = _raw_stance_candidates(times, xyz, config)
-    valid = ~np.isnan(xyz).any(axis=1)
-    discarded = [(s, e) for s, e in runs if (e - s + 1) < config.min_contact_frames]
+    valid = ~np.isnan(bridged_xyz).any(axis=1)
+    n = len(valid)
 
-    def _cameras_missing_at(f: int) -> List[str]:
-        return sorted(role for role, cv in cam_valid.items() if role != exclude_camera and not cv[f])
+    def _cameras_missing_at(f: int) -> "set[str]":
+        return {role for role, cv in cam_valid.items() if role != exclude_camera and not cv[f]}
 
     results = []
-    for run_start, run_end in discarded:
-        dropped_by = set()
-        window_start, window_end = run_start, run_end
-
-        j = run_start - 1
-        while j >= 0:
-            if not valid[j]:
-                dropped_by.update(_cameras_missing_at(j))
-                window_start = j
-                break
-            elif np.isnan(speed[j]):
-                # Valid position, but its own predecessor blocked its
-                # speed -- keep walking back through the chain.
-                window_start = j
-                j -= 1
-            else:
-                break  # a real (fast) swing frame: a genuine boundary, not a gap.
-
-        if run_end + 1 < n and not valid[run_end + 1]:
-            dropped_by.update(_cameras_missing_at(run_end + 1))
-            window_end = run_end + 1
-
-        if dropped_by:
-            results.append(DiscardedStance(window_start, window_end, sorted(dropped_by)))
+    i = 0
+    while i < n:
+        if valid[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and not valid[j]:
+            j += 1
+        if i > 0 and j < n:  # interior gap only -- skip leading/trailing edges
+            dropped_by = set()
+            for f in range(i, j):
+                dropped_by |= _cameras_missing_at(f)
+            if dropped_by:
+                results.append(DiscardedStance(i, j - 1, sorted(dropped_by)))
+        i = j
 
     return results
+
+
+def cam_valid_by_paw_from_aligned(aligned: Dict[str, PoseTrack2D]) -> Dict[str, Dict[str, np.ndarray]]:
+    """Per paw, per camera role, whether that camera had a valid 2D
+    detection on each shared-timeline frame -- the ``cam_valid`` input
+    :func:`find_camera_caused_discards` needs, derived from tracks
+    already resampled onto the shared timeline (see
+    :func:`alligaitor.triangulation.align_tracks_by_time`).
+    """
+    cam_valid_by_paw = {}
+    for paw in PAW_NODES:
+        node_idx = {role: aligned[role].node_names.index(paw) for role in CAMERA_ROLES}
+        cam_valid_by_paw[paw] = {
+            role: ~np.isnan(aligned[role].points[:, node_idx[role], :]).any(axis=1) for role in CAMERA_ROLES
+        }
+    return cam_valid_by_paw
+
+
+def compute_discards_by_paw(
+    positions: Dict[str, np.ndarray],
+    cam_valid_by_paw: Dict[str, Dict[str, np.ndarray]],
+    config: GaitConfig,
+) -> Dict[str, List[DiscardedStance]]:
+    """Per paw, its camera-caused discarded gaps (see
+    :func:`find_camera_caused_discards`), bridging short gaps first --
+    matching what :func:`compute_trial_metrics` itself does, so this is
+    checking against the same trajectory the real stance detection sees.
+    """
+    return {
+        paw: find_camera_caused_discards(
+            bridge_short_gaps(positions[paw], config.max_bridge_gap_frames),
+            cam_valid_by_paw[paw],
+            exclude_camera=FAR_SIDE_CAMERA[paw],
+        )
+        for paw in PAW_NODES
+    }
+
+
+def _qualifying_runs(events: PawEvents, bridged_xyz: np.ndarray, min_run: int) -> List[Tuple[int, int]]:
+    """Maximal runs of consecutive accepted stance events, as ``(start, end)``
+    index pairs into ``events``' arrays, with no remaining untriangulated
+    frame -- *after* bridging (see :func:`bridge_short_gaps`) -- anywhere
+    in the swing between any adjacent pair in the run, at least
+    ``min_run`` events long.
+
+    This used to check for a :func:`find_camera_caused_discards` window
+    instead, but that specifically flags a raw candidate run *rejected*
+    for being too short -- and with
+    :attr:`alligaitor.config.GaitConfig.min_contact_frames` at its
+    current default of 1, no candidate is ever too short to survive, so
+    that check had gone permanently vacuous (always "no discards found",
+    regardless of how much real data was actually missing). Checking the
+    bridged trajectory directly asks the question that actually matters
+    here: is there *any* untriangulated stretch between these two steps
+    that could be hiding a real one -- independent of whether any
+    isolated candidate frame happened to survive inside it. See
+    :func:`restrict_to_consecutive_runs`.
+    """
+    n = events.touchdown_frames.size
+    if n == 0:
+        return []
+
+    valid = ~np.isnan(bridged_xyz).any(axis=1)
+    clean_pair = np.ones(max(n - 1, 0), dtype=bool)
+    for i in range(n - 1):
+        gap_start, gap_end = events.liftoff_frames[i], events.touchdown_frames[i + 1]
+        clean_pair[i] = bool(valid[gap_start : gap_end + 1].all())
+
+    runs = []
+    start = 0
+    for i in range(n - 1):
+        if not clean_pair[i]:
+            runs.append((start, i))
+            start = i + 1
+    runs.append((start, n - 1))
+
+    return [(s, e) for s, e in runs if (e - s + 1) >= min_run]
+
+
+def restrict_to_consecutive_runs(
+    trial: TrialMetrics,
+    times: np.ndarray,
+    positions: Dict[str, np.ndarray],
+    config: GaitConfig,
+) -> TrialMetrics:
+    """Recompute stride/step/ground-contact-time averages from only the
+    steps that are part of a qualifying run (see
+    :attr:`alligaitor.config.GaitConfig.min_consecutive_steps` and
+    :func:`_qualifying_runs`) -- an isolated good detection outside any
+    such run doesn't feed the averages, and a paw with no qualifying run
+    at all reports ``NaN``. ``trial.paw_events`` (every detected event,
+    whether or not it ended up counted) is left untouched, so the
+    validation video and raw event log still show everything that was
+    actually detected -- only the summary numbers are restricted.
+
+    Args:
+        trial: Already-computed metrics (see :func:`compute_trial_metrics`).
+        times: This trial's per-frame timestamps (see :func:`load_pose_3d`).
+        positions: This trial's per-node positions (see :func:`load_pose_3d`).
+        config: The same :class:`GaitConfig` ``trial`` was computed with.
+    """
+    _, _, forward = _crossing_time_and_speed(times, positions[REFERENCE_NODE])
+
+    stride_length_mm, step_length_mm, ground_contact_time_s = {}, {}, {}
+    n_contacts, n_strides, n_steps = {}, {}, {}
+
+    for paw in PAW_NODES:
+        events = trial.paw_events[paw]
+        contra_events = trial.paw_events[CONTRALATERAL[paw]]
+        bridged = bridge_short_gaps(positions[paw], config.max_bridge_gap_frames)
+        runs = _qualifying_runs(events, bridged, config.min_consecutive_steps)
+
+        if not runs:
+            stride_length_mm[paw] = float("nan")
+            step_length_mm[paw] = float("nan")
+            ground_contact_time_s[paw] = float("nan")
+            n_contacts[paw] = 0
+            n_strides[paw] = 0
+            n_steps[paw] = 0
+            continue
+
+        strides_parts, steps_parts, durations_parts = [], [], []
+        total_contacts = 0
+        for s, e in runs:
+            run_events = PawEvents(
+                touchdown_frames=events.touchdown_frames[s : e + 1],
+                liftoff_frames=events.liftoff_frames[s : e + 1],
+                touchdown_times=events.touchdown_times[s : e + 1],
+                liftoff_times=events.liftoff_times[s : e + 1],
+            )
+            strides_parts.append(_stride_lengths(run_events, positions[paw], forward))
+            steps_parts.append(
+                _step_lengths(run_events, contra_events, positions[paw], positions[CONTRALATERAL[paw]], forward)
+            )
+            durations_parts.append(run_events.liftoff_times - run_events.touchdown_times)
+            total_contacts += run_events.touchdown_frames.size
+
+        strides = np.concatenate(strides_parts)
+        steps = np.concatenate(steps_parts)
+        durations = np.concatenate(durations_parts)
+
+        stride_length_mm[paw] = float(np.mean(strides)) if strides.size else float("nan")
+        step_length_mm[paw] = float(np.mean(steps)) if steps.size else float("nan")
+        ground_contact_time_s[paw] = float(np.mean(durations)) if durations.size else float("nan")
+        n_contacts[paw] = total_contacts
+        n_strides[paw] = int(strides.size)
+        n_steps[paw] = int(steps.size)
+
+    return replace(
+        trial,
+        stride_length_mm=stride_length_mm,
+        step_length_mm=step_length_mm,
+        ground_contact_time_s=ground_contact_time_s,
+        n_contacts=n_contacts,
+        n_strides=n_strides,
+        n_steps=n_steps,
+    )
 
 
 def _stride_lengths(events: PawEvents, xyz: np.ndarray, forward: np.ndarray) -> np.ndarray:

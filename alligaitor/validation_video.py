@@ -83,19 +83,14 @@ def _camera_drop_warnings(
         tracks[role] = pipeline.load_track(session.videos[role], slp_path)
         fps_by_role[role] = video_fps(session.videos[role])
     aligned = triangulation.align_tracks_by_time(tracks, fps_by_role)
+    cam_valid_by_paw = gait.cam_valid_by_paw_from_aligned(aligned)
+    discards_by_paw = gait.compute_discards_by_paw(positions, cam_valid_by_paw, config)
 
     warnings_by_role: Dict[str, Dict[int, List[str]]] = {role: {} for role in CAMERA_ROLES}
     for paw in PAW_NODES:
-        node_idx = {role: aligned[role].node_names.index(paw) for role in CAMERA_ROLES}
-        cam_valid = {
-            role: ~np.isnan(aligned[role].points[:, node_idx[role], :]).any(axis=1) for role in CAMERA_ROLES
-        }
-        bridged = gait.bridge_short_gaps(positions[paw], config.max_bridge_gap_frames)
+        cam_valid = cam_valid_by_paw[paw]
         exclude_camera = gait.FAR_SIDE_CAMERA[paw]
-        discards = gait.find_camera_caused_discards(
-            times, bridged, cam_valid, config, exclude_camera=exclude_camera
-        )
-        for discard in discards:
+        for discard in discards_by_paw[paw]:
             # discard.dropped_by is the union of whichever camera(s) were
             # missing at the window's start vs. end boundary -- not every
             # camera in that set was necessarily missing on every frame
