@@ -189,12 +189,34 @@ class GaitConfig:
             qualifying run at all reports ``NaN`` rather than an average
             built from too little (or too suspect) data. See
             :func:`alligaitor.gait.restrict_to_consecutive_runs`.
+        stillness_speed_threshold_mm_s: Below this frame-to-frame speed,
+            in mm/s, the whole-body reference node (see
+            ``alligaitor.gait.REFERENCE_NODE``) counts as not translating.
+            Used to trim any leading/trailing stretch where the rat has
+            stopped moving -- once the body itself is stationary, a
+            paw's own position can still jitter across
+            ``speed_threshold_mm_s`` from tracking noise alone, which
+            would otherwise look like a run of real steps in place. This
+            is a much lower bar than ``speed_threshold_mm_s``: it's
+            asking whether the *animal* is translating at all, not
+            whether one paw is currently planted mid-stride. Starting
+            default, not derived from measured data the way
+            ``min_contact_frames`` was -- tune against real trials with
+            ``scripts/debug_gait.py``.
+        min_still_frames: How many consecutive frames of sub-threshold
+            body speed, bordering either end of the trial, counts as
+            "stopped" rather than an ordinary brief slowdown mid-stride.
+            Only a run touching the very start or very end of the trial
+            is ever trimmed -- a pause in the middle is left alone. See
+            :func:`alligaitor.gait.restrict_to_consecutive_runs`.
     """
 
     speed_threshold_mm_s: float = 50.0
     min_contact_frames: int = 1
     max_bridge_gap_frames: int = 2
     min_consecutive_steps: int = 5
+    stillness_speed_threshold_mm_s: float = 20.0
+    min_still_frames: int = 15
 
 
 @dataclass

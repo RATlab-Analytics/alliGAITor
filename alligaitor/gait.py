@@ -177,19 +177,78 @@ def bridge_short_gaps(xyz: np.ndarray, max_gap: int) -> np.ndarray:
     return xyz
 
 
-def _crossing_time_and_speed(
-    times: np.ndarray, ref_xyz: np.ndarray
-) -> tuple[float, float, np.ndarray]:
-    """Return (crossing time, average speed, unit forward direction)."""
-    valid = ~np.isnan(ref_xyz).any(axis=1)
+def active_window(times: np.ndarray, ref_xyz: np.ndarray, config: GaitConfig) -> Tuple[int, int]:
+    """First/last frame index of sustained whole-body motion.
+
+    Trims any leading/trailing run of at least ``config.min_still_frames``
+    frames whose whole-body (reference node) frame-to-frame speed stays
+    below ``config.stillness_speed_threshold_mm_s`` -- e.g. a rat that
+    stops moving well before the recording ends, whose paws can then
+    jitter across the (much more sensitive) per-paw stance-speed
+    threshold and look like a run of real steps taken in place. A brief
+    slowdown in the middle of the trial isn't trimmed, only a run
+    bordering either end. Falls back to the full triangulated range if
+    the whole trial reads as "still" by this threshold, rather than
+    collapsing to an empty window.
+    """
+    bridged = bridge_short_gaps(ref_xyz, config.max_bridge_gap_frames)
+    valid = ~np.isnan(bridged).any(axis=1)
     valid_idx = np.flatnonzero(valid)
     if valid_idx.size < 2:
         raise ValueError(
             f"Reference node '{REFERENCE_NODE}' has fewer than 2 triangulated frames; "
-            "cannot determine crossing time or direction."
+            "cannot determine an active window."
+        )
+    first, last = int(valid_idx[0]), int(valid_idx[-1])
+
+    speed = np.full(len(bridged), np.nan)
+    disp = np.linalg.norm(bridged[1:] - bridged[:-1], axis=1)
+    dt = times[1:] - times[:-1]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        speed[1:] = disp / dt
+    moving = speed >= config.stillness_speed_threshold_mm_s
+
+    start = first
+    m = first
+    while m < last and not moving[m + 1]:
+        m += 1
+    if m - first >= config.min_still_frames:
+        start = m
+
+    end = last
+    k = last
+    while k > first and not moving[k]:
+        k -= 1
+    if last - k >= config.min_still_frames:
+        end = k
+
+    if start >= end:
+        return first, last
+    return start, end
+
+
+def _crossing_time_and_speed(
+    times: np.ndarray, ref_xyz: np.ndarray, config: GaitConfig
+) -> "tuple[float, float, np.ndarray, Tuple[int, int]]":
+    """Return (crossing time, average speed, unit forward direction, active window).
+
+    Restricted to the active window (see :func:`active_window`) rather
+    than the reference node's raw first-to-last triangulated frame, so
+    idle time before the rat starts moving or after it stops doesn't
+    inflate the crossing time or drag down the average speed.
+    """
+    start, end = active_window(times, ref_xyz, config)
+
+    window = ref_xyz[start : end + 1]
+    valid = ~np.isnan(window).any(axis=1)
+    valid_idx = np.flatnonzero(valid)
+    if valid_idx.size < 2:
+        raise ValueError(
+            f"Reference node '{REFERENCE_NODE}' has fewer than 2 triangulated frames "
+            "in its active window; cannot determine crossing time or direction."
         )
 
-    first_idx, last_idx = valid_idx[0], valid_idx[-1]
+    first_idx, last_idx = start + valid_idx[0], start + valid_idx[-1]
     net_displacement = ref_xyz[last_idx] - ref_xyz[first_idx]
     net_distance = np.linalg.norm(net_displacement)
     if net_distance == 0:
@@ -201,11 +260,11 @@ def _crossing_time_and_speed(
 
     crossing_time_s = times[last_idx] - times[first_idx]
 
-    pts = ref_xyz[valid_idx]
+    pts = ref_xyz[start + valid_idx]
     path_length = np.linalg.norm(np.diff(pts, axis=0), axis=1).sum()
     average_speed_mm_s = path_length / crossing_time_s
 
-    return float(crossing_time_s), float(average_speed_mm_s), forward
+    return float(crossing_time_s), float(average_speed_mm_s), forward, (start, end)
 
 
 def _raw_stance_candidates(
@@ -456,7 +515,7 @@ def restrict_to_consecutive_runs(
         positions: This trial's per-node positions (see :func:`load_pose_3d`).
         config: The same :class:`GaitConfig` ``trial`` was computed with.
     """
-    _, _, forward = _crossing_time_and_speed(times, positions[REFERENCE_NODE])
+    _, _, forward, (start, end) = _crossing_time_and_speed(times, positions[REFERENCE_NODE], config)
 
     stride_length_mm, step_length_mm, ground_contact_time_s = {}, {}, {}
     n_contacts, n_strides, n_steps = {}, {}, {}
@@ -464,7 +523,10 @@ def restrict_to_consecutive_runs(
     for paw in PAW_NODES:
         events = trial.paw_events[paw]
         contra_events = trial.paw_events[CONTRALATERAL[paw]]
-        bridged = bridge_short_gaps(positions[paw], config.max_bridge_gap_frames)
+        xyz = positions[paw].copy()
+        xyz[:start] = np.nan
+        xyz[end + 1 :] = np.nan
+        bridged = bridge_short_gaps(xyz, config.max_bridge_gap_frames)
         runs = _qualifying_runs(events, bridged, config.min_consecutive_steps)
 
         if not runs:
@@ -568,13 +630,23 @@ def compute_trial_metrics(
     if missing:
         raise ValueError(f"pose_3d CSV '{csv_path}' is missing required node(s): {missing}")
 
-    crossing_time_s, average_speed_mm_s, forward = _crossing_time_and_speed(times, positions[REFERENCE_NODE])
+    crossing_time_s, average_speed_mm_s, forward, (start, end) = _crossing_time_and_speed(
+        times, positions[REFERENCE_NODE], config
+    )
 
     # Bridged (short-gap-interpolated) paw positions drive stance
     # detection and every downstream paw measurement, so a touchdown/
     # liftoff landing on a bridged frame still reports a real position
     # rather than mixing bridged and raw coordinates inconsistently.
-    bridged = {paw: bridge_short_gaps(positions[paw], config.max_bridge_gap_frames) for paw in PAW_NODES}
+    # Masked to the active window first (see active_window) so a paw
+    # jittering in place after the rat has already stopped moving can't
+    # be detected as a stance phase at all.
+    bridged = {}
+    for paw in PAW_NODES:
+        xyz = positions[paw].copy()
+        xyz[:start] = np.nan
+        xyz[end + 1 :] = np.nan
+        bridged[paw] = bridge_short_gaps(xyz, config.max_bridge_gap_frames)
 
     events = {paw: _detect_paw_events(times, bridged[paw], config) for paw in PAW_NODES}
 
