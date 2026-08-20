@@ -37,7 +37,10 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "run",
         parents=[common],
-        help="Run calibration (if not already saved) and triangulate every configured session.",
+        help=(
+            "Run calibration (if not already saved), triangulate every configured session, "
+            "and write the group's gait-metrics workbook."
+        ),
     )
     return parser
 
@@ -50,9 +53,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.command == "calibrate":
         calibration.calibrate(config.calibration)
     elif args.command == "run":
-        outputs = pipeline.run_pipeline(config, device=args.device, tracking=args.tracking)
-        for path in outputs:
-            print(path)
+        output_xlsx = pipeline.run_group(config, device=args.device, tracking=args.tracking)
+        print(output_xlsx)
 
     return 0
 

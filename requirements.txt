@@ -2,8 +2,10 @@ aniposelib>=0.8.0
 sleap-io>=0.9.0
 numpy
 pandas
+openpyxl
 PyYAML
 imageio-ffmpeg
+tqdm
 
 # Runs `sleap-nn predict` as a subprocess; install separately per
 # https://nn.sleap.ai for the correct PyTorch/accelerator build for this

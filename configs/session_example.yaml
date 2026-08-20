@@ -11,32 +11,63 @@
 # physical camera that lands on a given recording's cam0/cam1/cam2 is not
 # consistent across sessions, so each session lists its own video for each
 # role rather than relying on a fixed camera index.
+#
+# This file is one "group": `run` triangulates every session below and
+# writes one gait-metrics workbook (`output_xlsx`) with one tab per
+# distinct `rat_id`. `name` and `output_xlsx` are both optional --
+# `name` defaults to this file's stem, and `output_xlsx` defaults to
+# `reports/<name>.gait_metrics.xlsx` next to this file. `gait` is also
+# optional; see alligaitor/config.py's GaitConfig for the stance/swing
+# detection thresholds it can override.
+
+name: "session_example"
+output_xlsx: "../reports/session_example.gait_metrics.xlsx"
 
 models:
   side_model_dir: "../models/alliGAITor_side_ConvNeXt_slim_v1.0.0.n=315"
   bottom_model_dir: "../models/alliGAITor_bottom_slim_v0.4.1-beta"
 
 calibration:
-  # ChArUco board recordings, one per camera role, captured once for the
-  # rig and reused across sessions. Re-record and re-run `calibrate` if a
+  # Mirrors configs/calibration_april01.yaml -- the AprilTag marker-grid
+  # board, the current calibration method for this rig (it supersedes the
+  # ChArUco boards for the bottom camera's steep tunnel-slit view; see
+  # alligaitor/calibration.py's board_preset docs). Captured once per rig
+  # and reused across sessions; re-record and re-run `calibrate` if a
   # camera is bumped or repositioned.
   videos:
-    left: "../calibration/left.mp4"
-    right: "../calibration/right.mp4"
-    bottom: "../calibration/bottom.mp4"
-  output_path: "../calibration/calibration.toml"
+    left: "../videos/april_cal_coded/april01_cam0_coded.mp4"
+    right: "../videos/april_cal_coded/april01_cam1_coded.mp4"
+    bottom: "../videos/april_cal_coded/april01_cam2_coded.mp4"
+  output_path: "../calibration/calibration_april01.toml"
+  board_preset: "apriltag"
 
 sessions:
+  # rat_id groups sessions onto the same spreadsheet tab -- it defaults to
+  # `name` (each session its own rat) when omitted, so set it explicitly
+  # whenever a rat crosses the platform more than once in this group.
+  #
+  # left/right below (cam0=left) is visually verified, not assumed: this
+  # rig has a black-and-white patterned patch on one wall, visible in the
+  # uncropped source recordings (not in these cropped strips -- see
+  # scripts/check_camera_side.py), only from the camera on that side.
+  # cam0 shows it in both sessions below AND in the april01 calibration
+  # recording, so "left" is consistently the same physical camera across
+  # all three -- no port swap between calibration and these two sessions.
+  # This does NOT extend to other recordings not checked this way; re-verify
+  # per session if ports may have been touched, since capture-port order
+  # isn't guaranteed stable across recordings in general.
   - name: "359a-BL"
+    rat_id: "359"
     output_dir: "../predictions_3d/359a-BL"
     videos:
-      left: "../side-training-data/359a-BL_cam0_coded.mp4"
-      right: "../side-training-data/359a-BL_cam2_coded.mp4"
-      bottom: "../bottom_training_data_cropped/359a-BL_cam1_coded.mp4"
+      left: "../videos/side-training-data/359a-BL_cam0_coded.mp4"
+      right: "../videos/side-training-data/359a-BL_cam2_coded.mp4"
+      bottom: "../videos/bottom_training_data_cropped/359a-BL_cam1_coded.mp4"
 
   - name: "359c-pu2"
+    rat_id: "359"
     output_dir: "../predictions_3d/359c-pu2"
     videos:
-      left: "../side-training-data/359c-pu2_cam0_coded.mp4"
-      right: "../side-training-data/359c-pu2_cam1_coded.mp4"
-      bottom: "../bottom_training_data_cropped/359c-pu2_cam2_coded.mp4"
+      left: "../videos/side-training-data/359c-pu2_cam0_coded.mp4"
+      right: "../videos/side-training-data/359c-pu2_cam1_coded.mp4"
+      bottom: "../videos/bottom_training_data_cropped/359c-pu2_cam2_coded.mp4"

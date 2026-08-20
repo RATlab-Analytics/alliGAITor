@@ -11,9 +11,9 @@ cameras have not been physically moved.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
 
 import yaml
 
@@ -119,23 +119,107 @@ class SessionConfig:
         videos: Mapping of camera role to this session's video path.
         output_dir: Directory where 2D predictions and 3D output for this
             session are written.
+        rat_id: Which rat this trial belongs to. Video/session names
+            (e.g. ``"359a-BL"``) encode a trial letter and condition, not
+            a reliable rat identity, so this is a separate, explicit
+            field rather than something parsed from ``name``. Defaults to
+            ``name`` (i.e. each session is its own rat) when not given.
+            Sessions sharing a ``rat_id`` within one group are combined
+            onto that rat's tab in the gait-metrics spreadsheet (see
+            :mod:`alligaitor.gait`), one row per trial.
     """
 
     name: str
     videos: Dict[str, Path]
     output_dir: Path
+    rat_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         _require_roles(self.videos, f"Session '{self.name}'")
+        if not self.rat_id:
+            self.rat_id = self.name
+
+
+@dataclass
+class GaitConfig:
+    """Tunable thresholds for stance/swing (paw ground-contact) detection.
+
+    A paw is considered planted on a frame when its frame-to-frame speed
+    stays below ``speed_threshold_mm_s``; see :mod:`alligaitor.gait` for
+    how that feeds into stride, step, and ground-contact-time
+    calculations.
+
+    A height-above-platform check was tried and dropped: drawing an
+    accurate height-threshold reference line requires knowing the current
+    frame's actual depth across the tunnel's width, and a single-anchor
+    approximation was visually misleading (a paw on the far side of the
+    tunnel could appear to cross a threshold line that was only valid for
+    a different depth) -- speed alone avoids that failure mode.
+
+    Attributes:
+        speed_threshold_mm_s: Maximum frame-to-frame speed, in mm/s, for a
+            paw to count as planted.
+        min_contact_frames: Minimum number of consecutive frames a paw
+            must satisfy that threshold to count as a real stance phase.
+            Originally meant to filter out single-frame tracking jitter,
+            but on real data (this rig, ~12.5fps) speed cleanly separates
+            into two well-defined clusters with almost nothing between
+            them -- a single frame landing in the low cluster is real
+            evidence of a (likely brief) stance, not noise near a fuzzy
+            boundary, and requiring 2 consecutive frames was discarding
+            most genuine forepaw stances (which are often only one frame
+            long at this frame rate). Defaults to ``1`` accordingly.
+        max_bridge_gap_frames: Untriangulated runs of at most this many
+            frames, bounded by a valid frame on both sides, are linearly
+            interpolated before speed/stance is computed at all -- jitter
+            and brief per-camera dropouts will always happen even with
+            good models, and this keeps a real stance phase from being
+            fragmented into pieces too short to individually survive
+            ``min_contact_frames`` just because of a momentary gap.
+            Longer gaps are left as real gaps (see
+            :func:`alligaitor.gait.find_camera_caused_discards`). ``0``
+            disables bridging entirely.
+        min_consecutive_steps: A paw's reported stride/step/ground-contact
+            averages are computed only from steps that are part of a run
+            of at least this many consecutive accepted stance events with
+            no camera-caused discard (see
+            :func:`alligaitor.gait.find_camera_caused_discards`) in the
+            swing between any pair -- an isolated good detection that
+            isn't part of such a run doesn't count, and a paw with no
+            qualifying run at all reports ``NaN`` rather than an average
+            built from too little (or too suspect) data. See
+            :func:`alligaitor.gait.restrict_to_consecutive_runs`.
+    """
+
+    speed_threshold_mm_s: float = 50.0
+    min_contact_frames: int = 1
+    max_bridge_gap_frames: int = 2
+    min_consecutive_steps: int = 5
 
 
 @dataclass
 class PipelineConfig:
-    """Top-level configuration: models, calibration, and one or more sessions."""
+    """Top-level configuration: models, calibration, and one or more sessions.
+
+    Attributes:
+        models: Trained model directories.
+        calibration: Calibration recordings and output path.
+        sessions: The group's trials -- one video-triplet per crossing.
+        name: Group identifier, used to name the gait-metrics workbook.
+            Defaults to the config file's stem.
+        output_xlsx: Where the gait-metrics workbook for this group (one
+            tab per distinct ``rat_id`` across ``sessions``) is written.
+            Defaults to ``<config dir>/reports/<name>.gait_metrics.xlsx``.
+        gait: Stance/swing detection thresholds shared by every session
+            in this group.
+    """
 
     models: ModelConfig
     calibration: CalibrationConfig
     sessions: List[SessionConfig]
+    name: str = "group"
+    output_xlsx: Optional[Path] = None
+    gait: GaitConfig = field(default_factory=GaitConfig)
 
     @classmethod
     def from_yaml(cls, path: PathLike) -> "PipelineConfig":
@@ -169,8 +253,25 @@ class PipelineConfig:
                 name=session_raw["name"],
                 videos={role: _resolve(base_dir, p) for role, p in session_raw["videos"].items()},
                 output_dir=_resolve(base_dir, session_raw["output_dir"]),
+                rat_id=session_raw.get("rat_id"),
             )
             for session_raw in raw["sessions"]
         ]
 
-        return cls(models=models, calibration=calibration, sessions=sessions)
+        name = raw.get("name", path.stem)
+        output_xlsx_raw = raw.get("output_xlsx")
+        output_xlsx = (
+            _resolve(base_dir, output_xlsx_raw)
+            if output_xlsx_raw
+            else base_dir / "reports" / f"{name}.gait_metrics.xlsx"
+        )
+        gait = GaitConfig(**raw.get("gait", {}))
+
+        return cls(
+            models=models,
+            calibration=calibration,
+            sessions=sessions,
+            name=name,
+            output_xlsx=output_xlsx,
+            gait=gait,
+        )
