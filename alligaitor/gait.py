@@ -34,6 +34,7 @@ exactly the frames this module treated as ground contact.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
@@ -273,21 +274,42 @@ def _raw_stance_candidates(
     """Shared groundwork for stance detection.
 
     Returns ``(valid, speed, runs)``: whether the paw is triangulated on
-    each frame, frame-to-frame speed (backward difference -- ``NaN`` on
-    frame 0 and any frame whose predecessor is untriangulated), and every
-    maximal run of raw "planted" frames (speed below
-    ``config.speed_threshold_mm_s``), before the ``min_contact_frames``
-    length filter. Used by both :func:`_detect_paw_events` and
-    :func:`find_camera_caused_discards`.
+    each frame, frame-to-frame speed, and every maximal run of raw
+    "planted" frames (speed below ``config.speed_threshold_mm_s``), before
+    the ``min_contact_frames`` length filter. Used by both
+    :func:`_detect_paw_events` and :func:`find_camera_caused_discards`.
+
+    Speed at each frame is the *minimum* of its backward- and
+    forward-difference estimates (whichever neighbor is triangulated),
+    not backward-only. A frame immediately following an untriangulated
+    gap has its backward difference span the whole gap, inflating the
+    apparent speed right at the frames most likely to be a real stance's
+    loading-response onset -- initial paw-ground contact, before the
+    animal's weight has fully transferred, which by the standard gait-cycle
+    definition (initial contact -> toe-off) still counts as stance even
+    though the paw may still show some settling velocity. Preferring
+    whichever direction doesn't cross a gap avoids that inflation without
+    requiring a second confirming frame, which at this frame rate risks
+    dropping genuinely brief stances entirely. (A locally-smoothed/
+    regression-based estimate was also tried and rejected -- more variable
+    on this rig's sparse, gap-heavy trajectories, sometimes fragmenting a
+    stance further instead of un-fragmenting it.)
     """
     n = len(times)
     valid = ~np.isnan(xyz).any(axis=1)
 
-    speed = np.full(n, np.nan)
     disp = np.linalg.norm(xyz[1:] - xyz[:-1], axis=1)
     dt = times[1:] - times[:-1]
     with np.errstate(invalid="ignore", divide="ignore"):
-        speed[1:] = disp / dt
+        step_speed = disp / dt  # step_speed[k] = speed of the transition frame k -> frame k+1
+
+    backward = np.full(n, np.nan)
+    backward[1:] = step_speed
+    forward = np.full(n, np.nan)
+    forward[:-1] = step_speed
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)  # all-NaN slice at isolated valid frames
+        speed = np.nanmin(np.stack([backward, forward]), axis=0)
 
     planted = valid & (speed < config.speed_threshold_mm_s)
 
@@ -309,7 +331,7 @@ def _detect_paw_events(times: np.ndarray, xyz: np.ndarray, config: GaitConfig) -
     """Segment one paw's trajectory into stance phases.
 
     A frame counts as planted when the paw is triangulated and its
-    frame-to-frame speed (backward difference) is below
+    frame-to-frame speed (see :func:`_raw_stance_candidates`) is below
     ``config.speed_threshold_mm_s``. Runs of fewer than
     ``config.min_contact_frames`` planted frames are dropped as tracking
     jitter rather than counted as real stance phases -- see
@@ -452,35 +474,83 @@ def compute_discards_by_paw(
     }
 
 
-def _qualifying_runs(events: PawEvents, bridged_xyz: np.ndarray, min_run: int) -> List[Tuple[int, int]]:
+def find_stride_length_outliers(
+    events: PawEvents,
+    xyz: np.ndarray,
+    forward: np.ndarray,
+    ratio: float,
+) -> List[Tuple[int, int, float, float]]:
+    """Adjacent stride pairs whose length exceeds ``ratio`` times this
+    paw's own median stride length in the trial.
+
+    A stride long enough to plausibly be two strides' worth of distance
+    rather than one usually means a real stance sat in between that the
+    speed classifier failed to recognize -- triangulation can be clean
+    the entire way through and still miss a brief plant, which is exactly
+    what :func:`find_camera_caused_discards` (a gap-based check) cannot
+    catch. The two are independent and complementary, not overlapping.
+
+    Returns a list of ``(liftoff_frame, touchdown_frame, stride_length_mm,
+    median_stride_length_mm)``, one entry per outlier stride.
+    """
+    strides = _stride_lengths(events, xyz, forward)
+    if strides.size < 2:
+        return []
+    median = float(np.median(strides))
+    if median <= 0:
+        return []
+    return [
+        (int(events.liftoff_frames[i]), int(events.touchdown_frames[i + 1]), float(s), median)
+        for i, s in enumerate(strides)
+        if s > median * ratio
+    ]
+
+
+def _qualifying_runs(
+    events: PawEvents,
+    bridged_xyz: np.ndarray,
+    forward: np.ndarray,
+    min_run: int,
+    stride_length_outlier_ratio: float,
+) -> List[Tuple[int, int]]:
     """Maximal runs of consecutive accepted stance events, as ``(start, end)``
-    index pairs into ``events``' arrays, with no remaining untriangulated
-    frame -- *after* bridging (see :func:`bridge_short_gaps`) -- anywhere
-    in the swing between any adjacent pair in the run, at least
-    ``min_run`` events long.
+    index pairs into ``events``' arrays, at least ``min_run`` events long.
+
+    A pair of adjacent events stays in the same run only if *both* hold:
+    no remaining untriangulated frame -- *after* bridging (see
+    :func:`bridge_short_gaps`) -- anywhere in the swing between them, and
+    the stride between them isn't a
+    :func:`find_stride_length_outliers`-flagged outlier. The first check
+    catches a triangulation gap that could be hiding a real step; the
+    second catches a real step missed despite clean triangulation. Neither
+    alone is sufficient -- see :func:`restrict_to_consecutive_runs`.
 
     This used to check for a :func:`find_camera_caused_discards` window
-    instead, but that specifically flags a raw candidate run *rejected*
-    for being too short -- and with
+    instead of the bridged trajectory directly, but that specifically
+    flags a raw candidate run *rejected* for being too short -- and with
     :attr:`alligaitor.config.GaitConfig.min_contact_frames` at its
     current default of 1, no candidate is ever too short to survive, so
     that check had gone permanently vacuous (always "no discards found",
-    regardless of how much real data was actually missing). Checking the
-    bridged trajectory directly asks the question that actually matters
-    here: is there *any* untriangulated stretch between these two steps
-    that could be hiding a real one -- independent of whether any
-    isolated candidate frame happened to survive inside it. See
-    :func:`restrict_to_consecutive_runs`.
+    regardless of how much real data was actually missing).
     """
     n = events.touchdown_frames.size
     if n == 0:
         return []
 
     valid = ~np.isnan(bridged_xyz).any(axis=1)
-    clean_pair = np.ones(max(n - 1, 0), dtype=bool)
+    gap_clean = np.ones(max(n - 1, 0), dtype=bool)
     for i in range(n - 1):
         gap_start, gap_end = events.liftoff_frames[i], events.touchdown_frames[i + 1]
-        clean_pair[i] = bool(valid[gap_start : gap_end + 1].all())
+        gap_clean[i] = bool(valid[gap_start : gap_end + 1].all())
+
+    strides = _stride_lengths(events, bridged_xyz, forward)
+    stride_clean = np.ones(max(n - 1, 0), dtype=bool)
+    if strides.size:
+        median = float(np.median(strides))
+        if median > 0:
+            stride_clean = strides <= median * stride_length_outlier_ratio
+
+    clean_pair = gap_clean & stride_clean
 
     runs = []
     start = 0
@@ -527,7 +597,9 @@ def restrict_to_consecutive_runs(
         xyz[:start] = np.nan
         xyz[end + 1 :] = np.nan
         bridged = bridge_short_gaps(xyz, config.max_bridge_gap_frames)
-        runs = _qualifying_runs(events, bridged, config.min_consecutive_steps)
+        runs = _qualifying_runs(
+            events, bridged, forward, config.min_consecutive_steps, config.stride_length_outlier_ratio
+        )
 
         if not runs:
             stride_length_mm[paw] = float("nan")

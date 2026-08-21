@@ -48,11 +48,21 @@ _NODE_COLOR = (0, 210, 255)  # non-paw nodes
 _PAW_SWING_COLOR = (255, 140, 0)
 _PAW_CONTACT_COLOR = (0, 200, 0)
 _DISAGREEMENT_COLOR = (0, 0, 255)
-_FOOTPRINT_COLOR = (255, 0, 255)
+_FOOTPRINT_COLOR_FOREPAW = (255, 0, 255)  # magenta
+_FOOTPRINT_COLOR_HINDPAW = (255, 255, 0)  # cyan
 _DROP_WARNING_COLOR = (0, 0, 220)
 
 _NODE_RADIUS = 5
 _FOOTPRINT_RADIUS = 4
+
+
+def _footprint_color(paw: str):
+    """Forepaw and hind-paw footprints get distinct colors so a trial's
+    two paw categories -- currently tracked with very different
+    reliability, see :mod:`alligaitor.gait` -- are visually distinguishable
+    at a glance rather than blending into one undifferentiated trail.
+    """
+    return _FOOTPRINT_COLOR_HINDPAW if "hind" in paw else _FOOTPRINT_COLOR_FOREPAW
 
 
 def _camera_drop_warnings(
@@ -119,8 +129,10 @@ def _reproject_footprints(
     cgroup: CameraGroup,
     cam_index: Dict[str, int],
     crop_offset: Dict[str, Tuple[float, float]],
-) -> Dict[str, List[Tuple[int, Tuple[float, float]]]]:
-    """Per role, a list of ``(touchdown_frame, (px, py))`` footprint markers.
+) -> Dict[str, List[Tuple[int, str, Tuple[float, float]]]]:
+    """Per role, a list of ``(touchdown_frame, paw, (px, py))`` footprint
+    markers -- ``paw`` is carried through so each marker can be colored by
+    fore/hind paw category (see :func:`_footprint_color`).
 
     Reprojected once for the whole video (the rig is static), not per frame.
     """
@@ -129,7 +141,7 @@ def _reproject_footprints(
         for paw in PAW_NODES
         for touchdown_frame in trial.paw_events[paw].touchdown_frames
     ]
-    footprints_by_role: Dict[str, List[Tuple[int, Tuple[float, float]]]] = {role: [] for role in CAMERA_ROLES}
+    footprints_by_role: Dict[str, List[Tuple[int, str, Tuple[float, float]]]] = {role: [] for role in CAMERA_ROLES}
     if not entries:
         return footprints_by_role
 
@@ -139,7 +151,7 @@ def _reproject_footprints(
         cam_proj = proj[cam_index[role]]
         offset = crop_offset[role]
         for (paw, frame), (px, py) in zip(entries, cam_proj):
-            footprints_by_role[role].append((int(frame), (float(px - offset[0]), float(py - offset[1]))))
+            footprints_by_role[role].append((int(frame), paw, (float(px - offset[0]), float(py - offset[1]))))
     return footprints_by_role
 
 
@@ -147,6 +159,45 @@ def _draw_marker(frame: np.ndarray, xy: Tuple[float, float], radius: int, color,
     x, y = int(round(xy[0])), int(round(xy[1]))
     if -radius <= x <= frame.shape[1] + radius and -radius <= y <= frame.shape[0] + radius:
         cv2.circle(frame, (x, y), radius, color, thickness)
+
+
+_STRIP_HEIGHT = 32
+_STRIP_BG_COLOR = (40, 40, 40)
+# (label, color) -- every marker color actually drawn elsewhere in this
+# module, so the legend can't drift out of sync with what's on screen.
+_LEGEND_ENTRIES = (
+    ("body node", _NODE_COLOR),
+    ("paw (swing)", _PAW_SWING_COLOR),
+    ("paw (contact)", _PAW_CONTACT_COLOR),
+    ("reprojection disagreement", _DISAGREEMENT_COLOR),
+    ("forepaw footprint", _FOOTPRINT_COLOR_FOREPAW),
+    ("hindpaw footprint", _FOOTPRINT_COLOR_HINDPAW),
+)
+
+
+def _draw_header_strip(width: int, t: float, frame_idx: int, n_frames: int) -> np.ndarray:
+    """A dedicated top strip: shared-timeline time/frame index on the left,
+    a color legend (matching every marker color drawn per-panel) filling
+    the rest -- kept in its own band above the camera panels rather than
+    overlaid on top of video pixels, so neither obscures the other.
+    """
+    strip = np.full((_STRIP_HEIGHT, width, 3), _STRIP_BG_COLOR, dtype=np.uint8)
+    baseline_y = _STRIP_HEIGHT // 2 + 5
+
+    text = f"t={t:.3f}s  frame {frame_idx}/{n_frames - 1}"
+    cv2.putText(strip, text, (8, baseline_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+    (tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+
+    x = 8 + tw + 28
+    for label, color in _LEGEND_ENTRIES:
+        if x > width - 20:
+            break  # ran out of room on a narrow panel -- drop remaining entries rather than overflow
+        cv2.circle(strip, (x, _STRIP_HEIGHT // 2), 5, color, -1)
+        cv2.putText(strip, label, (x + 10, baseline_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+        (lw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+        x += 10 + lw + 18
+
+    return strip
 
 
 def export_validation_video(
@@ -230,9 +281,9 @@ def export_validation_video(
                         pb = tuple(int(round(c)) for c in node_px[b])
                         cv2.line(panel, pa, pb, _EDGE_COLOR, 1, cv2.LINE_AA)
 
-                for touchdown_frame, xy in footprints_by_role.get(role, []):
+                for touchdown_frame, paw, xy in footprints_by_role.get(role, []):
                     if touchdown_frame <= i:
-                        _draw_marker(panel, xy, _FOOTPRINT_RADIUS, _FOOTPRINT_COLOR)
+                        _draw_marker(panel, xy, _FOOTPRINT_RADIUS, _footprint_color(paw))
 
                 for node, xy in node_px.items():
                     err = errors[node][i]
@@ -257,8 +308,8 @@ def export_validation_video(
 
             max_w = max(p.shape[1] for p in panels)
             panels = [p if p.shape[1] == max_w else cv2.resize(p, (max_w, int(p.shape[0] * max_w / p.shape[1]))) for p in panels]
-            composite = np.vstack(panels)
-            cv2.putText(composite, f"t={t:.3f}s", (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            header = _draw_header_strip(max_w, t, i, n_frames)
+            composite = np.vstack([header, *panels])
 
             if writer is None:
                 # "mp4v" (MPEG-4 Part 2) writes a technically-valid stream

@@ -178,7 +178,18 @@ class GaitConfig:
             ``min_contact_frames`` just because of a momentary gap.
             Longer gaps are left as real gaps (see
             :func:`alligaitor.gait.find_camera_caused_discards`). ``0``
-            disables bridging entirely.
+            disables bridging entirely. Defaults to ``4``: measured gap
+            lengths on real trials cluster at 2-4 frames (motion-blur
+            dropouts during a single swing, not multi-swing outages), and
+            the previous default of ``2`` was leaving nearly every one of
+            those just barely un-bridged -- fragmenting genuinely
+            consecutive steps into short runs for no reason tied to data
+            quality. A bridged gap also stops counting as a camera-caused
+            discard (see ``find_camera_caused_discards``), which is why a
+            second, independent check
+            (``stride_length_outlier_ratio``) exists for steps a gap
+            *doesn't* explain: one silently missing entirely inside a
+            span that still reads as clean.
         min_consecutive_steps: A paw's reported stride/step/ground-contact
             averages are computed only from steps that are part of a run
             of at least this many consecutive accepted stance events with
@@ -209,14 +220,24 @@ class GaitConfig:
             Only a run touching the very start or very end of the trial
             is ever trimmed -- a pause in the middle is left alone. See
             :func:`alligaitor.gait.restrict_to_consecutive_runs`.
+        stride_length_outlier_ratio: A stride longer than this many times
+            a paw's own median stride length in the trial is flagged as
+            likely hiding a missed step -- e.g. a real stance the speed
+            classifier failed to recognize -- rather than being one
+            genuine stride, and breaks a qualifying run the same way a
+            camera-caused discard does. This catches exactly what
+            ``max_bridge_gap_frames`` cannot: triangulation can be clean
+            the entire way through and still miss a real, brief stance.
+            See :func:`alligaitor.gait.find_stride_length_outliers`.
     """
 
     speed_threshold_mm_s: float = 50.0
     min_contact_frames: int = 1
-    max_bridge_gap_frames: int = 2
+    max_bridge_gap_frames: int = 4
     min_consecutive_steps: int = 5
     stillness_speed_threshold_mm_s: float = 20.0
     min_still_frames: int = 15
+    stride_length_outlier_ratio: float = 1.8
 
 
 @dataclass

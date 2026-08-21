@@ -27,7 +27,7 @@
 
 models:
   side_model_dir: "../models/alliGAITor_side_ConvNeXt_slim_v1.0.0.n=315"
-  bottom_model_dir: "../models/alliGAITor_bottom_slim_v0.4.1-beta"
+  bottom_model_dir: "../models/alliGAITor_bottom_color_v2.6.0.n252"
 
 calibration:
   videos:
