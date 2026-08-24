@@ -24,7 +24,7 @@ name: "session_example"
 output_xlsx: "../reports/session_example.gait_metrics.xlsx"
 
 models:
-  side_model_dir: "../models/alliGAITor_side_ConvNeXt_slim_v1.0.0.n=315"
+  side_model_dir: "../models/alliGAITor_side_ConvNeXt_color_v2.1.0.n494"
   bottom_model_dir: "../models/alliGAITor_bottom_color_v2.6.0.n252"
 
 calibration:
@@ -106,3 +106,38 @@ sessions:
       left: "../videos/side-training-data/377a-PU_cam0_coded.mp4"
       right: "../videos/side-training-data/377a-PU_cam1_coded.mp4"
       bottom: "../videos/bottom_training_data_cropped/377a-PU_cam2_coded.mp4"
+
+  # left/right for the four sessions below verified the same way (camo
+  # wall visible only in cam0's panel) -- added to reach 10 sessions for
+  # the side-model triangulation drop-rate comparison.
+  - name: "361a-pu2"
+    rat_id: "361"
+    output_dir: "../predictions_3d/361a-pu2"
+    videos:
+      left: "../videos/side-training-data/361a-pu2_cam0_coded.mp4"
+      right: "../videos/side-training-data/361a-pu2_cam1_coded.mp4"
+      bottom: "../videos/bottom_training_data_cropped/361a-pu2_cam2_coded.mp4"
+
+  - name: "368a-BL"
+    rat_id: "368"
+    output_dir: "../predictions_3d/368a-BL"
+    videos:
+      left: "../videos/side-training-data/368a-BL_cam0_coded.mp4"
+      right: "../videos/side-training-data/368a-BL_cam2_coded.mp4"
+      bottom: "../videos/bottom_training_data_cropped/368a-BL_cam1_coded.mp4"
+
+  - name: "372a-BL"
+    rat_id: "372"
+    output_dir: "../predictions_3d/372a-BL"
+    videos:
+      left: "../videos/side-training-data/372a-BL_cam0_coded.mp4"
+      right: "../videos/side-training-data/372a-BL_cam1_coded.mp4"
+      bottom: "../videos/bottom_training_data_cropped/372a-BL_cam2_coded.mp4"
+
+  - name: "378a-pu"
+    rat_id: "378"
+    output_dir: "../predictions_3d/378a-pu"
+    videos:
+      left: "../videos/side-training-data/378a-pu_cam0_coded.mp4"
+      right: "../videos/side-training-data/378a-pu_cam1_coded.mp4"
+      bottom: "../videos/bottom_training_data_cropped/378a-pu_cam2_coded.mp4"

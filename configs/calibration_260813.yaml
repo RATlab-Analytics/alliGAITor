@@ -26,7 +26,7 @@
 # the full 3D pipeline against real footage using this calibration.
 
 models:
-  side_model_dir: "../models/alliGAITor_side_ConvNeXt_slim_v1.0.0.n=315"
+  side_model_dir: "../models/alliGAITor_side_ConvNeXt_color_v2.1.0.n494"
   bottom_model_dir: "../models/alliGAITor_bottom_color_v2.6.0.n252"
 
 calibration:
