@@ -1,0 +1,572 @@
+"""
+Main window shell for the alliGAITor GUI: job queue table, Load/Edit/
+Remove/Run controls (both a toolbar row and mirrored menu actions), a
+log panel, and a progress bar + ETA shown while a run is in flight.
+
+Ported from RATlab-NOR's gui/main_window.py's overall shape (menu bar,
+table+log+progress layout, BatchRunner wiring, Reset menu), with
+alliGAITor's two setup gates (config editor, then crop) replacing NOR's
+one (object-coordinate setup), and Model/Settings/Help menus built for
+alliGAITor's own needs (two model roles, discovery regex defaults, a
+GPLv3 About dialog).
+"""
+
+from __future__ import annotations
+
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QActionGroup
+from PySide6.QtWidgets import (
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTableView,
+    QPushButton, QPlainTextEdit, QDialog, QDialogButtonBox, QFormLayout,
+    QLineEdit, QMessageBox, QAbstractItemView, QSplitter,
+    QProgressBar, QLabel,
+)
+
+from job_queue import Job, JobQueue, JobStatus, refresh_job_readiness
+from job_table_model import JobTableModel
+from add_job_dialog import AddJobDialog
+from group_config_dialog import GroupConfigDialog
+from batch_runner import BatchRunner
+from about_dialog import AboutDialog
+import app_settings
+import reset as reset_module
+
+from alligaitor.config import PipelineConfig
+from alligaitor.discovery import find_videos
+
+from crop_setup_dialog import CropSetupDialog
+from crop_config import CROP_TARGET_WIDTH, CROP_TARGET_HEIGHT, side_crop_size_for_model
+from regex_help import build_regex_help_panel
+
+import re
+
+
+class _PreferencesDialog(QDialog):
+    """Settings > Preferences: the id/camera regex and per-role default
+    tokens a newly loaded job's config editor is pre-filled with, and the
+    default output-base folder offered by the Load Job dialog. Small
+    enough to keep inline here rather than its own module.
+
+    The default tokens (e.g. "cam0" for Left) are a separate setting from
+    the camera regex itself: the regex says how to *extract* a token from
+    a filename, the tokens say which extracted value this lab expects for
+    each role, so a new job's role combos start pre-filled with an actual
+    guess instead of an arbitrary first/second/third-discovered-token
+    fallback that has no connection to which camera is which.
+    """
+
+    def __init__(self, app_data_dir: Path, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Preferences")
+        self.app_data_dir = app_data_dir
+
+        id_regex, camera_regex = app_settings.get_default_regexes(app_data_dir)
+        tokens = app_settings.get_default_camera_tokens(app_data_dir)
+        self.id_regex_edit = QLineEdit(id_regex)
+        self.camera_regex_edit = QLineEdit(camera_regex)
+        self.left_token_edit = QLineEdit(tokens["left"])
+        self.right_token_edit = QLineEdit(tokens["right"])
+        self.bottom_token_edit = QLineEdit(tokens["bottom"])
+        self.output_base_edit = QLineEdit(app_settings.get_default_output_base(app_data_dir))
+
+        form = QFormLayout()
+        form.addRow("Default ID regex:", self.id_regex_edit)
+        form.addRow("Default camera regex:", self.camera_regex_edit)
+        form.addRow("Default token — Left camera:", self.left_token_edit)
+        form.addRow("Default token — Right camera:", self.right_token_edit)
+        form.addRow("Default token — Bottom camera:", self.bottom_token_edit)
+        form.addRow("Default output base folder:", self.output_base_edit)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._on_save)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(build_regex_help_panel(self))
+        layout.addWidget(buttons)
+
+    def _on_save(self):
+        app_settings.set_default_regexes(
+            self.app_data_dir, self.id_regex_edit.text(), self.camera_regex_edit.text()
+        )
+        app_settings.set_default_camera_tokens(self.app_data_dir, {
+            "left": self.left_token_edit.text().strip(),
+            "right": self.right_token_edit.text().strip(),
+            "bottom": self.bottom_token_edit.text().strip(),
+        })
+        app_settings.set_default_output_base(self.app_data_dir, self.output_base_edit.text())
+        self.accept()
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, job_queue: JobQueue, repo_dir: Path, parent=None):
+        super().__init__(parent)
+        self.job_queue = job_queue
+        self.repo_dir = Path(repo_dir)
+        self.app_data_dir = job_queue.app_data_dir
+        self.runner: BatchRunner | None = None
+
+        # Overall-run progress tracking (every job in the current run,
+        # not just the job currently executing), keyed by job id.
+        self._run_total_by_job: dict = {}
+        self._run_done_by_job: dict = {}
+        self._run_start_time: float | None = None
+
+        self._progress_timer = QTimer(self)
+        self._progress_timer.setInterval(1000)
+        self._progress_timer.timeout.connect(self._update_progress_ui)
+
+        self.setWindowTitle("alliGAITor")
+        self.resize(1080, 620)
+
+        self._build_menu_bar()
+
+        self.model = JobTableModel(job_queue)
+        self.table = QTableView()
+        self.table.setModel(self.model)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setAlternatingRowColors(True)
+        self.table.doubleClicked.connect(lambda _index: self._on_edit_job())
+
+        self.log_panel = QPlainTextEdit()
+        self.log_panel.setReadOnly(True)
+        self.log_panel.setMaximumBlockCount(5000)
+        self.log_panel.setPlaceholderText("Run log will appear here…")
+
+        self.load_btn = QPushButton("Load Jobs…")
+        self.edit_btn = QPushButton("Edit Job…")
+        self.remove_btn = QPushButton("Remove Selected")
+        self.run_selected_btn = QPushButton("Run Selected")
+        self.run_btn = QPushButton("Run All")
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setEnabled(False)
+
+        self.load_btn.clicked.connect(self._on_load_jobs)
+        self.edit_btn.clicked.connect(self._on_edit_job)
+        self.remove_btn.clicked.connect(self._on_remove_selected)
+        self.run_selected_btn.clicked.connect(self._on_run_selected)
+        self.run_btn.clicked.connect(self._on_run_queue)
+        self.stop_btn.clicked.connect(self._on_stop_queue)
+
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(self.load_btn)
+        btn_row.addWidget(self.edit_btn)
+        btn_row.addWidget(self.remove_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(self.run_selected_btn)
+        btn_row.addWidget(self.run_btn)
+        btn_row.addWidget(self.stop_btn)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat("%v / %m sessions (%p%)")
+        self.progress_bar.setVisible(False)
+        self.eta_label = QLabel("")
+        self.eta_label.setVisible(False)
+        progress_row = QHBoxLayout()
+        progress_row.addWidget(self.progress_bar, stretch=1)
+        progress_row.addWidget(self.eta_label)
+
+        top = QWidget()
+        top_layout = QVBoxLayout(top)
+        top_layout.addLayout(btn_row)
+        top_layout.addLayout(progress_row)
+        top_layout.addWidget(self.table)
+
+        splitter = QSplitter(Qt.Vertical)
+        splitter.addWidget(top)
+        splitter.addWidget(self.log_panel)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 1)
+
+        central = QWidget()
+        central_layout = QVBoxLayout(central)
+        central_layout.addWidget(splitter)
+        self.setCentralWidget(central)
+
+        self.statusBar().showMessage(f"{len(self.job_queue.jobs)} job(s) queued")
+        self._log(f"Loaded queue from {self.job_queue.path}")
+
+    # -- menu bar --
+
+    def _build_menu_bar(self):
+        job_menu = self.menuBar().addMenu("Job")
+        job_menu.addAction("Load Jobs…", self._on_load_jobs)
+        job_menu.addAction("Edit Job…", self._on_edit_job)
+        job_menu.addAction("Remove Selected", self._on_remove_selected)
+        job_menu.addSeparator()
+        job_menu.addAction("Re-crop Selected…", self._on_recrop_selected)
+
+        reset_menu = self.menuBar().addMenu("Reset")
+        reset_menu.addAction(
+            "Selected Job(s): Predictions + 3D Output + Report…",
+            lambda: self._on_reset_selected(clear_predictions=True, clear_output=True, clear_crops=False),
+        )
+        reset_menu.addAction(
+            "Selected Job(s): 3D Output + Report Only…",
+            lambda: self._on_reset_selected(clear_predictions=False, clear_output=True, clear_crops=False),
+        )
+        reset_menu.addAction(
+            "Selected Job(s): Everything…",
+            lambda: self._on_reset_selected(clear_predictions=True, clear_output=True, clear_crops=True),
+        )
+
+        model_menu = self.menuBar().addMenu("Model")
+        self._build_role_model_submenu(model_menu, "Side Model", "side")
+        self._build_role_model_submenu(model_menu, "Bottom Model", "bottom")
+
+        run_menu = self.menuBar().addMenu("Run")
+        run_menu.addAction("Run All", self._on_run_queue)
+        run_menu.addAction("Run Selected Job(s)", self._on_run_selected)
+        run_menu.addSeparator()
+        run_menu.addAction("Stop", self._on_stop_queue)
+
+        settings_menu = self.menuBar().addMenu("Settings")
+        settings_menu.addAction("Preferences…", self._on_open_preferences)
+
+        help_menu = self.menuBar().addMenu("Help")
+        help_menu.addAction("About alliGAITor…", self._on_open_about)
+
+    def _build_role_model_submenu(self, parent_menu, label: str, role: str):
+        submenu = parent_menu.addMenu(label)
+        models_dir = self.repo_dir / "models"
+        candidates = sorted(
+            p.name for p in models_dir.iterdir() if p.is_dir() and role in p.name.lower()
+        ) if models_dir.is_dir() else []
+        if not candidates:
+            action = submenu.addAction(f"(no {role} models found in models/)")
+            action.setEnabled(False)
+            return
+        current = app_settings.get_selected_model(self.app_data_dir, role)
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        for name in candidates:
+            action = submenu.addAction(name)
+            action.setCheckable(True)
+            action.setChecked(name == current)
+            action.triggered.connect(lambda _checked=False, n=name, r=role: self._on_select_model(r, n))
+            group.addAction(action)
+
+    def _on_select_model(self, role: str, name: str):
+        app_settings.set_selected_model(self.app_data_dir, role, name)
+        self._log(f"{role.capitalize()} model set to '{name}' -- applies to any job saved/run from now on.")
+
+    def _on_open_preferences(self):
+        dialog = _PreferencesDialog(self.app_data_dir, parent=self)
+        if dialog.exec() == QDialog.Accepted:
+            self._log("Preferences saved.")
+
+    def _on_open_about(self):
+        AboutDialog(parent=self).exec()
+
+    # -- job selection helpers --
+
+    def _selected_jobs(self) -> list[Job]:
+        rows = sorted({index.row() for index in self.table.selectionModel().selectedRows()})
+        return [self.model.job_at(r) for r in rows]
+
+    def _selected_job(self) -> Job | None:
+        jobs = self._selected_jobs()
+        return jobs[0] if len(jobs) == 1 else None
+
+    # -- load / edit / remove --
+
+    def _on_load_jobs(self):
+        existing_names = {j.group_name for j in self.job_queue.jobs}
+        default_output_base = app_settings.get_default_output_base(self.app_data_dir)
+        dialog = AddJobDialog(default_output_base, existing_names, parent=self)
+        if dialog.exec() != QDialog.Accepted or dialog.result_job_kwargs is None:
+            return
+        job = Job(**dialog.result_job_kwargs)
+        self.job_queue.add(job)
+        self.model.refresh()
+        self.statusBar().showMessage(f"{len(self.job_queue.jobs)} job(s) queued")
+        self._log(f"Loaded job '{job.group_name}'.")
+        self._open_config_editor(job)  # opens on first load, per the design brief
+
+    def _open_config_editor(self, job: Job):
+        existing_names = {j.group_name for j in self.job_queue.jobs if j.id != job.id}
+        dialog = GroupConfigDialog(job, self.repo_dir, self.app_data_dir, existing_names, parent=self)
+        dialog.exec()
+        if not dialog.saved:
+            return  # canceled -- job's fields are untouched, nothing to persist
+
+        refresh_job_readiness(job)
+        self.job_queue.update(job)
+        self.model.refresh()
+        self._log(f"Saved config for '{job.group_name}' -- now {job.status.value}.")
+
+        if job.status == JobStatus.NEEDS_CROP:
+            self._open_crop_step(job)
+
+    def _on_edit_job(self):
+        job = self._selected_job()
+        if job is None:
+            QMessageBox.information(self, "Select a job", "Select exactly one job to edit.")
+            return
+        if job.status == JobStatus.RUNNING:
+            QMessageBox.information(self, "Job running", "Can't edit a job while it's running.")
+            return
+        self._open_config_editor(job)
+
+    def _on_remove_selected(self):
+        jobs = self._selected_jobs()
+        if not jobs:
+            return
+        if any(j.status == JobStatus.RUNNING for j in jobs):
+            QMessageBox.information(self, "Job running", "Stop the run before removing a running job.")
+            return
+        reply = QMessageBox.question(
+            self, "Remove job(s)",
+            f"Remove {len(jobs)} job(s) from the queue? (Output already written to disk is not deleted.)",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        for job in jobs:
+            self.job_queue.remove(job.id)
+        self.model.refresh()
+        self.statusBar().showMessage(f"{len(self.job_queue.jobs)} job(s) queued")
+        self._log(f"Removed {len(jobs)} job(s).")
+
+    # -- crop step --
+
+    def _on_recrop_selected(self):
+        job = self._selected_job()
+        if job is None:
+            QMessageBox.information(self, "Select a job", "Select exactly one job to re-crop.")
+            return
+        if job.status == JobStatus.RUNNING:
+            QMessageBox.information(self, "Job running", "Can't re-crop a job while it's running.")
+            return
+        self._open_crop_step(job)
+
+    def _open_crop_step(self, job: Job):
+        if not job.config_path.exists():
+            QMessageBox.warning(self, "No config", "Save this job's config before cropping.")
+            return
+        try:
+            config = PipelineConfig.from_yaml(job.config_path)
+        except Exception as exc:
+            QMessageBox.warning(self, "Can't crop", f"Couldn't load {job.config_path}:\n{exc}")
+            return
+        if config.discovery is None:
+            QMessageBox.warning(
+                self, "Can't crop", "This job's config has no discovery info -- re-save it from the config editor."
+            )
+            return
+
+        disc = config.discovery
+        all_videos = find_videos(disc.input_dir)
+        token_pattern = re.compile(disc.camera_regex)
+
+        def videos_for_role(role):
+            matched = []
+            for v in all_videos:
+                m = token_pattern.search(v.name)
+                if m and disc.camera_role_map.get(m.group(1)) == role:
+                    matched.append(v)
+            return matched
+
+        bottom_videos = videos_for_role("bottom")
+        side_videos = videos_for_role("left") + videos_for_role("right")
+        cropped_dir = job.cropped_dir
+        tools_dir = str(self.repo_dir / "tools")
+
+        if bottom_videos:
+            grade_all = QMessageBox.question(
+                self, "Bottom footage",
+                "Apply bottom-up color correction to all bottom videos in this job?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+            ) == QMessageBox.Yes
+            dialog = CropSetupDialog(
+                bottom_videos, disc.input_dir, cropped_dir, tools_dir,
+                CROP_TARGET_WIDTH, CROP_TARGET_HEIGHT, parent=self,
+                mode="bottom", default_color_grade=grade_all,
+            )
+            dialog.exec()
+
+        if side_videos:
+            side_model = app_settings.get_selected_model(self.app_data_dir, "side")
+            if side_model:
+                side_w, side_h = side_crop_size_for_model(self.repo_dir / "models" / side_model)
+            else:
+                side_w, side_h = CROP_TARGET_WIDTH, CROP_TARGET_HEIGHT
+            dialog = CropSetupDialog(
+                side_videos, disc.input_dir, cropped_dir, tools_dir,
+                side_w, side_h, parent=self, mode="side",
+            )
+            dialog.exec()
+
+        refresh_job_readiness(job)
+        self.job_queue.update(job)
+        self.model.refresh()
+        self._log(f"'{job.group_name}' now {job.status.value}.")
+
+    # -- reset --
+
+    def _on_reset_selected(self, clear_predictions: bool, clear_output: bool, clear_crops: bool):
+        jobs = self._selected_jobs()
+        targetable = [j for j in jobs if j.status != JobStatus.RUNNING]
+        if len(targetable) < len(jobs):
+            self._log("Skipping running job(s) -- can't reset while running.")
+        if not targetable:
+            return
+
+        lines = []
+        for job in targetable:
+            lines.append(f"{job.group_name}:")
+            lines.extend(
+                f"    {t}" for t in reset_module.describe_job_targets(job, clear_predictions, clear_output, clear_crops)
+            )
+        reply = QMessageBox.question(
+            self, "Confirm reset",
+            "This will delete:\n\n" + "\n".join(lines) + "\n\n(crop_positions.json is always kept)\n\nProceed?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        for job in targetable:
+            reset_module.perform_job_reset(job, clear_predictions, clear_output, clear_crops, log=self._log)
+            job.status = JobStatus.NEEDS_CROP
+            job.error_message = ""
+            refresh_job_readiness(job)
+            self.job_queue.update(job)
+            self._log(f"'{job.group_name}' reset -- now {job.status.value}.")
+        self.model.refresh()
+
+    # -- run --
+
+    def _on_run_queue(self):
+        self._run_jobs(self.job_queue.runnable_jobs())
+
+    def _on_run_selected(self):
+        jobs = [j for j in self._selected_jobs() if j.status == JobStatus.READY]
+        self._run_jobs(jobs)
+
+    def _run_jobs(self, jobs: list[Job]):
+        if not jobs:
+            QMessageBox.information(self, "Nothing to run", "No Ready job(s) to run.")
+            return
+        if self.runner is not None:
+            QMessageBox.information(self, "Already running", "A run is already in progress.")
+            return
+
+        for job in jobs:
+            job.status = JobStatus.RUNNING
+            job.started_at = datetime.now(timezone.utc).isoformat()
+            job.sessions_done = 0
+            self.job_queue.update(job)
+        self.model.refresh()
+
+        self._run_total_by_job = {j.id: (j.sessions_total or 1) for j in jobs}
+        self._run_done_by_job = {j.id: 0 for j in jobs}
+        self._run_start_time = time.time()
+
+        self.runner = BatchRunner(jobs, self.repo_dir, device="auto", tracking=False, parent=self)
+        self.runner.log.connect(self._log)
+        self.runner.job_started.connect(self._on_job_started)
+        self.runner.job_progress.connect(self._on_job_progress)
+        self.runner.job_finished.connect(self._on_job_finished)
+        self.runner.all_finished.connect(self._on_all_finished)
+        self.runner.finished.connect(self._on_runner_finished)
+        self.runner.start()
+
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setMaximum(sum(self._run_total_by_job.values()))
+        self.progress_bar.setValue(0)
+        self.eta_label.setVisible(True)
+        self.eta_label.setText("ETA: estimating…")
+        self._progress_timer.start()
+        self.run_btn.setEnabled(False)
+        self.run_selected_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self._log(f"Starting run of {len(jobs)} job(s)...")
+
+    def _on_job_started(self, job_id: str):
+        job = self.job_queue.get(job_id)
+        self._log(f"Started '{job.group_name if job else job_id}'.")
+
+    def _on_job_progress(self, job_id: str, done: int, total: int):
+        self._run_done_by_job[job_id] = done
+        self._run_total_by_job[job_id] = total
+        job = self.job_queue.get(job_id)
+        if job is not None:
+            job.sessions_done = done
+            job.sessions_total = total
+            self.job_queue.update(job)
+            self.model.refresh()
+        self._update_progress_ui()
+
+    def _on_job_finished(self, job_id: str, status: str, message: str):
+        job = self.job_queue.get(job_id)
+        if job is None:
+            return
+        job.status = JobStatus(status)
+        job.error_message = message
+        job.finished_at = datetime.now(timezone.utc).isoformat()
+        self.job_queue.update(job)
+        self.model.refresh()
+        suffix = f" -- {message}" if message else ""
+        self._log(f"'{job.group_name}' finished: {status}{suffix}")
+
+    def _on_all_finished(self):
+        self._log("Run complete.")
+
+    def _on_runner_finished(self):
+        self.runner = None
+        self._progress_timer.stop()
+        self.progress_bar.setVisible(False)
+        self.eta_label.setVisible(False)
+        self.run_btn.setEnabled(True)
+        self.run_selected_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+
+    def _on_stop_queue(self):
+        if self.runner is not None:
+            self.runner.request_stop()
+            self._log("Stop requested -- the current job will finish; remaining queued job(s) will be canceled.")
+
+    def _update_progress_ui(self):
+        done = sum(self._run_done_by_job.values())
+        total = sum(self._run_total_by_job.values()) or 1
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(done)
+
+        elapsed = time.time() - self._run_start_time if self._run_start_time else 0
+        if done > 0 and elapsed > 0:
+            rate = done / elapsed
+            remaining_s = max(0.0, (total - done) / rate) if rate > 0 else 0.0
+            m, s = divmod(int(remaining_s), 60)
+            self.eta_label.setText(f"ETA: {m}m {s:02d}s")
+        else:
+            self.eta_label.setText("ETA: estimating…")
+
+    # -- logging --
+
+    def _log(self, message: str):
+        self.log_panel.appendPlainText(message)
+
+    # -- shutdown --
+
+    def closeEvent(self, event):
+        if self.runner is not None:
+            reply = QMessageBox.question(
+                self, "Run in progress",
+                "A run is still in progress. Quit anyway? The current job will be interrupted.",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                event.ignore()
+                return
+            self.runner.request_stop()
+            self.runner.wait(5000)
+        event.accept()

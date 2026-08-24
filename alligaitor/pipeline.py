@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List
+from typing import Callable, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -144,7 +144,12 @@ def run_pipeline(config: PipelineConfig, device: str = "auto", tracking: bool = 
     ]
 
 
-def run_group(config: PipelineConfig, device: str = "auto", tracking: bool = False) -> Path:
+def run_group(
+    config: PipelineConfig,
+    device: str = "auto",
+    tracking: bool = False,
+    progress_callback: Optional[Callable[[str, int, int], None]] = None,
+) -> Path:
     """Run the full pipeline for every session in a group and write its gait-metrics workbook.
 
     This is the entry point a job queue (see the module docstring in
@@ -152,6 +157,16 @@ def run_group(config: PipelineConfig, device: str = "auto", tracking: bool = Fal
     every session, computes gait metrics for each from its 3D trajectory,
     and writes one Excel workbook for the group with one tab per distinct
     ``rat_id``.
+
+    Args:
+        progress_callback: If given, called as
+            ``progress_callback(session.name, sessions_done, sessions_total)``
+            immediately after each session finishes (inference,
+            triangulation, and gait metrics -- everything but the final
+            group-wide workbook write, which only happens once at the
+            end). Lets a GUI job queue show per-session progress without
+            this function needing to know anything about how progress is
+            displayed.
 
     Returns:
         Path to the written gait-metrics workbook.
@@ -161,7 +176,8 @@ def run_group(config: PipelineConfig, device: str = "auto", tracking: bool = Fal
     cgroup = _load_or_calibrate(config.calibration)
 
     trials = []
-    for session in config.sessions:
+    total = len(config.sessions)
+    for i, session in enumerate(config.sessions, start=1):
         csv_path = run_session(session, config.models, cgroup, device=device, tracking=tracking)
         trial = gait.compute_trial_metrics(
             csv_path,
@@ -175,6 +191,9 @@ def run_group(config: PipelineConfig, device: str = "auto", tracking: bool = Fal
 
         gait.save_paw_events_csv(trial, session.output_dir / f"{session.name}.paw_events.csv")
         trials.append(trial)
+
+        if progress_callback is not None:
+            progress_callback(session.name, i, total)
 
     gait.write_group_report(trials, config.output_xlsx)
     return config.output_xlsx

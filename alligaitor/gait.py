@@ -816,6 +816,35 @@ def _trial_row(trial: TrialMetrics) -> dict:
     return row
 
 
+def _average_row(rat_trials: List[TrialMetrics]) -> dict:
+    """A summary row averaging every crossing for one rat within a group,
+    appended after that rat's per-trial rows when there's more than one.
+    NaN-aware mean for the continuous per-crossing metrics (crossing
+    time, speed, stride/step length, ground contact time) -- a paw with
+    no qualifying detection on a given crossing contributes NaN there,
+    not a zero that would drag the average down. Event counts
+    (n_contacts/n_strides/n_steps) are summed rather than averaged,
+    since they're per-crossing tallies, not a rate comparable across
+    trials."""
+    rows = [_trial_row(trial) for trial in rat_trials]
+    row: dict = {"session": "AVERAGE"}
+    count_suffixes = ("_n_contacts", "_n_strides", "_n_steps")
+    for key in rows[0]:
+        if key == "session":
+            continue
+        values = [r[key] for r in rows]
+        if key.endswith(count_suffixes):
+            row[key] = float(np.nansum(values))
+        else:
+            with warnings.catch_warnings():
+                # nanmean warns on an all-NaN slice (a paw with zero
+                # qualifying detections across every crossing) -- NaN is
+                # exactly the right answer there, not a bug.
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                row[key] = float(np.nanmean(values))
+    return row
+
+
 def _safe_sheet_name(name: str, used: set) -> str:
     """Sanitize and de-duplicate an Excel sheet name (31-char limit, no ``[]:*?/\\``)."""
     cleaned = "".join(c if c not in _INVALID_SHEET_CHARS else "_" for c in str(name)).strip() or "rat"
@@ -837,6 +866,8 @@ def write_group_report(trials: List[TrialMetrics], output_path: PathLike) -> Non
     core parameters -- crossing time, average speed, and per-paw stride
     length, step length, and ground contact time -- plus each metric's
     underlying event count for a quick sanity check on detection quality.
+    A rat with more than one crossing in this group also gets a trailing
+    ``AVERAGE`` row (see :func:`_average_row`).
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -850,5 +881,8 @@ def write_group_report(trials: List[TrialMetrics], output_path: PathLike) -> Non
         if not by_rat:
             pd.DataFrame(columns=["session"]).to_excel(writer, sheet_name="Sheet1", index=False)
         for rat_id, rat_trials in by_rat.items():
-            df = pd.DataFrame([_trial_row(trial) for trial in rat_trials])
+            rows = [_trial_row(trial) for trial in rat_trials]
+            if len(rat_trials) > 1:
+                rows.append(_average_row(rat_trials))
+            df = pd.DataFrame(rows)
             df.to_excel(writer, sheet_name=_safe_sheet_name(rat_id, used_names), index=False)

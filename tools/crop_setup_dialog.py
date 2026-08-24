@@ -18,6 +18,22 @@ save_positions, keyed with frame_utils.video_key()) at
 same input/output folder resumes rather than re-asking for videos
 already cropped.
 
+The ``mode`` constructor argument controls how the color-correction UI is
+offered, since alliGAITor's GUI job queue always knows in advance whether
+a given crop pass is side or bottom footage (it runs each role as its
+own separate pass), unlike the original NOR-derived "pick per video"
+design:
+
+  - ``"manual"`` (default): the original side/bottom-up radio pair,
+    for the standalone ``scripts/crop_tool_main.py`` entry point, which
+    doesn't know a folder's camera roles ahead of time.
+  - ``"bottom"``: a single "Apply bottom-up color correction" checkbox
+    (plus the strength slider) in place of the radio pair, pre-checked
+    from ``default_color_grade`` -- for the job queue's bottom-only pass.
+  - ``"side"``: no color-correction UI at all -- ``color_grade`` is
+    always ``False``. For the job queue's side-only pass, where grading
+    was never an option to begin with, not just a default.
+
 Ported from RATlab-NOR's gui/crop_setup_dialog.py, with two changes:
 
   1. The `object_picker`/`object_setup_dialog` imports (NOR-specific
@@ -34,9 +50,6 @@ Ported from RATlab-NOR's gui/crop_setup_dialog.py, with two changes:
      native-frame pixel coordinates throughout (the same coordinates
      video_crop.crop_video() takes); only paintEvent and the mouse
      handlers convert to/from the current display scale.
-
-RATlab-NOR is MIT-licensed (Copyright (c) 2026 Mitchell Carson); see
-../THIRD_PARTY_NOTICES.md for the full license text.
 """
 
 from __future__ import annotations
@@ -48,7 +61,7 @@ from PySide6.QtGui import QPainter, QPen, QColor, QPixmap
 from PySide6.QtWidgets import (
     QDialog, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QSpinBox, QMessageBox, QPlainTextEdit, QProgressBar, QApplication,
-    QSizePolicy, QRadioButton, QButtonGroup, QSlider,
+    QSizePolicy, QRadioButton, QButtonGroup, QSlider, QCheckBox,
 )
 
 from frame_utils import video_key, grab_middle_frame, bgr_frame_to_qimage
@@ -194,10 +207,15 @@ class _CropCanvas(QWidget):
 
 class CropSetupDialog(QDialog):
     def __init__(self, video_paths, input_folder, output_folder, tools_dir,
-                 width, height, parent=None, force_review=False, camera_angle="side"):
+                 width, height, parent=None, force_review=False,
+                 mode="manual", default_color_grade=True):
         super().__init__(parent)
         self.setWindowTitle("Crop Setup")
         self.setFocusPolicy(Qt.StrongFocus)
+
+        if mode not in ("manual", "bottom", "side"):
+            raise ValueError(f"mode must be 'manual', 'bottom', or 'side', got {mode!r}")
+        self.mode = mode
 
         self.input_folder = Path(input_folder)
         self.output_folder = Path(output_folder)
@@ -238,40 +256,55 @@ class CropSetupDialog(QDialog):
         self.width_spin.valueChanged.connect(self._on_size_changed)
         self.height_spin.valueChanged.connect(self._on_size_changed)
 
-        # Camera angle toggle -- side-angle footage is cropped as-is;
-        # bottom-up (tunnel) footage additionally gets
-        # video_crop.apply_bottom_up_color_correction() applied per frame
-        # at crop time, reproducing the paw/body color-contrast boost the
-        # original (now-lost) bottom-up preprocessing produced, without
-        # the noise it also introduced. See video_crop.py's module
-        # docstring for why.
-        self.side_radio = QRadioButton("Side angle")
-        self.bottomup_radio = QRadioButton("Bottom-up (apply color correction)")
-        self.angle_group = QButtonGroup(self)
-        self.angle_group.addButton(self.side_radio)
-        self.angle_group.addButton(self.bottomup_radio)
-        if camera_angle == "bottom-up":
-            self.bottomup_radio.setChecked(True)
-        else:
+        # Color-correction UI: video_crop.apply_bottom_up_color_correction()
+        # reproduces the paw/body color-contrast boost the original
+        # (now-lost) bottom-up preprocessing produced, without the noise
+        # it also introduced (see video_crop.py's module docstring) --
+        # only ever meaningful for bottom-up (tunnel) footage. How it's
+        # offered depends on self.mode (see the class docstring): the job
+        # queue always knows in advance whether a given pass is side or
+        # bottom footage, so "manual" mode's side/bottom-up radio pair
+        # (for the standalone crop_tool_main.py, which doesn't know a
+        # folder's camera roles ahead of time) is replaced by a single
+        # checkbox in "bottom" mode, or nothing at all in "side" mode.
+        self.side_radio = None
+        self.bottomup_radio = None
+        self.grade_checkbox = None
+        if self.mode == "manual":
+            self.side_radio = QRadioButton("Side angle")
+            self.bottomup_radio = QRadioButton("Bottom-up (apply color correction)")
+            self.angle_group = QButtonGroup(self)
+            self.angle_group.addButton(self.side_radio)
+            self.angle_group.addButton(self.bottomup_radio)
             self.side_radio.setChecked(True)
-        self.side_radio.toggled.connect(self._on_angle_changed)
-        self.bottomup_radio.toggled.connect(self._on_angle_changed)
+            self.side_radio.toggled.connect(self._on_grade_changed)
+            self.bottomup_radio.toggled.connect(self._on_grade_changed)
+        elif self.mode == "bottom":
+            self.grade_checkbox = QCheckBox("Apply bottom-up color correction")
+            self.grade_checkbox.setChecked(default_color_grade)
+            self.grade_checkbox.toggled.connect(self._on_grade_changed)
+        # mode == "side": no color-grade control at all -- self.color_grade
+        # stays False unconditionally (see that property).
 
         # Strength slider -- the bottom camera has more ambient light than
         # the side-angle footage this correction was tuned against, so the
         # full-strength recipe (video_crop._BC_LAYERS) can look starker
         # than intended on real bottom-up footage. Scales
         # apply_bottom_up_color_correction()'s effect linearly, 0% = no-op,
-        # 100% = the documented recipe as-is. Only meaningful (and only
-        # enabled) when Bottom-up is selected.
-        self.strength_slider = QSlider(Qt.Horizontal)
-        self.strength_slider.setRange(0, 100)
-        self.strength_slider.setValue(100)
-        self.strength_label = QLabel("100%")
-        self.strength_label.setMinimumWidth(40)
-        self.strength_slider.valueChanged.connect(self._on_strength_changed)
-        self.strength_slider.setEnabled(self.bottomup_radio.isChecked())
-        self.strength_label.setEnabled(self.bottomup_radio.isChecked())
+        # 100% = the documented recipe as-is. Only shown/enabled where
+        # grading itself is offered (not "side" mode), and only enabled
+        # while grading is actually turned on.
+        self.strength_slider = None
+        self.strength_label = None
+        if self.mode != "side":
+            self.strength_slider = QSlider(Qt.Horizontal)
+            self.strength_slider.setRange(0, 100)
+            self.strength_slider.setValue(100)
+            self.strength_label = QLabel("100%")
+            self.strength_label.setMinimumWidth(40)
+            self.strength_slider.valueChanged.connect(self._on_strength_changed)
+            self.strength_slider.setEnabled(self.color_grade)
+            self.strength_label.setEnabled(self.color_grade)
 
         self.info_label = QLabel()
         self.info_label.setWordWrap(True)
@@ -306,16 +339,24 @@ class CropSetupDialog(QDialog):
         size_row.addStretch()
         size_row.addWidget(self.progress_label)
 
-        angle_row = QHBoxLayout()
-        angle_row.addWidget(QLabel("Camera angle:"))
-        angle_row.addWidget(self.side_radio)
-        angle_row.addWidget(self.bottomup_radio)
-        angle_row.addStretch()
+        angle_row = None
+        if self.mode == "manual":
+            angle_row = QHBoxLayout()
+            angle_row.addWidget(QLabel("Camera angle:"))
+            angle_row.addWidget(self.side_radio)
+            angle_row.addWidget(self.bottomup_radio)
+            angle_row.addStretch()
+        elif self.mode == "bottom":
+            angle_row = QHBoxLayout()
+            angle_row.addWidget(self.grade_checkbox)
+            angle_row.addStretch()
 
-        strength_row = QHBoxLayout()
-        strength_row.addWidget(QLabel("Correction strength:"))
-        strength_row.addWidget(self.strength_slider, stretch=1)
-        strength_row.addWidget(self.strength_label)
+        strength_row = None
+        if self.strength_slider is not None:
+            strength_row = QHBoxLayout()
+            strength_row.addWidget(QLabel("Correction strength:"))
+            strength_row.addWidget(self.strength_slider, stretch=1)
+            strength_row.addWidget(self.strength_label)
 
         nav_row = QHBoxLayout()
         nav_row.addWidget(self.back_btn)
@@ -324,8 +365,10 @@ class CropSetupDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.addLayout(size_row)
-        layout.addLayout(angle_row)
-        layout.addLayout(strength_row)
+        if angle_row is not None:
+            layout.addLayout(angle_row)
+        if strength_row is not None:
+            layout.addLayout(strength_row)
         layout.addWidget(self.canvas, stretch=1)  # the one thing that should grow when the dialog is resized
         layout.addWidget(self.info_label)
         layout.addLayout(nav_row)
@@ -356,17 +399,24 @@ class CropSetupDialog(QDialog):
 
     @property
     def color_grade(self) -> bool:
-        return self.bottomup_radio.isChecked()
+        if self.mode == "manual":
+            return self.bottomup_radio.isChecked()
+        if self.mode == "bottom":
+            return self.grade_checkbox.isChecked()
+        return False  # "side" -- grading was never offered, not just off by default
 
     @property
     def color_grade_strength(self) -> float:
+        if self.strength_slider is None:
+            return 0.0
         return self.strength_slider.value() / 100.0
 
     # -- preview --
 
-    def _on_angle_changed(self, checked=None):
-        self.strength_slider.setEnabled(self.bottomup_radio.isChecked())
-        self.strength_label.setEnabled(self.bottomup_radio.isChecked())
+    def _on_grade_changed(self, checked=None):
+        if self.strength_slider is not None:
+            self.strength_slider.setEnabled(self.color_grade)
+            self.strength_label.setEnabled(self.color_grade)
         self._update_preview()
 
     def _on_strength_changed(self, value):
@@ -557,10 +607,14 @@ class CropSetupDialog(QDialog):
         self.apply_all_btn.setEnabled(enabled and self.canvas.fits())
         self.width_spin.setEnabled(enabled)
         self.height_spin.setEnabled(enabled)
-        self.side_radio.setEnabled(enabled)
-        self.bottomup_radio.setEnabled(enabled)
-        self.strength_slider.setEnabled(enabled and self.bottomup_radio.isChecked())
-        self.strength_label.setEnabled(enabled and self.bottomup_radio.isChecked())
+        if self.mode == "manual":
+            self.side_radio.setEnabled(enabled)
+            self.bottomup_radio.setEnabled(enabled)
+        elif self.mode == "bottom":
+            self.grade_checkbox.setEnabled(enabled)
+        if self.strength_slider is not None:
+            self.strength_slider.setEnabled(enabled and self.color_grade)
+            self.strength_label.setEnabled(enabled and self.color_grade)
 
     # -- keyboard shortcuts (dialog-level, so they work regardless of --
     # -- exactly which child widget currently has focus) --
