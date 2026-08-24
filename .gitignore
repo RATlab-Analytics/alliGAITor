@@ -9,6 +9,10 @@ __pycache__/
 
 # SLEAP projects and predictions
 *.slp
+*.slp.*
+*.bak.*
+*.tmp
+*.tmp.*
 /predictions/
 
 # Trained models (large binaries)
@@ -36,3 +40,4 @@ minimal_skeleton.json
 /predictions_3d/
 /calibration/*.mp4
 /calibration/*.mov
+/configs

@@ -7,6 +7,7 @@ array keyed by skeleton node name.
 
 from __future__ import annotations
 
+import re
 import subprocess
 import warnings
 from dataclasses import dataclass
@@ -40,6 +41,74 @@ class PoseTrack2D:
     scores: np.ndarray
 
 
+_COLOR_TOKEN = "color"
+
+
+def model_trained_on_color(model_dir: Path) -> bool:
+    """Whether ``model_dir`` was trained on genuine color content, judged
+    by a ``color`` token in the model directory's own name.
+
+    This is deliberately NOT read from sleap-nn's own
+    ``ensure_rgb``/``ensure_grayscale`` training-config fields (see
+    ``_read_color_mode``) -- those only describe the channel *shape* a
+    model expects (3-channel vs 1-channel), not the actual pixel content
+    it was trained on. Content is decided independently, upstream, by
+    :mod:`alligaitor.preprocessing`'s grayscale re-encode (or an
+    equivalent conversion done by hand before labeling) -- e.g. the
+    existing side model is ``ensure_rgb: true``-shaped (matches its
+    ConvNeXt backbone) but was still trained on force-grayscale-converted,
+    achromatic content, so shape alone would give the wrong answer here.
+
+    Instead this follows the same convention every model directory here
+    already uses to record what makes it different from the last one
+    (``ConvNeXt``, ``single_instance``, ``n=252``, ...): name a
+    color-trained model's directory with ``color`` as one of its
+    ``.``/``_``/``-``-delimited components (e.g.
+    ``alliGAITor_bottom_slim_v1.1.0.color.n=310``) and it's picked up
+    automatically, no separate marker file or registration step needed.
+    A directory name without that token is assumed grayscale-only -- the
+    correct read for every model trained so far.
+    """
+    parts = re.split(r"[^a-zA-Z0-9]+", Path(model_dir).name.lower())
+    return _COLOR_TOKEN in parts
+
+
+def _read_color_mode(model_dir: Path) -> "tuple[Optional[bool], Optional[bool]]":
+    """Read ``(ensure_rgb, ensure_grayscale)`` from a model's own training
+    config, or ``(None, None)`` if that config can't be found/parsed.
+
+    The model directory is the single source of truth for what color mode
+    a model expects -- it's set once at training time and every consumer
+    (inference's own color-mode flags, and whether to strip color from the
+    input video before inference even runs -- see ``run_inference``'s
+    ``force_grayscale``) should derive from it rather than assuming every
+    model is grayscale, which stops being true the moment a color-trained
+    model exists alongside the grayscale ones.
+    """
+    config_path = model_dir / "training_config.yaml"
+    if not config_path.exists():
+        config_path = model_dir / "initial_config.yaml"
+    if not config_path.exists():
+        warnings.warn(
+            f"No training_config.yaml/initial_config.yaml found in {model_dir}; "
+            "falling back to sleap-nn's own color-mode default."
+        )
+        return None, None
+
+    with open(config_path, "r") as f:
+        cfg = yaml.safe_load(f)
+
+    try:
+        preprocessing = cfg["data_config"]["preprocessing"]
+        return bool(preprocessing["ensure_rgb"]), bool(preprocessing["ensure_grayscale"])
+    except (KeyError, TypeError):
+        warnings.warn(
+            f"Could not find data_config.preprocessing.ensure_rgb/ensure_grayscale in "
+            f"{config_path}; falling back to sleap-nn's own color-mode default."
+        )
+        return None, None
+
+
 def _color_mode_flags(model_dir: Path) -> List[str]:
     """Build explicit ``--ensure_rgb``/``--ensure_grayscale`` flags for a model.
 
@@ -51,30 +120,9 @@ def _color_mode_flags(model_dir: Path) -> List[str]:
     training config here and passing the flags explicitly makes the
     color mode an assertion instead of an assumption.
     """
-    config_path = model_dir / "training_config.yaml"
-    if not config_path.exists():
-        config_path = model_dir / "initial_config.yaml"
-    if not config_path.exists():
-        warnings.warn(
-            f"No training_config.yaml/initial_config.yaml found in {model_dir}; "
-            "falling back to sleap-nn's own color-mode default."
-        )
+    ensure_rgb, ensure_grayscale = _read_color_mode(model_dir)
+    if ensure_rgb is None:
         return []
-
-    with open(config_path, "r") as f:
-        cfg = yaml.safe_load(f)
-
-    try:
-        preprocessing = cfg["data_config"]["preprocessing"]
-        ensure_rgb = preprocessing["ensure_rgb"]
-        ensure_grayscale = preprocessing["ensure_grayscale"]
-    except (KeyError, TypeError):
-        warnings.warn(
-            f"Could not find data_config.preprocessing.ensure_rgb/ensure_grayscale in "
-            f"{config_path}; falling back to sleap-nn's own color-mode default."
-        )
-        return []
-
     return [
         "--ensure_rgb" if ensure_rgb else "--no-ensure_rgb",
         "--ensure_grayscale" if ensure_grayscale else "--no-ensure_grayscale",
@@ -87,7 +135,7 @@ def run_inference(
     output_path: Optional[Path] = None,
     device: str = DEFAULT_DEVICE,
     tracking: bool = False,
-    force_grayscale: bool = True,
+    force_grayscale: Optional[bool] = None,
     peak_threshold: Optional[float] = None,
 ) -> Path:
     """Run ``sleap-nn predict`` on a single video and return the output path.
@@ -103,12 +151,18 @@ def run_inference(
             These are single-instance models, so tracking is only useful
             here for its identity-smoothing effect on left/right paw
             flicker between frames.
-        force_grayscale: Both models were trained on achromatic footage,
-            so by default the video is re-encoded to true single-channel
-            grayscale content (see :mod:`alligaitor.preprocessing`) before
-            inference, stripping any color/chroma noise regardless of the
-            channel *count* each model expects. Set to ``False`` only if
-            ``video_path`` is already a verified grayscale-content file.
+        force_grayscale: Whether to re-encode the video to true
+            single-channel grayscale content (see
+            :mod:`alligaitor.preprocessing`) before inference, stripping
+            any color/chroma content regardless of the channel *count*
+            ``model_dir`` expects. Left as ``None`` (the default), this
+            is decided by :func:`model_trained_on_color` -- grayscale is
+            forced unless ``model_dir``'s own name has a ``color`` token,
+            so color-trained and grayscale-trained models can coexist
+            without the caller having to know which is which.
+            Pass ``True``/``False`` explicitly to override -- e.g.
+            ``False`` if ``video_path`` is already a verified
+            grayscale-content file and re-encoding would be wasted work.
         peak_threshold: Minimum confidence map value for a detection to be
             kept; anything below is dropped entirely rather than returned
             as a low-confidence point. Defaults to ``sleap-nn predict``'s
@@ -125,6 +179,9 @@ def run_inference(
         output_path = video_path.with_suffix(video_path.suffix + ".predictions.slp")
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if force_grayscale is None:
+        force_grayscale = not model_trained_on_color(model_dir)
 
     data_path = video_path
     if force_grayscale:
