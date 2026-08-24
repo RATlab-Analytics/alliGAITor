@@ -17,13 +17,13 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QActionGroup
+from PySide6.QtCore import Qt, QTimer, QModelIndex
+from PySide6.QtGui import QActionGroup, QTextCursor
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTableView,
     QPushButton, QPlainTextEdit, QDialog, QDialogButtonBox, QFormLayout,
     QLineEdit, QMessageBox, QAbstractItemView, QSplitter,
-    QProgressBar, QLabel, QTabWidget, QSpinBox, QDoubleSpinBox,
+    QProgressBar, QLabel, QTabWidget, QSpinBox, QDoubleSpinBox, QMenu,
 )
 
 from job_queue import Job, JobQueue, JobStatus, refresh_job_readiness
@@ -254,6 +254,21 @@ class MainWindow(QMainWindow):
         self._run_total_by_job: dict = {}
         self._run_done_by_job: dict = {}
         self._run_start_time: float | None = None
+        # ETA is a countdown snapshot, re-anchored only when real
+        # progress happens (a session finishes) -- see
+        # _recompute_eta_snapshot's docstring for why recomputing the
+        # estimate on every 1Hz tick (against an ever-growing elapsed
+        # time with a numerator that's fixed between completions) made
+        # the displayed ETA count up instead of down.
+        self._eta_remaining_s: float | None = None
+        self._eta_snapshot_time: float | None = None
+
+        # Whether the last line written to the log panel is a live
+        # progress-bar redraw (as opposed to a discrete log message) --
+        # see _on_progress_line/_log. Lets repeated redraws of "the same"
+        # tqdm line overwrite each other in place instead of each one
+        # adding a new line.
+        self._progress_line_open = False
 
         self._progress_timer = QTimer(self)
         self._progress_timer.setInterval(1000)
@@ -272,6 +287,8 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setAlternatingRowColors(True)
         self.table.doubleClicked.connect(lambda _index: self._on_edit_job())
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_table_context_menu)
 
         self.log_panel = QPlainTextEdit()
         self.log_panel.setReadOnly(True)
@@ -413,6 +430,62 @@ class MainWindow(QMainWindow):
     def _selected_job(self) -> Job | None:
         jobs = self._selected_jobs()
         return jobs[0] if len(jobs) == 1 else None
+
+    # -- right-click menu --
+
+    def _on_table_context_menu(self, pos):
+        """Right-click menu on the job table: Edit / Crop / Run / Remove
+        / Reset, all scoped to whichever job(s) the click applies to --
+        same underlying handlers as the toolbar buttons and menu bar
+        actions, just reachable without leaving the row."""
+        index = self.table.indexAt(pos)
+        if not index.isValid():
+            return
+
+        # Right-clicking a row outside the current selection selects just
+        # that row first (standard table convention) -- right-clicking
+        # within an existing multi-row selection leaves it alone, so a
+        # batch action (e.g. Reset) can still apply to all of them.
+        selection_model = self.table.selectionModel()
+        if not selection_model.isRowSelected(index.row(), QModelIndex()):
+            self.table.selectRow(index.row())
+
+        jobs = self._selected_jobs()
+        if not jobs:
+            return
+
+        menu = self._build_job_context_menu(jobs)
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def _build_job_context_menu(self, jobs: list[Job]) -> QMenu:
+        """Split out from _on_table_context_menu so it can be constructed
+        (and its contents inspected) without also invoking the blocking,
+        modal QMenu.exec() -- handy for tests, and keeps the "what's in
+        the menu" logic separate from "where/when it pops up"."""
+        menu = QMenu(self)
+        menu.addAction("Edit Job…", self._on_edit_job)
+        menu.addAction("Crop…", self._on_recrop_selected)
+        menu.addSeparator()
+        menu.addAction("Run Selected Job(s)", self._on_run_selected)
+        menu.addSeparator()
+        menu.addAction("Remove Selected", self._on_remove_selected)
+        menu.addSeparator()
+
+        reset_menu = menu.addMenu("Reset")
+        reset_menu.addAction(
+            "Predictions + 3D Output + Report…",
+            lambda: self._on_reset_selected(clear_predictions=True, clear_output=True, clear_crops=False),
+        )
+        reset_menu.addAction(
+            "3D Output + Report Only…",
+            lambda: self._on_reset_selected(clear_predictions=False, clear_output=True, clear_crops=False),
+        )
+        reset_menu.addAction(
+            "Everything…",
+            lambda: self._on_reset_selected(clear_predictions=True, clear_output=True, clear_crops=True),
+        )
+
+        return menu
 
     # -- load / edit / remove --
 
@@ -608,9 +681,12 @@ class MainWindow(QMainWindow):
         self._run_total_by_job = {j.id: (j.sessions_total or 1) for j in jobs}
         self._run_done_by_job = {j.id: 0 for j in jobs}
         self._run_start_time = time.time()
+        self._eta_remaining_s = None
+        self._eta_snapshot_time = None
 
         self.runner = BatchRunner(jobs, self.repo_dir, device="auto", tracking=False, parent=self)
         self.runner.log.connect(self._log)
+        self.runner.progress.connect(self._on_progress_line)
         self.runner.job_started.connect(self._on_job_started)
         self.runner.job_progress.connect(self._on_job_progress)
         self.runner.job_finished.connect(self._on_job_finished)
@@ -642,6 +718,7 @@ class MainWindow(QMainWindow):
             job.sessions_total = total
             self.job_queue.update(job)
             self.model.refresh()
+        self._recompute_eta_snapshot()
         self._update_progress_ui()
 
     def _on_job_finished(self, job_id: str, status: str, message: str):
@@ -673,25 +750,85 @@ class MainWindow(QMainWindow):
             self.runner.request_stop()
             self._log("Stop requested -- the current job will finish; remaining queued job(s) will be canceled.")
 
+    def _recompute_eta_snapshot(self):
+        """Re-anchors the ETA countdown to a fresh rate estimate.
+
+        Called only when real progress actually happens (a session
+        finishes) -- NOT every second. The previous version recomputed
+        ``(total - done) / (done / elapsed_since_start)`` on every 1Hz
+        tick, with ``elapsed_since_start`` growing continuously while
+        ``done`` stayed fixed between session completions (often several
+        minutes apart, once inference progress is the bottleneck) -- so
+        the *average rate* it computed kept dropping every tick, and the
+        *remaining time* estimate it displayed grew right along with it:
+        the ETA counted up, not down, for however long a session took.
+
+        Instead: compute a remaining-seconds estimate here, once, only
+        when there's new information to compute it from, and store it
+        alongside the wall-clock time it was computed at. Between calls,
+        _update_progress_ui's 1Hz tick just subtracts elapsed real time
+        from that fixed estimate -- an ordinary countdown -- rather than
+        re-deriving a new (and, between updates, ever-larger) estimate
+        from scratch.
+        """
+        if self._run_start_time is None:
+            return
+        done = sum(self._run_done_by_job.values())
+        total = sum(self._run_total_by_job.values()) or 1
+        elapsed = time.time() - self._run_start_time
+        if done <= 0 or elapsed <= 0:
+            self._eta_remaining_s = None
+            self._eta_snapshot_time = None
+            return
+        rate = done / elapsed
+        self._eta_remaining_s = max(0.0, (total - done) / rate) if rate > 0 else None
+        self._eta_snapshot_time = time.time()
+
     def _update_progress_ui(self):
         done = sum(self._run_done_by_job.values())
         total = sum(self._run_total_by_job.values()) or 1
         self.progress_bar.setMaximum(total)
         self.progress_bar.setValue(done)
 
-        elapsed = time.time() - self._run_start_time if self._run_start_time else 0
-        if done > 0 and elapsed > 0:
-            rate = done / elapsed
-            remaining_s = max(0.0, (total - done) / rate) if rate > 0 else 0.0
-            m, s = divmod(int(remaining_s), 60)
-            self.eta_label.setText(f"ETA: {m}m {s:02d}s")
-        else:
+        if self._eta_remaining_s is None or self._eta_snapshot_time is None:
             self.eta_label.setText("ETA: estimating…")
+            return
+
+        displayed_remaining = max(0.0, self._eta_remaining_s - (time.time() - self._eta_snapshot_time))
+        m, s = divmod(int(displayed_remaining), 60)
+        self.eta_label.setText(f"ETA: {m}m {s:02d}s")
 
     # -- logging --
 
     def _log(self, message: str):
         self.log_panel.appendPlainText(message)
+        # A discrete message always ends any progress-bar redraw in
+        # progress -- the next one (a different camera role's inference,
+        # most likely) should start its own new line rather than
+        # overwriting whatever was just logged here.
+        self._progress_line_open = False
+
+    def _on_progress_line(self, message: str):
+        """Live inference-progress updates (see
+        alligaitor.subprocess_streaming's `progress` callback) -- redraws
+        the same line in place, the same way the tqdm bar this mirrors
+        does in a real terminal, instead of adding a new line to the log
+        for every redraw."""
+        if self._progress_line_open:
+            cursor = self.log_panel.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            # Selects from the end of the document back to the start of
+            # the last line (not the whole document) -- KeepAnchor stops
+            # the selection from also eating the newline before it, so
+            # only that one line's text gets replaced.
+            cursor.movePosition(QTextCursor.StartOfBlock, QTextCursor.KeepAnchor)
+            cursor.removeSelectedText()
+            cursor.insertText(message)
+            self.log_panel.setTextCursor(cursor)
+        else:
+            self.log_panel.appendPlainText(message)
+            self._progress_line_open = True
+        self.log_panel.ensureCursorVisible()
 
     # -- shutdown --
 

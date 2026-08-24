@@ -37,10 +37,13 @@ from __future__ import annotations
 import warnings
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 
 from alligaitor.config import CAMERA_ROLES, GaitConfig
 from alligaitor.inference import PoseTrack2D
@@ -800,49 +803,132 @@ def save_paw_events_csv(trial: TrialMetrics, csv_path: PathLike) -> None:
     df.to_csv(csv_path, index=False)
 
 
-def _trial_row(trial: TrialMetrics) -> dict:
-    row = {
-        "session": trial.session_name,
-        "crossing_time_s": trial.crossing_time_s,
-        "average_speed_mm_s": trial.average_speed_mm_s,
-    }
+_PAW_LABELS: Dict[str, str] = {
+    "left-forepaw": "Left forepaw",
+    "right-forepaw": "Right forepaw",
+    "left-hind-paw": "Left hind paw",
+    "right-hind-paw": "Right hind paw",
+}
+
+# (attribute name on TrialMetrics, column header, per-session number format).
+# Counts are true integers per session (a real, possibly-zero tally --
+# see _paw_has_no_usable_run's docstring for why that's different from
+# NaN), so "0" is the right per-session format; the averages table
+# overrides every column to "0.00" instead (see _write_paw_block), since
+# an average of integer counts across crossings is itself a fraction, not
+# a count.
+_STAT_COLUMNS: Tuple[Tuple[str, str, str], ...] = (
+    ("stride_length_mm", "Stride Length (mm)", "0.00"),
+    ("step_length_mm", "Step Length (mm)", "0.00"),
+    ("ground_contact_time_s", "Ground Contact Time (s)", "0.00"),
+    ("n_contacts", "Contacts (n)", "0"),
+    ("n_strides", "Strides (n)", "0"),
+    ("n_steps", "Steps (n)", "0"),
+)
+_N_COLUMNS = 1 + len(_STAT_COLUMNS)  # "Paw" + the stat columns
+
+_TITLE_FONT = Font(bold=True, color="FFFFFF", size=12)
+_TITLE_FILL = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+_LABEL_FONT = Font(bold=True)
+_HEADER_FONT = Font(bold=True)
+_HEADER_FILL = PatternFill(start_color="DCE6F1", end_color="DCE6F1", fill_type="solid")
+_BAD_FILL = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+_BAD_FONT = Font(color="9C0006")
+
+
+def _paw_has_no_usable_run(trial: TrialMetrics, paw: str) -> bool:
+    """True if `paw` never formed a run clean/long enough to trust for
+    stride length, step length, or ground-contact time on this crossing
+    (all three NaN -- see GaitConfig.min_consecutive_steps). n_contacts
+    et al. can still be a real, nonzero count even when this is True: a
+    handful of raw detections that never added up to a qualifying run is
+    exactly the case this flags, not "zero contacts detected"."""
+    return (
+        np.isnan(trial.stride_length_mm[paw])
+        and np.isnan(trial.step_length_mm[paw])
+        and np.isnan(trial.ground_contact_time_s[paw])
+    )
+
+
+def _nanmean(values) -> float:
+    with warnings.catch_warnings():
+        # An all-NaN slice (a paw with zero qualifying detections across
+        # every crossing) warns by default -- NaN is exactly the right
+        # answer there, not a bug worth surfacing.
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        return float(np.nanmean(values))
+
+
+def _write_cell(ws, row: int, col: int, value, number_format: str, bad: bool):
+    display_value = None if value is None or (isinstance(value, float) and np.isnan(value)) else value
+    cell = ws.cell(row=row, column=col, value=display_value)
+    cell.number_format = number_format
+    if bad:
+        cell.fill = _BAD_FILL
+        cell.font = _BAD_FONT
+    return cell
+
+
+def _write_paw_block(
+    ws,
+    start_row: int,
+    title: str,
+    crossing_time_s: float,
+    average_speed_cm_s: float,
+    get_value: Callable[[str, str], float],
+    is_bad: Callable[[str], bool],
+    stat_columns: Tuple[Tuple[str, str, str], ...] = _STAT_COLUMNS,
+) -> int:
+    """Writes one titled block -- crossing time/speed, then a paw x stat
+    table -- starting at `start_row`, and returns the row the next block
+    should start at. `get_value(stat, paw)` and `is_bad(paw)` abstract
+    over "one trial's own numbers" vs. "this rat's per-paw averages" (see
+    write_group_report), so this one function lays out both.
+    """
+    row = start_row
+    title_cell = ws.cell(row=row, column=1, value=title)
+    title_cell.font = _TITLE_FONT
+    title_cell.fill = _TITLE_FILL
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=_N_COLUMNS)
+    for col in range(1, _N_COLUMNS + 1):
+        ws.cell(row=row, column=col).fill = _TITLE_FILL
+    row += 1
+
+    ws.cell(row=row, column=1, value="Crossing Time (s)").font = _LABEL_FONT
+    _write_cell(ws, row, 2, crossing_time_s, "0.00", bad=False)
+    ws.cell(row=row, column=3, value="Average Speed (cm/s)").font = _LABEL_FONT
+    _write_cell(ws, row, 4, average_speed_cm_s, "0.00", bad=False)
+    row += 2  # blank spacer before the paw table
+
+    ws.cell(row=row, column=1, value="Paw").font = _HEADER_FONT
+    ws.cell(row=row, column=1).fill = _HEADER_FILL
+    for col, (_, label, _fmt) in enumerate(stat_columns, start=2):
+        cell = ws.cell(row=row, column=col, value=label)
+        cell.font = _HEADER_FONT
+        cell.fill = _HEADER_FILL
+    row += 1
+
     for paw in PAW_NODES:
-        row[f"{paw}_stride_length_mm"] = trial.stride_length_mm[paw]
-        row[f"{paw}_step_length_mm"] = trial.step_length_mm[paw]
-        row[f"{paw}_ground_contact_time_s"] = trial.ground_contact_time_s[paw]
-        row[f"{paw}_n_contacts"] = trial.n_contacts[paw]
-        row[f"{paw}_n_strides"] = trial.n_strides[paw]
-        row[f"{paw}_n_steps"] = trial.n_steps[paw]
-    return row
+        bad = is_bad(paw)
+        name_cell = ws.cell(row=row, column=1, value=_PAW_LABELS[paw])
+        if bad:
+            name_cell.fill = _BAD_FILL
+            name_cell.font = _BAD_FONT
+        for col, (stat, _label, fmt) in enumerate(stat_columns, start=2):
+            _write_cell(ws, row, col, get_value(stat, paw), fmt, bad=bad)
+        row += 1
+
+    return row + 2  # blank spacer before the next block
 
 
-def _average_row(rat_trials: List[TrialMetrics]) -> dict:
-    """A summary row averaging every crossing for one rat within a group,
-    appended after that rat's per-trial rows when there's more than one.
-    NaN-aware mean for the continuous per-crossing metrics (crossing
-    time, speed, stride/step length, ground contact time) -- a paw with
-    no qualifying detection on a given crossing contributes NaN there,
-    not a zero that would drag the average down. Event counts
-    (n_contacts/n_strides/n_steps) are summed rather than averaged,
-    since they're per-crossing tallies, not a rate comparable across
-    trials."""
-    rows = [_trial_row(trial) for trial in rat_trials]
-    row: dict = {"session": "AVERAGE"}
-    count_suffixes = ("_n_contacts", "_n_strides", "_n_steps")
-    for key in rows[0]:
-        if key == "session":
-            continue
-        values = [r[key] for r in rows]
-        if key.endswith(count_suffixes):
-            row[key] = float(np.nansum(values))
-        else:
-            with warnings.catch_warnings():
-                # nanmean warns on an all-NaN slice (a paw with zero
-                # qualifying detections across every crossing) -- NaN is
-                # exactly the right answer there, not a bug.
-                warnings.simplefilter("ignore", category=RuntimeWarning)
-                row[key] = float(np.nanmean(values))
-    return row
+def _format_sheet(ws):
+    ws.column_dimensions["A"].width = 22
+    for col in range(2, _N_COLUMNS + 1):
+        ws.column_dimensions[get_column_letter(col)].width = 20
+    for row in ws.iter_rows():
+        for cell in row:
+            if cell.value is not None:
+                cell.alignment = Alignment(horizontal="left" if cell.column == 1 else "right")
 
 
 def _safe_sheet_name(name: str, used: set) -> str:
@@ -862,12 +948,17 @@ def _safe_sheet_name(name: str, used: set) -> str:
 def write_group_report(trials: List[TrialMetrics], output_path: PathLike) -> None:
     """Write one group's gait-metrics workbook: one tab per distinct ``rat_id``.
 
-    Each tab holds one row per trial (session) for that rat, covering the
-    core parameters -- crossing time, average speed, and per-paw stride
-    length, step length, and ground contact time -- plus each metric's
-    underlying event count for a quick sanity check on detection quality.
-    A rat with more than one crossing in this group also gets a trailing
-    ``AVERAGE`` row (see :func:`_average_row`).
+    Each tab stacks one titled block per trial (session) for that rat --
+    crossing time and average speed, then a paw x stat table (rows are
+    the four paws, columns are stride length/step length/ground contact
+    time/event counts, all in natural-language, unit-bearing headers) --
+    followed, when a rat has more than one crossing in this group, by a
+    final "Average" block in the same shape. A paw with no run in a
+    given crossing clean/long enough to trust for its length/timing
+    columns (see :func:`_paw_has_no_usable_run`) has its whole row
+    highlighted; the Average block's per-(paw, stat) means are NaN-aware,
+    so a paw's bad crossings don't count against its average from the
+    crossings where it did produce something usable.
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -876,13 +967,39 @@ def write_group_report(trials: List[TrialMetrics], output_path: PathLike) -> Non
     for trial in trials:
         by_rat.setdefault(trial.rat_id, []).append(trial)
 
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+    wb = Workbook()
+    wb.remove(wb.active)  # replaced by a real sheet per rat below (or the placeholder, if there are none)
+
+    if not by_rat:
+        ws = wb.create_sheet("Sheet1")
+        ws.cell(row=1, column=1, value="No sessions in this group.")
+    else:
         used_names: set = set()
-        if not by_rat:
-            pd.DataFrame(columns=["session"]).to_excel(writer, sheet_name="Sheet1", index=False)
         for rat_id, rat_trials in by_rat.items():
-            rows = [_trial_row(trial) for trial in rat_trials]
+            ws = wb.create_sheet(_safe_sheet_name(rat_id, used_names))
+            row = 1
+            for trial in rat_trials:
+                row = _write_paw_block(
+                    ws, row,
+                    title=f"Session: {trial.session_name}",
+                    crossing_time_s=trial.crossing_time_s,
+                    average_speed_cm_s=trial.average_speed_mm_s / 10.0,
+                    get_value=lambda stat, paw, t=trial: getattr(t, stat)[paw],
+                    is_bad=lambda paw, t=trial: _paw_has_no_usable_run(t, paw),
+                )
+
             if len(rat_trials) > 1:
-                rows.append(_average_row(rat_trials))
-            df = pd.DataFrame(rows)
-            df.to_excel(writer, sheet_name=_safe_sheet_name(rat_id, used_names), index=False)
+                avg_stat_columns = tuple((stat, label, "0.00") for stat, label, _fmt in _STAT_COLUMNS)
+                row = _write_paw_block(
+                    ws, row,
+                    title="Average",
+                    crossing_time_s=_nanmean([t.crossing_time_s for t in rat_trials]),
+                    average_speed_cm_s=_nanmean([t.average_speed_mm_s for t in rat_trials]) / 10.0,
+                    get_value=lambda stat, paw: _nanmean([getattr(t, stat)[paw] for t in rat_trials]),
+                    is_bad=lambda paw: all(_paw_has_no_usable_run(t, paw) for t in rat_trials),
+                    stat_columns=avg_stat_columns,
+                )
+
+            _format_sheet(ws)
+
+    wb.save(output_path)

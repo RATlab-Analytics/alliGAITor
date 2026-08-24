@@ -42,6 +42,8 @@ def run_session(
     cgroup: CameraGroup,
     device: str = "auto",
     tracking: bool = False,
+    log: Callable[[str], None] = print,
+    progress: Optional[Callable[[str], None]] = None,
 ) -> Path:
     """Run 2D inference and 3D triangulation for a single session.
 
@@ -51,6 +53,13 @@ def run_session(
         cgroup: Calibrated camera group (see :mod:`alligaitor.calibration`).
         device: Torch device passed through to SLEAP-NN inference.
         tracking: Whether to run SLEAP-NN's tracker during inference.
+        log: Forwarded to :func:`alligaitor.inference.run_inference` for
+            each of this session's three camera roles -- discrete
+            one-off messages (the command run, full output on failure).
+        progress: Forwarded to :func:`alligaitor.inference.run_inference`
+            -- the live tqdm-style progress line for whichever camera
+            role is currently running inference. Defaults to ``log`` if
+            not given (see that function's own docstring).
 
     Returns:
         Path to the written 3D trajectory CSV.
@@ -64,7 +73,8 @@ def run_session(
         model_dir = models.model_dir_for_role(role)
         slp_path = session.output_dir / f"{role}.predictions.slp"
         inference.run_inference(
-            video_path, model_dir, output_path=slp_path, device=device, tracking=tracking
+            video_path, model_dir, output_path=slp_path, device=device, tracking=tracking,
+            log=log, progress=progress,
         )
         tracks[role] = load_track(video_path, slp_path)
         fps_by_role[role] = video_fps(video_path)
@@ -135,11 +145,17 @@ def aligned_camera_validity(session: SessionConfig) -> "dict":
     return gait.cam_valid_by_paw_from_aligned(aligned)
 
 
-def run_pipeline(config: PipelineConfig, device: str = "auto", tracking: bool = False) -> List[Path]:
+def run_pipeline(
+    config: PipelineConfig,
+    device: str = "auto",
+    tracking: bool = False,
+    log: Callable[[str], None] = print,
+    progress: Optional[Callable[[str], None]] = None,
+) -> List[Path]:
     """Run calibration (loading a saved one if present) and triangulate every session."""
     cgroup = _load_or_calibrate(config.calibration)
     return [
-        run_session(session, config.models, cgroup, device=device, tracking=tracking)
+        run_session(session, config.models, cgroup, device=device, tracking=tracking, log=log, progress=progress)
         for session in config.sessions
     ]
 
@@ -149,6 +165,8 @@ def run_group(
     device: str = "auto",
     tracking: bool = False,
     progress_callback: Optional[Callable[[str, int, int], None]] = None,
+    log: Callable[[str], None] = print,
+    progress: Optional[Callable[[str], None]] = None,
 ) -> Path:
     """Run the full pipeline for every session in a group and write its gait-metrics workbook.
 
@@ -167,6 +185,16 @@ def run_group(
             end). Lets a GUI job queue show per-session progress without
             this function needing to know anything about how progress is
             displayed.
+        log: Forwarded to :func:`run_session` for each session -- discrete
+            one-off messages, not the live per-video progress line.
+        progress: Forwarded to :func:`run_session` -- the live tqdm-style
+            progress line from whichever camera role is currently running
+            inference. This is what makes a long-running session's
+            inference stage visible while it's happening, rather than
+            the log going quiet for however long it takes (see
+            :func:`alligaitor.inference.run_inference`). Distinct from
+            ``progress_callback`` above, which only fires once *between*
+            sessions, not during one.
 
     Returns:
         Path to the written gait-metrics workbook.
@@ -178,7 +206,9 @@ def run_group(
     trials = []
     total = len(config.sessions)
     for i, session in enumerate(config.sessions, start=1):
-        csv_path = run_session(session, config.models, cgroup, device=device, tracking=tracking)
+        csv_path = run_session(
+            session, config.models, cgroup, device=device, tracking=tracking, log=log, progress=progress
+        )
         trial = gait.compute_trial_metrics(
             csv_path,
             session_name=session.name,

@@ -5,9 +5,12 @@ pipeline work to a separate OS process
 process -- see that module's docstring for why.
 
 Ported from RATlab-NOR's gui/batch_runner.py, with "video" progress
-renamed to "session" (alliGAITor's own unit of run progress) and the
-NOR-specific tqdm-redraw ``progress`` signal dropped -- per-session log
-lines are infrequent enough not to need it.
+renamed to "session" (alliGAITor's own unit of run progress). The
+``progress`` signal below is NOR's same tqdm-redraw mechanism, carried
+over for the same reason NOR needed it: without it, the live progress a
+long inference run is actually making (see
+:mod:`alligaitor.subprocess_streaming`) has nowhere to go, and a
+multi-minute session looks hung rather than working.
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ from job_queue import Job
 
 class BatchRunner(QObject):
     log = Signal(str)
+    progress = Signal(str)                   # same redrawing line updating -- see main_window.py's _on_progress_line
     job_started = Signal(str)               # job_id
     job_progress = Signal(str, int, int)     # job_id, sessions_done, sessions_total
     job_finished = Signal(str, str, str)     # job_id, status, message
@@ -82,6 +86,8 @@ class BatchRunner(QObject):
         kind = msg[0]
         if kind == "log":
             self.log.emit(msg[1])
+        elif kind == "progress":
+            self.progress.emit(msg[1])
         elif kind == "job_started":
             self.job_started.emit(msg[1])
         elif kind == "job_progress":

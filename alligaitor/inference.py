@@ -8,17 +8,17 @@ array keyed by skeleton node name.
 from __future__ import annotations
 
 import re
-import subprocess
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import numpy as np
 import sleap_io as sio
 import yaml
 
 from alligaitor import preprocessing
+from alligaitor.subprocess_streaming import stream_subprocess
 
 DEFAULT_DEVICE = "auto"
 
@@ -137,6 +137,8 @@ def run_inference(
     tracking: bool = False,
     force_grayscale: Optional[bool] = None,
     peak_threshold: Optional[float] = None,
+    log: Callable[[str], None] = print,
+    progress: Optional[Callable[[str], None]] = None,
 ) -> Path:
     """Run ``sleap-nn predict`` on a single video and return the output path.
 
@@ -169,6 +171,15 @@ def run_inference(
             own default (``0.2``) when left as ``None``. Lower this to
             compare against SLEAP's GUI inference, which may use a
             different default.
+        log: Receives discrete one-off messages (the command being run;
+            the full subprocess output if it fails -- see
+            :mod:`alligaitor.subprocess_streaming`).
+        progress: Receives ``sleap-nn predict``'s own live tqdm progress
+            output as it runs -- repeated calls for what's conceptually
+            the same redrawing line, as opposed to ``log``'s discrete
+            messages, so a caller that wants to show that in place (the
+            GUI does) can tell the two apart. Defaults to ``log`` if not
+            given.
 
     Returns:
         Path to the written ``.slp`` predictions file.
@@ -205,7 +216,14 @@ def run_inference(
     if tracking:
         cmd.append("--tracking")
 
-    subprocess.run(cmd, check=True)
+    log(f"  $ {' '.join(cmd)}")
+    returncode, streamer = stream_subprocess(cmd, log, progress)
+    if returncode != 0:
+        streamer.dump_plain_lines("run failed")
+        raise RuntimeError(
+            f"sleap-nn predict exited with code {returncode} for {video_path}. "
+            f"See its output above for details."
+        )
     return output_path
 
 

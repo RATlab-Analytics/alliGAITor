@@ -38,6 +38,15 @@ def run_batch_worker(repo_dir: str, job_dicts: list, queue, stop_event,
     def log(message: str):
         queue.put(("log", message))
 
+    def progress(message: str):
+        # Live tqdm-style line from inference (see
+        # alligaitor.subprocess_streaming) -- kept as its own message
+        # kind, not "log", so the GUI can redraw it in place instead of
+        # appending a new line for every update (this is what makes a
+        # long-running session's inference stage visible while it's
+        # happening, instead of the log going quiet and looking hung).
+        queue.put(("progress", message))
+
     for job_dict in job_dicts:
         job = Job.from_dict(job_dict)
 
@@ -62,7 +71,10 @@ def run_batch_worker(repo_dir: str, job_dicts: list, queue, stop_event,
 
         try:
             log(f"[{job.group_name}] calibrating (or loading saved calibration)...")
-            output_path = run_group(config, device=device, tracking=tracking, progress_callback=progress_callback)
+            output_path = run_group(
+                config, device=device, tracking=tracking, progress_callback=progress_callback,
+                log=log, progress=progress,
+            )
             log(f"[{job.group_name}] wrote {output_path}")
             queue.put(("job_finished", job.id, JobStatus.DONE.value, ""))
         except Exception as exc:
