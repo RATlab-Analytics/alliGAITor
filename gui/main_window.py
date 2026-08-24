@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTableView,
     QPushButton, QPlainTextEdit, QDialog, QDialogButtonBox, QFormLayout,
     QLineEdit, QMessageBox, QAbstractItemView, QSplitter,
-    QProgressBar, QLabel,
+    QProgressBar, QLabel, QTabWidget, QSpinBox, QDoubleSpinBox,
 )
 
 from job_queue import Job, JobQueue, JobStatus, refresh_job_readiness
@@ -45,18 +45,48 @@ from regex_help import build_regex_help_panel
 import re
 
 
-class _PreferencesDialog(QDialog):
-    """Settings > Preferences: the id/camera regex and per-role default
-    tokens a newly loaded job's config editor is pre-filled with, and the
-    default output-base folder offered by the Load Job dialog. Small
-    enough to keep inline here rather than its own module.
+def _double_spin(value: float, minimum: float, maximum: float, decimals: int = 1, suffix: str = "", tooltip: str = ""):
+    box = QDoubleSpinBox()
+    box.setRange(minimum, maximum)
+    box.setDecimals(decimals)
+    box.setSuffix(suffix)
+    box.setValue(value)
+    if tooltip:
+        box.setToolTip(tooltip)
+    return box
 
-    The default tokens (e.g. "cam0" for Left) are a separate setting from
-    the camera regex itself: the regex says how to *extract* a token from
-    a filename, the tokens say which extracted value this lab expects for
-    each role, so a new job's role combos start pre-filled with an actual
-    guess instead of an arbitrary first/second/third-discovered-token
-    fallback that has no connection to which camera is which.
+
+def _int_spin(value: int, minimum: int, maximum: int, suffix: str = "", tooltip: str = ""):
+    box = QSpinBox()
+    box.setRange(minimum, maximum)
+    box.setSuffix(suffix)
+    box.setValue(value)
+    if tooltip:
+        box.setToolTip(tooltip)
+    return box
+
+
+class _PreferencesDialog(QDialog):
+    """Settings > Preferences, in two tabs:
+
+    - **General**: the id/camera regex and per-role default tokens a
+      newly loaded job's config editor is pre-filled with, and the
+      default output-base folder offered by the Load Job dialog. The
+      default tokens (e.g. "cam0" for Left) are a separate setting from
+      the camera regex itself: the regex says how to *extract* a token
+      from a filename, the tokens say which extracted value this lab
+      expects for each role, so a new job's role combos start pre-filled
+      with an actual guess instead of an arbitrary
+      first/second/third-discovered-token fallback that has no
+      connection to which camera is which.
+    - **Scoring & Triangulation**: the stance/swing detection thresholds
+      (alligaitor.config.GaitConfig) and the calibration
+      min_corners_extrinsic tunable, baked into every newly-saved job's
+      config.yaml the same way the selected models are (see
+      group_config_dialog.py's _on_save) -- not something an individual
+      job overrides in the editor UI, just what "new job" starts from.
+
+    Small enough to keep inline here rather than its own module.
     """
 
     def __init__(self, app_data_dir: Path, parent=None):
@@ -64,14 +94,56 @@ class _PreferencesDialog(QDialog):
         self.setWindowTitle("Preferences")
         self.app_data_dir = app_data_dir
 
-        id_regex, camera_regex = app_settings.get_default_regexes(app_data_dir)
-        tokens = app_settings.get_default_camera_tokens(app_data_dir)
+        # Built before the tabs' own content, since the regex help panel
+        # inside the General tab needs to call back into
+        # _sync_dialog_size(), which needs self._tabs to already exist.
+        self._tabs = QTabWidget()
+        self._tabs.currentChanged.connect(lambda _index: QTimer.singleShot(0, self._sync_dialog_size))
+
+        self._tabs.addTab(self._build_general_tab(), "General")
+        self._tabs.addTab(self._build_scoring_tab(), "Scoring && Triangulation")
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._on_save)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self._tabs)
+        layout.addWidget(buttons)
+
+    def _sync_dialog_size(self):
+        """Resizes this dialog to fit whichever tab is current.
+
+        QTabWidget's internal QStackedWidget is documented Qt behavior
+        to size itself for the *largest* page it has ever shown, not the
+        current one -- so switching to a shorter tab, or collapsing the
+        regex help panel back down within the current tab, leaves the
+        dialog oversized under plain sizeHint()-based resizing (see
+        shrink_window_to_fit's docstring; that approach alone isn't
+        enough here). The only reliable fix is to bypass QStackedWidget's
+        own sizeHint entirely: give the tab widget an explicit fixed
+        height computed from the current page's own sizeHint(), which --
+        unlike the tab widget's -- always stays accurate regardless of
+        what other tabs have been shown.
+        """
+        page = self._tabs.currentWidget()
+        if page is None:
+            return
+        tabbar_h = self._tabs.tabBar().sizeHint().height()
+        frame_padding = 20  # tab frame border; small and stable across styles
+        self._tabs.setFixedHeight(page.sizeHint().height() + tabbar_h + frame_padding)
+        self.layout().activate()
+        self.resize(self.width(), self.layout().sizeHint().height())
+
+    def _build_general_tab(self) -> QWidget:
+        id_regex, camera_regex = app_settings.get_default_regexes(self.app_data_dir)
+        tokens = app_settings.get_default_camera_tokens(self.app_data_dir)
         self.id_regex_edit = QLineEdit(id_regex)
         self.camera_regex_edit = QLineEdit(camera_regex)
         self.left_token_edit = QLineEdit(tokens["left"])
         self.right_token_edit = QLineEdit(tokens["right"])
         self.bottom_token_edit = QLineEdit(tokens["bottom"])
-        self.output_base_edit = QLineEdit(app_settings.get_default_output_base(app_data_dir))
+        self.output_base_edit = QLineEdit(app_settings.get_default_output_base(self.app_data_dir))
 
         form = QFormLayout()
         form.addRow("Default ID regex:", self.id_regex_edit)
@@ -80,15 +152,71 @@ class _PreferencesDialog(QDialog):
         form.addRow("Default token — Right camera:", self.right_token_edit)
         form.addRow("Default token — Bottom camera:", self.bottom_token_edit)
         form.addRow("Default output base folder:", self.output_base_edit)
+        form.addRow(build_regex_help_panel(self, on_toggled=self._sync_dialog_size))
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self._on_save)
-        buttons.rejected.connect(self.reject)
+        tab = QWidget()
+        tab.setLayout(form)
+        return tab
 
-        layout = QVBoxLayout(self)
-        layout.addLayout(form)
-        layout.addWidget(build_regex_help_panel(self))
-        layout.addWidget(buttons)
+    def _build_scoring_tab(self) -> QWidget:
+        gait = app_settings.get_default_gait_overrides(self.app_data_dir)
+        min_corners = app_settings.get_default_min_corners_extrinsic(self.app_data_dir)
+
+        self.speed_threshold_spin = _double_spin(
+            gait["speed_threshold_mm_s"], 0, 100000, 1, " mm/s",
+            "Maximum frame-to-frame speed for a paw to count as planted.",
+        )
+        self.min_contact_frames_spin = _int_spin(
+            gait["min_contact_frames"], 0, 1000, "",
+            "Minimum consecutive frames a paw must stay under the speed threshold to count as a real stance.",
+        )
+        self.max_bridge_gap_spin = _int_spin(
+            gait["max_bridge_gap_frames"], 0, 1000, "",
+            "Untriangulated runs up to this many frames are interpolated before stance is computed. 0 disables bridging.",
+        )
+        self.min_consecutive_steps_spin = _int_spin(
+            gait["min_consecutive_steps"], 0, 1000, "",
+            "A paw's reported averages only use steps from a run of at least this many consecutive clean stances.",
+        )
+        self.stillness_threshold_spin = _double_spin(
+            gait["stillness_speed_threshold_mm_s"], 0, 100000, 1, " mm/s",
+            "Below this whole-body speed, the rat counts as not translating (for trimming a stationary start/end).",
+        )
+        self.min_still_frames_spin = _int_spin(
+            gait["min_still_frames"], 0, 10000, "",
+            "Consecutive stationary frames at the very start/end of a trial needed to trim it as \"stopped\".",
+        )
+        self.stride_outlier_spin = _double_spin(
+            gait["stride_length_outlier_ratio"], 0.1, 100, 2, "×",
+            "A stride longer than this many times a paw's own median stride length is flagged as a likely missed step.",
+        )
+        self.min_corners_extrinsic_spin = _int_spin(
+            min_corners, 1, 10000, "",
+            "Minimum matched points a frame needs to link two cameras' poses during AprilTag calibration.",
+        )
+
+        gait_form = QFormLayout()
+        gait_form.addRow("Speed threshold (planted):", self.speed_threshold_spin)
+        gait_form.addRow("Min contact frames:", self.min_contact_frames_spin)
+        gait_form.addRow("Max bridge gap:", self.max_bridge_gap_spin)
+        gait_form.addRow("Min consecutive steps:", self.min_consecutive_steps_spin)
+        gait_form.addRow("Stillness speed threshold:", self.stillness_threshold_spin)
+        gait_form.addRow("Min still frames:", self.min_still_frames_spin)
+        gait_form.addRow("Stride length outlier ratio:", self.stride_outlier_spin)
+
+        triangulation_form = QFormLayout()
+        triangulation_form.addRow("Min corners (extrinsic, AprilTag):", self.min_corners_extrinsic_spin)
+
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel("<b>Scoring</b> (stance/swing detection defaults for new jobs)"))
+        layout.addLayout(gait_form)
+        layout.addWidget(QLabel("<b>Triangulation</b> (calibration defaults for new jobs)"))
+        layout.addLayout(triangulation_form)
+        layout.addStretch()
+
+        tab = QWidget()
+        tab.setLayout(layout)
+        return tab
 
     def _on_save(self):
         app_settings.set_default_regexes(
@@ -100,6 +228,16 @@ class _PreferencesDialog(QDialog):
             "bottom": self.bottom_token_edit.text().strip(),
         })
         app_settings.set_default_output_base(self.app_data_dir, self.output_base_edit.text())
+        app_settings.set_default_gait_overrides(self.app_data_dir, {
+            "speed_threshold_mm_s": self.speed_threshold_spin.value(),
+            "min_contact_frames": self.min_contact_frames_spin.value(),
+            "max_bridge_gap_frames": self.max_bridge_gap_spin.value(),
+            "min_consecutive_steps": self.min_consecutive_steps_spin.value(),
+            "stillness_speed_threshold_mm_s": self.stillness_threshold_spin.value(),
+            "min_still_frames": self.min_still_frames_spin.value(),
+            "stride_length_outlier_ratio": self.stride_outlier_spin.value(),
+        })
+        app_settings.set_default_min_corners_extrinsic(self.app_data_dir, self.min_corners_extrinsic_spin.value())
         self.accept()
 
 

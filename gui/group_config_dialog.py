@@ -132,27 +132,40 @@ class GroupConfigDialog(QDialog):
         layout.addWidget(regex_box)
 
         # -- camera roles --
+        # Thumbnails are keyed by *token*, not by role: pairing a preview
+        # with a role dropdown (as if the dropdown's current selection
+        # determined which frame to show) means the thumbnail is only
+        # ever correct once you've already gotten the role assignment
+        # right -- exactly backwards, since the thumbnail's whole job is
+        # to help you figure out the assignment in the first place. A
+        # token gallery, unambiguous and independent of what's currently
+        # selected in any dropdown, does that instead; the three role
+        # dropdowns below it just pick a token by name.
         roles_box = QGroupBox("Camera roles")
-        roles_form = QFormLayout(roles_box)
+        roles_layout = QVBoxLayout(roles_box)
+
+        roles_layout.addWidget(QLabel("Detected camera tokens (from the camera regex above):"))
+        self.token_gallery = QWidget()
+        self.token_gallery_layout = QHBoxLayout(self.token_gallery)
+        self.token_gallery_layout.setContentsMargins(0, 0, 0, 0)
+        roles_layout.addWidget(self.token_gallery)
+
+        # Side by side rather than stacked (QFormLayout rows): matches
+        # the gallery's own horizontal layout above, and three role
+        # pickers read fine in a row -- no need for the vertical space
+        # a label-per-row form would cost here.
+        role_row = QHBoxLayout()
         self.role_combos: Dict[str, QComboBox] = {}
-        self.role_thumbs: Dict[str, QLabel] = {}
         for role in _ROLES:
+            role_cell = QVBoxLayout()
+            role_cell.addWidget(QLabel(f"{_ROLE_LABELS[role]}:"))
             combo = QComboBox()
             combo.setEditable(True)
             combo.currentTextChanged.connect(self._rescan)
-            thumb = QLabel()
-            thumb.setFixedSize(*_THUMB_SIZE)
-            thumb.setStyleSheet("background: #222; color: #888;")
-            thumb.setAlignment(Qt.AlignCenter)
-            thumb.setText("no preview")
-            role_row = QHBoxLayout()
-            role_row.addWidget(combo, stretch=1)
-            role_row.addWidget(thumb)
-            role_row_widget = QWidget()
-            role_row_widget.setLayout(role_row)
-            roles_form.addRow(f"{_ROLE_LABELS[role]}:", role_row_widget)
+            role_cell.addWidget(combo)
+            role_row.addLayout(role_cell)
             self.role_combos[role] = combo
-            self.role_thumbs[role] = thumb
+        roles_layout.addLayout(role_row)
         layout.addWidget(roles_box)
 
         # -- sessions --
@@ -393,7 +406,7 @@ class GroupConfigDialog(QDialog):
 
     def _rescan(self):
         discovery = self._current_discovery()
-        self._update_thumbnails(discovery)
+        self._update_token_gallery(discovery)
         self._update_calib_output_label()
 
         if discovery is None or not Path(discovery.input_dir).is_dir():
@@ -407,30 +420,62 @@ class GroupConfigDialog(QDialog):
         self._sessions, self._problems = discover_sessions(discovery, cropped_dir, predictions_dir)
         self._refresh_session_table()
 
-    def _update_thumbnails(self, discovery: Optional[DiscoveryConfig]):
-        if discovery is None:
-            videos = []
-        else:
-            videos = find_videos(discovery.input_dir)
-        for role in _ROLES:
-            token = self.role_combos[role].currentText().strip()
-            thumb = self.role_thumbs[role]
-            video = representative_video_for_token(videos, self.camera_regex_edit.text() or ".^", token) if token else None
+    def _update_token_gallery(self, discovery: Optional[DiscoveryConfig]):
+        """Rebuilds the token->thumbnail gallery from scratch: one cell
+        per distinct camera token actually found in the input folder,
+        each labeled with that token and a preview frame from a
+        representative video -- independent of what's currently selected
+        in any of the three role dropdowns, so the preview a token shows
+        can never be wrong relative to some *other* token's dropdown
+        (unlike pairing a thumbnail with a role's current selection)."""
+        while self.token_gallery_layout.count():
+            item = self.token_gallery_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        videos = find_videos(discovery.input_dir) if discovery is not None else []
+        camera_regex = self.camera_regex_edit.text() or ".^"
+        tokens = camera_tokens(videos, camera_regex)
+
+        if not tokens:
+            placeholder = QLabel("(no camera tokens detected yet)")
+            placeholder.setStyleSheet("color: #888;")
+            self.token_gallery_layout.addWidget(placeholder)
+            return
+
+        for token in tokens:
+            cell = QWidget()
+            cell_layout = QVBoxLayout(cell)
+            cell_layout.setContentsMargins(4, 4, 4, 4)
+
+            thumb = QLabel()
+            thumb.setFixedSize(*_THUMB_SIZE)
+            thumb.setStyleSheet("background: #222; color: #888;")
+            thumb.setAlignment(Qt.AlignCenter)
+            video = representative_video_for_token(videos, camera_regex, token)
             if video is None:
-                thumb.setPixmap(QPixmap())
                 thumb.setText("no preview")
-                continue
-            try:
-                frame = grab_middle_frame(video)
-                qimage = bgr_frame_to_qimage(frame)
-                pixmap = QPixmap.fromImage(qimage).scaled(
-                    *_THUMB_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation
-                )
-                thumb.setPixmap(pixmap)
-                thumb.setText("")
-            except Exception:
-                thumb.setPixmap(QPixmap())
-                thumb.setText("preview failed")
+            else:
+                try:
+                    frame = grab_middle_frame(video)
+                    qimage = bgr_frame_to_qimage(frame)
+                    pixmap = QPixmap.fromImage(qimage).scaled(
+                        *_THUMB_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation
+                    )
+                    thumb.setPixmap(pixmap)
+                except Exception:
+                    thumb.setText("preview failed")
+
+            token_label = QLabel(token)
+            token_label.setAlignment(Qt.AlignCenter)
+            token_label.setStyleSheet("font-weight: bold;")
+
+            cell_layout.addWidget(thumb)
+            cell_layout.addWidget(token_label)
+            self.token_gallery_layout.addWidget(cell)
+
+        self.token_gallery_layout.addStretch()
 
     def _refresh_session_table(self):
         self.session_table.blockSignals(True)
@@ -487,7 +532,7 @@ class GroupConfigDialog(QDialog):
             QMessageBox.warning(self, "Invalid regex", "The ID regex and camera regex must both be valid.")
             return
 
-        from app_settings import get_selected_model
+        from app_settings import get_default_gait_overrides, get_default_min_corners_extrinsic, get_selected_model
         side_model = get_selected_model(self.app_data_dir, "side")
         bottom_model = get_selected_model(self.app_data_dir, "bottom")
         if not side_model or not bottom_model:
@@ -525,6 +570,7 @@ class GroupConfigDialog(QDialog):
             videos=calib_videos,
             output_path=output_path,
             board_preset=self.board_preset_combo.currentText(),
+            min_corners_extrinsic=get_default_min_corners_extrinsic(self.app_data_dir),
         )
 
         cropped_dir = Path(output_folder) / "cropped"
@@ -552,7 +598,7 @@ class GroupConfigDialog(QDialog):
             sessions=sessions,
             name=group_name,
             output_xlsx=Path(output_folder) / "reports" / f"{group_name}.gait_metrics.xlsx",
-            gait=GaitConfig(),
+            gait=GaitConfig(**get_default_gait_overrides(self.app_data_dir)),
             discovery=discovery,
         )
 

@@ -1,0 +1,22 @@
+{
+  "selected_side_model": "alliGAITor_side_ConvNeXt_color_v2.1.0.n494",
+  "selected_bottom_model": "alliGAITor_bottom_color_v2.6.0.n252",
+  "default_id_regex": "^(.+?)_cam\\d+",
+  "default_camera_regex": "_(cam\\d+)",
+  "default_camera_tokens": {
+    "left": "cam0",
+    "right": "cam1",
+    "bottom": "cam2"
+  },
+  "default_output_base": "",
+  "default_gait": {
+    "speed_threshold_mm_s": 50.0,
+    "min_contact_frames": 1,
+    "max_bridge_gap_frames": 4,
+    "min_consecutive_steps": 5,
+    "stillness_speed_threshold_mm_s": 20.0,
+    "min_still_frames": 15,
+    "stride_length_outlier_ratio": 1.8
+  },
+  "default_min_corners_extrinsic": 8
+}

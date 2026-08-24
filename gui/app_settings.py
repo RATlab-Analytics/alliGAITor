@@ -2,16 +2,21 @@
 App-wide settings for the alliGAITor GUI, persisted to
 ``app_data/settings.json`` alongside the job queue. Covers things that
 apply to every job unless overridden: which side/bottom model the Model
-menu currently has selected, the default id/camera regex used to seed a
-newly added job's config editor (Settings > Preferences), and the
-default output-base folder offered by the Add Job dialog.
+menu currently has selected, the default id/camera regex and per-role
+camera tokens used to seed a newly added job's config editor, default
+scoring (gait) and triangulation/calibration tunables baked into every
+newly-saved job's config.yaml, and the default output-base folder offered
+by the Load Job dialog. All editable from Settings > Preferences.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 from typing import Dict, Optional, Tuple
+
+from alligaitor.config import CalibrationConfig, GaitConfig
 
 # Matches this rig's current "<session>_camN_coded.mp4" filenames (see
 # configs/session_example.yaml) -- just a starting point. Any lab can
@@ -30,6 +35,22 @@ DEFAULT_CAMERA_REGEX = r"_(cam\d+)"
 # "cam2" verbatim, so the defaults below are those same strings.
 DEFAULT_CAMERA_TOKENS = {"left": "cam0", "right": "cam1", "bottom": "cam2"}
 
+
+def _dataclass_field_default(cls, name: str):
+    for f in dataclasses.fields(cls):
+        if f.name == name:
+            return f.default
+    raise KeyError(name)
+
+
+# Scoring (stance/swing detection -- alligaitor.config.GaitConfig) and
+# triangulation/calibration (CalibrationConfig.min_corners_extrinsic)
+# tunables, read from those dataclasses' own field defaults rather than
+# duplicated here as separate literals, so this can't silently drift out
+# of sync if those defaults are ever changed in alligaitor/config.py.
+DEFAULT_GAIT = dataclasses.asdict(GaitConfig())
+DEFAULT_MIN_CORNERS_EXTRINSIC = _dataclass_field_default(CalibrationConfig, "min_corners_extrinsic")
+
 _DEFAULTS = {
     "selected_side_model": None,
     "selected_bottom_model": None,
@@ -37,6 +58,8 @@ _DEFAULTS = {
     "default_camera_regex": DEFAULT_CAMERA_REGEX,
     "default_camera_tokens": dict(DEFAULT_CAMERA_TOKENS),
     "default_output_base": "",
+    "default_gait": dict(DEFAULT_GAIT),
+    "default_min_corners_extrinsic": DEFAULT_MIN_CORNERS_EXTRINSIC,
 }
 
 
@@ -106,6 +129,37 @@ def get_default_camera_tokens(app_data_dir: Path) -> Dict[str, str]:
 def set_default_camera_tokens(app_data_dir: Path, tokens: Dict[str, str]) -> None:
     settings = load_settings(app_data_dir)
     settings["default_camera_tokens"] = dict(tokens)  # copy -- never share the caller's dict
+    save_settings(app_data_dir, settings)
+
+
+# -- default scoring (gait) and triangulation/calibration tunables --
+# (Settings > Preferences > Scoring & Triangulation)
+
+def get_default_gait_overrides(app_data_dir: Path) -> Dict[str, float]:
+    """Values used to build the GaitConfig baked into a newly-saved job's
+    config.yaml (see group_config_dialog.py's _on_save) -- same
+    always-read-fresh-from-Settings pattern as the selected models, not
+    something an individual job can override in the editor UI."""
+    settings = load_settings(app_data_dir)
+    values = dict(DEFAULT_GAIT)
+    values.update(settings.get("default_gait") or {})
+    return values
+
+
+def set_default_gait_overrides(app_data_dir: Path, values: Dict[str, float]) -> None:
+    settings = load_settings(app_data_dir)
+    settings["default_gait"] = dict(values)
+    save_settings(app_data_dir, settings)
+
+
+def get_default_min_corners_extrinsic(app_data_dir: Path) -> int:
+    settings = load_settings(app_data_dir)
+    return settings.get("default_min_corners_extrinsic", DEFAULT_MIN_CORNERS_EXTRINSIC)
+
+
+def set_default_min_corners_extrinsic(app_data_dir: Path, value: int) -> None:
+    settings = load_settings(app_data_dir)
+    settings["default_min_corners_extrinsic"] = value
     save_settings(app_data_dir, settings)
 
 
