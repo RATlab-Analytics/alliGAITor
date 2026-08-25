@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List
+from typing import Callable, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -42,6 +42,10 @@ def run_session(
     cgroup: CameraGroup,
     device: str = "auto",
     tracking: bool = False,
+    log: Callable[[str], None] = print,
+    progress: Optional[Callable[[str], None]] = None,
+    html_progress: bool = False,
+    on_redraw_closed: Optional[Callable[[], None]] = None,
 ) -> Path:
     """Run 2D inference and 3D triangulation for a single session.
 
@@ -51,6 +55,19 @@ def run_session(
         cgroup: Calibrated camera group (see :mod:`alligaitor.calibration`).
         device: Torch device passed through to SLEAP-NN inference.
         tracking: Whether to run SLEAP-NN's tracker during inference.
+        log: Forwarded to :func:`alligaitor.inference.run_inference` for
+            each of this session's three camera roles -- discrete
+            one-off messages (the command run, full output on failure).
+        progress: Forwarded to :func:`alligaitor.inference.run_inference`
+            -- the live tqdm-style progress line for whichever camera
+            role is currently running inference. Defaults to ``log`` if
+            not given (see that function's own docstring).
+        html_progress: Forwarded to :func:`alligaitor.inference.run_inference`
+            -- whether ``progress`` wants HTML-rendered color or plain text.
+        on_redraw_closed: Forwarded to
+            :func:`alligaitor.inference.run_inference` -- called whenever
+            a redrawn progress line's definitive final state has just
+            been sent to ``progress``.
 
     Returns:
         Path to the written 3D trajectory CSV.
@@ -64,7 +81,8 @@ def run_session(
         model_dir = models.model_dir_for_role(role)
         slp_path = session.output_dir / f"{role}.predictions.slp"
         inference.run_inference(
-            video_path, model_dir, output_path=slp_path, device=device, tracking=tracking
+            video_path, model_dir, output_path=slp_path, device=device, tracking=tracking,
+            log=log, progress=progress, html_progress=html_progress, on_redraw_closed=on_redraw_closed,
         )
         tracks[role] = load_track(video_path, slp_path)
         fps_by_role[role] = video_fps(video_path)
@@ -135,16 +153,37 @@ def aligned_camera_validity(session: SessionConfig) -> "dict":
     return gait.cam_valid_by_paw_from_aligned(aligned)
 
 
-def run_pipeline(config: PipelineConfig, device: str = "auto", tracking: bool = False) -> List[Path]:
+def run_pipeline(
+    config: PipelineConfig,
+    device: str = "auto",
+    tracking: bool = False,
+    log: Callable[[str], None] = print,
+    progress: Optional[Callable[[str], None]] = None,
+    html_progress: bool = False,
+    on_redraw_closed: Optional[Callable[[], None]] = None,
+) -> List[Path]:
     """Run calibration (loading a saved one if present) and triangulate every session."""
     cgroup = _load_or_calibrate(config.calibration)
     return [
-        run_session(session, config.models, cgroup, device=device, tracking=tracking)
+        run_session(
+            session, config.models, cgroup, device=device, tracking=tracking,
+            log=log, progress=progress, html_progress=html_progress, on_redraw_closed=on_redraw_closed,
+        )
         for session in config.sessions
     ]
 
 
-def run_group(config: PipelineConfig, device: str = "auto", tracking: bool = False) -> Path:
+def run_group(
+    config: PipelineConfig,
+    device: str = "auto",
+    tracking: bool = False,
+    progress_callback: Optional[Callable[[str, int, int], None]] = None,
+    log: Callable[[str], None] = print,
+    progress: Optional[Callable[[str], None]] = None,
+    html_progress: bool = False,
+    on_redraw_closed: Optional[Callable[[], None]] = None,
+    validation_dir: Optional[Path] = None,
+) -> Path:
     """Run the full pipeline for every session in a group and write its gait-metrics workbook.
 
     This is the entry point a job queue (see the module docstring in
@@ -153,16 +192,59 @@ def run_group(config: PipelineConfig, device: str = "auto", tracking: bool = Fal
     and writes one Excel workbook for the group with one tab per distinct
     ``rat_id``.
 
+    Args:
+        progress_callback: If given, called as
+            ``progress_callback(session.name, sessions_done, sessions_total)``
+            immediately after each session finishes (inference,
+            triangulation, and gait metrics -- everything but the final
+            group-wide workbook write, which only happens once at the
+            end). Lets a GUI job queue show per-session progress without
+            this function needing to know anything about how progress is
+            displayed.
+        log: Forwarded to :func:`run_session` for each session -- discrete
+            one-off messages, not the live per-video progress line.
+        progress: Forwarded to :func:`run_session` -- the live tqdm-style
+            progress line from whichever camera role is currently running
+            inference. This is what makes a long-running session's
+            inference stage visible while it's happening, rather than
+            the log going quiet for however long it takes (see
+            :func:`alligaitor.inference.run_inference`). Distinct from
+            ``progress_callback`` above, which only fires once *between*
+            sessions, not during one.
+        html_progress: Forwarded to :func:`run_session` -- whether
+            ``progress`` wants HTML-rendered color (a rich-text GUI
+            widget; see :mod:`alligaitor.ansi_html`) or plain text.
+        on_redraw_closed: Forwarded to :func:`run_session` -- called
+            whenever a redrawn progress line's definitive final state
+            has just been sent to ``progress``, so a caller redrawing in
+            place can start the next update fresh instead of immediately
+            overwriting it (matters when a session's inference prints
+            more than one tqdm bar in sequence -- otherwise one bar's
+            true completion flashes for an instant before the next bar's
+            first redraw overwrites it in the same spot).
+        validation_dir: If given, an annotated validation video (see
+            :func:`alligaitor.validation_video.export_validation_video`) is
+            rendered for every session into
+            ``validation_dir/<session.name>.validation.mp4``. Rendering is
+            best-effort: a failure is logged via ``log`` and skipped rather
+            than failing the whole run -- the workbook and every other
+            session's video are still produced. ``None`` (the default)
+            skips video export entirely.
+
     Returns:
         Path to the written gait-metrics workbook.
     """
-    from alligaitor import gait  # local import: avoids a pipeline<->gait import cycle
+    from alligaitor import gait, validation, validation_video  # local import: avoids a pipeline<->gait import cycle
 
     cgroup = _load_or_calibrate(config.calibration)
 
     trials = []
-    for session in config.sessions:
-        csv_path = run_session(session, config.models, cgroup, device=device, tracking=tracking)
+    total = len(config.sessions)
+    for i, session in enumerate(config.sessions, start=1):
+        csv_path = run_session(
+            session, config.models, cgroup, device=device, tracking=tracking,
+            log=log, progress=progress, html_progress=html_progress, on_redraw_closed=on_redraw_closed,
+        )
         trial = gait.compute_trial_metrics(
             csv_path,
             session_name=session.name,
@@ -174,7 +256,26 @@ def run_group(config: PipelineConfig, device: str = "auto", tracking: bool = Fal
         trial = gait.restrict_to_consecutive_runs(trial, times, positions, config.gait)
 
         gait.save_paw_events_csv(trial, session.output_dir / f"{session.name}.paw_events.csv")
+        validation.save_validation_summary(
+            trial, times, positions, config.gait,
+            session.output_dir / f"{session.name}.validation_summary.json",
+        )
+        if validation_dir is not None:
+            try:
+                validation_video.export_validation_video(
+                    session, csv_path, cgroup, trial, config.gait,
+                    Path(validation_dir) / f"{session.name}.validation.mp4",
+                )
+            except Exception as exc:
+                log(f"[{session.name}] validation video export failed: {exc}")
         trials.append(trial)
 
-    gait.write_group_report(trials, config.output_xlsx)
+        if progress_callback is not None:
+            progress_callback(session.name, i, total)
+
+    predictions_root = config.sessions[0].output_dir.parent if config.sessions else Path(".")
+    manual_flags = validation.load_group_manual_flags(
+        predictions_root, [session.name for session in config.sessions]
+    )
+    gait.write_group_report(trials, config.output_xlsx, manual_flags=manual_flags)
     return config.output_xlsx

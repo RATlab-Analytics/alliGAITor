@@ -37,10 +37,13 @@ from __future__ import annotations
 import warnings
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 
 from alligaitor.config import CAMERA_ROLES, GaitConfig
 from alligaitor.inference import PoseTrack2D
@@ -178,19 +181,75 @@ def bridge_short_gaps(xyz: np.ndarray, max_gap: int) -> np.ndarray:
     return xyz
 
 
+def pose_sampling_fps(times: np.ndarray) -> float:
+    """Frames per second of a ``pose_3d`` time column.
+
+    ``pose_3d`` is sampled uniformly at the slowest camera's frame rate
+    (see :func:`alligaitor.pipeline.run_session`), so the median step
+    between consecutive times recovers that rate exactly. Read from the
+    data rather than passed in, so a seconds-valued threshold means the
+    same real duration on any rig -- taken over the median (not the
+    first pair) so a frame missing from the CSV entirely can't skew it.
+    """
+    dt = np.diff(times)
+    dt = dt[np.isfinite(dt) & (dt > 0)]
+    if dt.size == 0:
+        raise ValueError("pose_3d times contain no usable frame interval; cannot determine fps.")
+    return 1.0 / float(np.median(dt))
+
+
+def windowed_body_speed(times: np.ndarray, xyz: np.ndarray, window_s: float) -> np.ndarray:
+    """Per-frame translation speed, in mm/s, measured across a window
+    centered on each frame rather than between adjacent frames.
+
+    Frame-to-frame speed of a single triangulated node is dominated by
+    reconstruction jitter whenever the animal is at rest: measured on
+    real trials, ``mid-back`` swings +/-12mm while the rat stands
+    perfectly still, which at ~12.5fps pose sampling reads as 150-225
+    mm/s -- higher than any threshold that would still fall below a real
+    walking speed, so "has it stopped?" simply cannot be asked one frame
+    at a time. Net displacement between the window's outermost
+    triangulated frames cancels that jitter (the node returns to nearly
+    the same place) while leaving genuine translation untouched.
+
+    ``NaN`` on frames whose window holds fewer than two triangulated
+    frames, or spans no time at all.
+    """
+    n = len(xyz)
+    half = max(1, int(round(window_s * pose_sampling_fps(times) / 2.0)))
+    valid = ~np.isnan(xyz).any(axis=1)
+    speed = np.full(n, np.nan)
+    for i in range(n):
+        lo, hi = max(0, i - half), min(n - 1, i + half)
+        idx = np.flatnonzero(valid[lo : hi + 1])
+        if idx.size < 2:
+            continue
+        a, b = lo + int(idx[0]), lo + int(idx[-1])
+        span = times[b] - times[a]
+        if not span > 0:
+            continue
+        speed[i] = float(np.linalg.norm(xyz[b] - xyz[a]) / span)
+    return speed
+
+
 def active_window(times: np.ndarray, ref_xyz: np.ndarray, config: GaitConfig) -> Tuple[int, int]:
     """First/last frame index of sustained whole-body motion.
 
-    Trims any leading/trailing run of at least ``config.min_still_frames``
-    frames whose whole-body (reference node) frame-to-frame speed stays
-    below ``config.stillness_speed_threshold_mm_s`` -- e.g. a rat that
-    stops moving well before the recording ends, whose paws can then
-    jitter across the (much more sensitive) per-paw stance-speed
-    threshold and look like a run of real steps taken in place. A brief
-    slowdown in the middle of the trial isn't trimmed, only a run
-    bordering either end. Falls back to the full triangulated range if
-    the whole trial reads as "still" by this threshold, rather than
-    collapsing to an empty window.
+    Trims any leading/trailing stretch of at least
+    ``config.min_still_seconds`` whose whole-body (reference node)
+    windowed speed (see :func:`windowed_body_speed`) stays below
+    ``config.stillness_window_speed_mm_s`` -- e.g. a rat that stops
+    moving well before the recording ends, whose paws can then jitter
+    across the (much more sensitive) per-paw stance-speed threshold and
+    look like one long stance, or a run of real steps taken in place. A
+    brief slowdown in the middle of the trial isn't trimmed, only a
+    stretch bordering either end. Falls back to the full triangulated
+    range if the whole trial reads as "still" by this threshold, rather
+    than collapsing to an empty window.
+
+    A frame with no windowed speed at all (too little triangulated data
+    nearby) counts as moving, not as still: "unknown" should never be
+    grounds for throwing frames away.
     """
     bridged = bridge_short_gaps(ref_xyz, config.max_bridge_gap_frames)
     valid = ~np.isnan(bridged).any(axis=1)
@@ -202,25 +261,23 @@ def active_window(times: np.ndarray, ref_xyz: np.ndarray, config: GaitConfig) ->
         )
     first, last = int(valid_idx[0]), int(valid_idx[-1])
 
-    speed = np.full(len(bridged), np.nan)
-    disp = np.linalg.norm(bridged[1:] - bridged[:-1], axis=1)
-    dt = times[1:] - times[:-1]
-    with np.errstate(invalid="ignore", divide="ignore"):
-        speed[1:] = disp / dt
-    moving = speed >= config.stillness_speed_threshold_mm_s
+    speed = windowed_body_speed(times, bridged, config.stillness_window_seconds)
+    with np.errstate(invalid="ignore"):
+        still = speed < config.stillness_window_speed_mm_s  # NaN -> False
+    min_still_frames = max(1, int(round(config.min_still_seconds * pose_sampling_fps(times))))
 
     start = first
     m = first
-    while m < last and not moving[m + 1]:
+    while m < last and still[m]:
         m += 1
-    if m - first >= config.min_still_frames:
+    if m - first >= min_still_frames:
         start = m
 
     end = last
     k = last
-    while k > first and not moving[k]:
+    while k > first and still[k]:
         k -= 1
-    if last - k >= config.min_still_frames:
+    if last - k >= min_still_frames:
         end = k
 
     if start >= end:
@@ -325,6 +382,35 @@ def _raw_stance_candidates(
         runs.append((start, n - 1))
 
     return valid, speed, runs
+
+
+def _drop_window_clipped_stances(events: PawEvents, start: int, end: int) -> PawEvents:
+    """Drop stance phases whose touchdown or liftoff is the active
+    window's boundary rather than a detected event.
+
+    Paw positions are masked to the active window (see
+    :func:`active_window`) before stance detection, so a paw already
+    planted when the window opens -- or still planted when it closes --
+    yields a stance phase with a synthetic endpoint: the mask edge, not
+    a real touchdown or liftoff. The common case is the rat coming to
+    rest, where the paw plants and simply never lifts again (measured on
+    359a-BL: the right hind paw sits within 1mm from f87 through f100,
+    and its "stance" appears to end only because the window does).
+
+    Such a phase is not a completed ground contact. Its duration is
+    whatever the window happened to cut it to, so counting it inflates
+    ground contact time and pads a qualifying run with a step that never
+    happened -- and because it is dropped on the endpoint being
+    synthetic rather than on where the edge fell, this stays correct
+    whether the trim lands a frame early or a frame late.
+    """
+    keep = (events.touchdown_frames > start) & (events.liftoff_frames < end)
+    return PawEvents(
+        touchdown_frames=events.touchdown_frames[keep],
+        liftoff_frames=events.liftoff_frames[keep],
+        touchdown_times=events.touchdown_times[keep],
+        liftoff_times=events.liftoff_times[keep],
+    )
 
 
 def _detect_paw_events(times: np.ndarray, xyz: np.ndarray, config: GaitConfig) -> PawEvents:
@@ -574,10 +660,13 @@ def restrict_to_consecutive_runs(
     :attr:`alligaitor.config.GaitConfig.min_consecutive_steps` and
     :func:`_qualifying_runs`) -- an isolated good detection outside any
     such run doesn't feed the averages, and a paw with no qualifying run
-    at all reports ``NaN``. ``trial.paw_events`` (every detected event,
-    whether or not it ended up counted) is left untouched, so the
-    validation video and raw event log still show everything that was
-    actually detected -- only the summary numbers are restricted.
+    at all reports ``NaN``. ``trial.paw_events`` (every stance phase
+    :func:`compute_trial_metrics` kept, whether or not it ended up
+    counted here) is left untouched, so the validation video and raw
+    event log still show everything that was treated as ground contact
+    -- only the summary numbers are restricted. Phases clipped by the
+    active window's edge are already gone by this point, dropped at
+    detection time (see :func:`_drop_window_clipped_stances`).
 
     Args:
         trial: Already-computed metrics (see :func:`compute_trial_metrics`).
@@ -720,7 +809,15 @@ def compute_trial_metrics(
         xyz[end + 1 :] = np.nan
         bridged[paw] = bridge_short_gaps(xyz, config.max_bridge_gap_frames)
 
-    events = {paw: _detect_paw_events(times, bridged[paw], config) for paw in PAW_NODES}
+    # A stance touching either edge of the active window was cut by the
+    # masking above rather than by a real liftoff/touchdown, so it isn't
+    # a completed ground contact -- see _drop_window_clipped_stances.
+    events = {
+        paw: _drop_window_clipped_stances(
+            _detect_paw_events(times, bridged[paw], config), start, end
+        )
+        for paw in PAW_NODES
+    }
 
     stride_length_mm, step_length_mm, ground_contact_time_s = {}, {}, {}
     n_contacts, n_strides, n_steps = {}, {}, {}
@@ -753,6 +850,86 @@ def compute_trial_metrics(
         n_steps=n_steps,
         paw_events=events,
     )
+
+
+@dataclass
+class PawWindow:
+    """The single time window a validation-video viewer should highlight
+    for one paw: its longest qualifying run (see :func:`_qualifying_runs`)
+    if it has one, else its longest raw detected run regardless of length
+    -- exactly "the used run, or the longest run if none cross the
+    threshold" a reviewer needs to see. ``usable`` mirrors which case this
+    is, so a caller doesn't have to re-derive it from ``_paw_has_no_usable_run``.
+    """
+
+    start_frame: int
+    end_frame: int
+    start_s: float
+    end_s: float
+    duration_s: float
+    usable: bool
+
+
+def _longest_raw_run(events: PawEvents) -> Optional[Tuple[int, int]]:
+    """Index range (into `events`' arrays) of the longest single detected
+    stance phase, or ``None`` if nothing was ever detected at all. Used as
+    the fallback window for a paw with zero qualifying runs -- there's no
+    "used" run to show, but showing nothing at all would leave a reviewer
+    unable to tell where the pipeline even looked."""
+    n = events.touchdown_frames.size
+    if n == 0:
+        return None
+    durations = events.liftoff_times - events.touchdown_times
+    i = int(np.argmax(durations))
+    return i, i
+
+
+def paw_usability_windows(
+    trial: TrialMetrics,
+    times: np.ndarray,
+    positions: Dict[str, np.ndarray],
+    config: GaitConfig,
+) -> Dict[str, Optional[PawWindow]]:
+    """Per paw, the single window a validation-video viewer should
+    highlight -- the longest qualifying run (see :func:`_qualifying_runs`,
+    the same run-detection :func:`restrict_to_consecutive_runs` uses for
+    its averages) if the paw has one, else its longest raw detected stance
+    phase. ``None`` only when the paw was never detected planted at all in
+    this trial.
+    """
+    _, _, forward, (start, end) = _crossing_time_and_speed(times, positions[REFERENCE_NODE], config)
+
+    windows: Dict[str, Optional[PawWindow]] = {}
+    for paw in PAW_NODES:
+        events = trial.paw_events[paw]
+        xyz = positions[paw].copy()
+        xyz[:start] = np.nan
+        xyz[end + 1 :] = np.nan
+        bridged = bridge_short_gaps(xyz, config.max_bridge_gap_frames)
+        runs = _qualifying_runs(
+            events, bridged, forward, config.min_consecutive_steps, config.stride_length_outlier_ratio
+        )
+
+        if runs:
+            s, e = max(runs, key=lambda r: events.liftoff_times[r[1]] - events.touchdown_times[r[0]])
+            usable = True
+        else:
+            fallback = _longest_raw_run(events)
+            if fallback is None:
+                windows[paw] = None
+                continue
+            s, e = fallback
+            usable = False
+
+        windows[paw] = PawWindow(
+            start_frame=int(events.touchdown_frames[s]),
+            end_frame=int(events.liftoff_frames[e]),
+            start_s=float(events.touchdown_times[s]),
+            end_s=float(events.liftoff_times[e]),
+            duration_s=float(events.liftoff_times[e] - events.touchdown_times[s]),
+            usable=usable,
+        )
+    return windows
 
 
 def planted_mask(trial: TrialMetrics, n_frames: int) -> Dict[str, np.ndarray]:
@@ -800,20 +977,148 @@ def save_paw_events_csv(trial: TrialMetrics, csv_path: PathLike) -> None:
     df.to_csv(csv_path, index=False)
 
 
-def _trial_row(trial: TrialMetrics) -> dict:
-    row = {
-        "session": trial.session_name,
-        "crossing_time_s": trial.crossing_time_s,
-        "average_speed_mm_s": trial.average_speed_mm_s,
-    }
+_PAW_LABELS: Dict[str, str] = {
+    "left-forepaw": "Left forepaw",
+    "right-forepaw": "Right forepaw",
+    "left-hind-paw": "Left hind paw",
+    "right-hind-paw": "Right hind paw",
+}
+
+# (attribute name on TrialMetrics, column header, per-session number format).
+# Counts are true integers per session (a real, possibly-zero tally --
+# see _paw_has_no_usable_run's docstring for why that's different from
+# NaN), so "0" is the right per-session format; the averages table
+# overrides every column to "0.00" instead (see _write_paw_block), since
+# an average of integer counts across crossings is itself a fraction, not
+# a count.
+_STAT_COLUMNS: Tuple[Tuple[str, str, str], ...] = (
+    ("stride_length_mm", "Stride Length (mm)", "0.00"),
+    ("step_length_mm", "Step Length (mm)", "0.00"),
+    ("ground_contact_time_s", "Ground Contact Time (s)", "0.00"),
+    ("n_contacts", "Contacts (n)", "0"),
+    ("n_strides", "Strides (n)", "0"),
+    ("n_steps", "Steps (n)", "0"),
+)
+_NOTES_LABEL = "Notes"
+_N_STAT_COLUMNS = 1 + len(_STAT_COLUMNS)  # "Paw" + the stat columns
+_NOTES_COLUMN = _N_STAT_COLUMNS + 1
+_N_COLUMNS = _NOTES_COLUMN  # "Paw" + the stat columns + Notes
+
+_TITLE_FONT = Font(bold=True, color="FFFFFF", size=12)
+_TITLE_FILL = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+_LABEL_FONT = Font(bold=True)
+_HEADER_FONT = Font(bold=True)
+_HEADER_FILL = PatternFill(start_color="DCE6F1", end_color="DCE6F1", fill_type="solid")
+_BAD_FILL = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+_BAD_FONT = Font(color="9C0006")
+_CLEAR_FILL = PatternFill(fill_type=None)
+_CLEAR_FONT = Font()
+
+
+def _paw_has_no_usable_run(trial: TrialMetrics, paw: str) -> bool:
+    """True if `paw` never formed a run clean/long enough to trust for
+    stride length, step length, or ground-contact time on this crossing
+    (all three NaN -- see GaitConfig.min_consecutive_steps). n_contacts
+    et al. can still be a real, nonzero count even when this is True: a
+    handful of raw detections that never added up to a qualifying run is
+    exactly the case this flags, not "zero contacts detected"."""
+    return (
+        np.isnan(trial.stride_length_mm[paw])
+        and np.isnan(trial.step_length_mm[paw])
+        and np.isnan(trial.ground_contact_time_s[paw])
+    )
+
+
+def _nanmean(values) -> float:
+    with warnings.catch_warnings():
+        # An all-NaN slice (a paw with zero qualifying detections across
+        # every crossing) warns by default -- NaN is exactly the right
+        # answer there, not a bug worth surfacing.
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        return float(np.nanmean(values))
+
+
+def _write_cell(ws, row: int, col: int, value, number_format: str, bad: bool):
+    display_value = None if value is None or (isinstance(value, float) and np.isnan(value)) else value
+    cell = ws.cell(row=row, column=col, value=display_value)
+    cell.number_format = number_format
+    if bad:
+        cell.fill = _BAD_FILL
+        cell.font = _BAD_FONT
+    return cell
+
+
+def _write_paw_block(
+    ws,
+    start_row: int,
+    title: str,
+    crossing_time_s: float,
+    average_speed_cm_s: float,
+    get_value: Callable[[str, str], float],
+    is_bad: Callable[[str], bool],
+    stat_columns: Tuple[Tuple[str, str, str], ...] = _STAT_COLUMNS,
+    note_getter: Callable[[str], str] = lambda paw: "",
+) -> int:
+    """Writes one titled block -- crossing time/speed, then a paw x stat
+    table -- starting at `start_row`, and returns the row the next block
+    should start at. `get_value(stat, paw)` and `is_bad(paw)` abstract
+    over "one trial's own numbers" vs. "this rat's per-paw averages" (see
+    write_group_report), so this one function lays out both. `note_getter(paw)`
+    fills the trailing Notes column -- empty by default, used to record why
+    a paw was manually flagged invalid (see :func:`annotate_manual_flag`).
+    """
+    row = start_row
+    title_cell = ws.cell(row=row, column=1, value=title)
+    title_cell.font = _TITLE_FONT
+    title_cell.fill = _TITLE_FILL
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=_N_COLUMNS)
+    for col in range(1, _N_COLUMNS + 1):
+        ws.cell(row=row, column=col).fill = _TITLE_FILL
+    row += 1
+
+    ws.cell(row=row, column=1, value="Crossing Time (s)").font = _LABEL_FONT
+    _write_cell(ws, row, 2, crossing_time_s, "0.00", bad=False)
+    ws.cell(row=row, column=3, value="Average Speed (cm/s)").font = _LABEL_FONT
+    _write_cell(ws, row, 4, average_speed_cm_s, "0.00", bad=False)
+    row += 2  # blank spacer before the paw table
+
+    ws.cell(row=row, column=1, value="Paw").font = _HEADER_FONT
+    ws.cell(row=row, column=1).fill = _HEADER_FILL
+    for col, (_, label, _fmt) in enumerate(stat_columns, start=2):
+        cell = ws.cell(row=row, column=col, value=label)
+        cell.font = _HEADER_FONT
+        cell.fill = _HEADER_FILL
+    notes_header = ws.cell(row=row, column=_NOTES_COLUMN, value=_NOTES_LABEL)
+    notes_header.font = _HEADER_FONT
+    notes_header.fill = _HEADER_FILL
+    row += 1
+
     for paw in PAW_NODES:
-        row[f"{paw}_stride_length_mm"] = trial.stride_length_mm[paw]
-        row[f"{paw}_step_length_mm"] = trial.step_length_mm[paw]
-        row[f"{paw}_ground_contact_time_s"] = trial.ground_contact_time_s[paw]
-        row[f"{paw}_n_contacts"] = trial.n_contacts[paw]
-        row[f"{paw}_n_strides"] = trial.n_strides[paw]
-        row[f"{paw}_n_steps"] = trial.n_steps[paw]
-    return row
+        bad = is_bad(paw)
+        name_cell = ws.cell(row=row, column=1, value=_PAW_LABELS[paw])
+        if bad:
+            name_cell.fill = _BAD_FILL
+            name_cell.font = _BAD_FONT
+        for col, (stat, _label, fmt) in enumerate(stat_columns, start=2):
+            _write_cell(ws, row, col, get_value(stat, paw), fmt, bad=bad)
+        note_cell = ws.cell(row=row, column=_NOTES_COLUMN, value=note_getter(paw) or None)
+        if bad:
+            note_cell.fill = _BAD_FILL
+            note_cell.font = _BAD_FONT
+        row += 1
+
+    return row + 2  # blank spacer before the next block
+
+
+def _format_sheet(ws):
+    ws.column_dimensions["A"].width = 22
+    for col in range(2, _N_COLUMNS + 1):
+        ws.column_dimensions[get_column_letter(col)].width = 20
+    ws.column_dimensions[get_column_letter(_NOTES_COLUMN)].width = 40
+    for row in ws.iter_rows():
+        for cell in row:
+            if cell.value is not None:
+                cell.alignment = Alignment(horizontal="left" if cell.column == 1 else "right")
 
 
 def _safe_sheet_name(name: str, used: set) -> str:
@@ -830,25 +1135,159 @@ def _safe_sheet_name(name: str, used: set) -> str:
     return candidate
 
 
-def write_group_report(trials: List[TrialMetrics], output_path: PathLike) -> None:
+def write_group_report(
+    trials: List[TrialMetrics],
+    output_path: PathLike,
+    manual_flags: Optional[Dict[str, Tuple[set, str]]] = None,
+) -> None:
     """Write one group's gait-metrics workbook: one tab per distinct ``rat_id``.
 
-    Each tab holds one row per trial (session) for that rat, covering the
-    core parameters -- crossing time, average speed, and per-paw stride
-    length, step length, and ground contact time -- plus each metric's
-    underlying event count for a quick sanity check on detection quality.
+    Each tab stacks one titled block per trial (session) for that rat --
+    crossing time and average speed, then a paw x stat table (rows are
+    the four paws, columns are stride length/step length/ground contact
+    time/event counts, all in natural-language, unit-bearing headers) --
+    followed, when a rat has more than one crossing in this group, by a
+    final "Average" block in the same shape. A paw with no run in a
+    given crossing clean/long enough to trust for its length/timing
+    columns (see :func:`_paw_has_no_usable_run`) has its whole row
+    highlighted; the Average block's per-(paw, stat) means are NaN-aware,
+    so a paw's bad crossings don't count against its average from the
+    crossings where it did produce something usable.
+
+    Args:
+        manual_flags: Session name -> (flagged paw names, note), carried
+            forward from :func:`alligaitor.validation.load_manual_flags` so
+            a regenerated workbook keeps highlighting a paw a reviewer
+            already flagged invalid by hand, exactly as
+            :func:`annotate_manual_flag` would highlight it on an
+            already-written workbook. A paw already bad from
+            :func:`_paw_has_no_usable_run` stays bad regardless of what's
+            here -- this only ever adds highlighting, never removes it.
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    manual_flags = manual_flags or {}
 
     by_rat: Dict[str, List[TrialMetrics]] = {}
     for trial in trials:
         by_rat.setdefault(trial.rat_id, []).append(trial)
 
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+    wb = Workbook()
+    wb.remove(wb.active)  # replaced by a real sheet per rat below (or the placeholder, if there are none)
+
+    if not by_rat:
+        ws = wb.create_sheet("Sheet1")
+        ws.cell(row=1, column=1, value="No sessions in this group.")
+    else:
         used_names: set = set()
-        if not by_rat:
-            pd.DataFrame(columns=["session"]).to_excel(writer, sheet_name="Sheet1", index=False)
         for rat_id, rat_trials in by_rat.items():
-            df = pd.DataFrame([_trial_row(trial) for trial in rat_trials])
-            df.to_excel(writer, sheet_name=_safe_sheet_name(rat_id, used_names), index=False)
+            ws = wb.create_sheet(_safe_sheet_name(rat_id, used_names))
+            row = 1
+            for trial in rat_trials:
+                flagged_paws, note = manual_flags.get(trial.session_name, (set(), ""))
+                row = _write_paw_block(
+                    ws, row,
+                    title=f"Session: {trial.session_name}",
+                    crossing_time_s=trial.crossing_time_s,
+                    average_speed_cm_s=trial.average_speed_mm_s / 10.0,
+                    get_value=lambda stat, paw, t=trial: getattr(t, stat)[paw],
+                    is_bad=lambda paw, t=trial, fp=flagged_paws: _paw_has_no_usable_run(t, paw) or paw in fp,
+                    note_getter=lambda paw, fp=flagged_paws, n=note: n if paw in fp else "",
+                )
+
+            if len(rat_trials) > 1:
+                avg_stat_columns = tuple((stat, label, "0.00") for stat, label, _fmt in _STAT_COLUMNS)
+                row = _write_paw_block(
+                    ws, row,
+                    title="Average",
+                    crossing_time_s=_nanmean([t.crossing_time_s for t in rat_trials]),
+                    average_speed_cm_s=_nanmean([t.average_speed_mm_s for t in rat_trials]) / 10.0,
+                    get_value=lambda stat, paw: _nanmean([getattr(t, stat)[paw] for t in rat_trials]),
+                    is_bad=lambda paw: all(
+                        _paw_has_no_usable_run(t, paw) or paw in manual_flags.get(t.session_name, (set(), ""))[0]
+                        for t in rat_trials
+                    ),
+                    stat_columns=avg_stat_columns,
+                )
+
+            _format_sheet(ws)
+
+    wb.save(output_path)
+
+
+def _find_session_paw_row(ws, session_name: str, paw: str) -> Optional[int]:
+    """Row index of `paw`'s row within the ``"Session: {session_name}"``
+    block on `ws`, or ``None`` if that block or paw row isn't present --
+    e.g. the workbook predates this session, or was regenerated with
+    different sessions. Searches a bounded window below the title row
+    rather than assuming :func:`_write_paw_block`'s exact row offsets, so
+    it keeps working even if that layout changes shape slightly.
+    """
+    title = f"Session: {session_name}"
+    for row in ws.iter_rows(min_col=1, max_col=1):
+        cell = row[0]
+        if cell.value != title:
+            continue
+        for r in range(cell.row + 1, cell.row + 16):
+            if ws.cell(row=r, column=1).value == _PAW_LABELS[paw]:
+                return r
+        return None
+    return None
+
+
+def annotate_manual_flag(
+    xlsx_path: PathLike,
+    rat_id: str,
+    session_name: str,
+    paw: str,
+    auto_usable: bool,
+    flagged: bool,
+    note: str = "",
+) -> bool:
+    """Patch one paw's row in an already-written group workbook to reflect
+    a reviewer's manual flag, without regenerating the whole report from
+    :class:`TrialMetrics`.
+
+    The row is highlighted (and `note` written to its Notes cell) when
+    ``flagged`` or ``not auto_usable`` -- unflagging a paw the automatic
+    detection already called unusable (``auto_usable=False``) leaves it
+    highlighted, since that's a real "no usable run" finding this manual
+    action didn't create and shouldn't be able to erase. Only values/number
+    formats are left untouched; this only ever changes fill/font/notes.
+
+    Returns:
+        ``True`` if the target row was found and patched, ``False`` if the
+        workbook has no matching rat sheet / session block / paw row (the
+        caller should warn rather than assume the flag took effect).
+    """
+    from openpyxl import load_workbook
+
+    xlsx_path = Path(xlsx_path)
+    if not xlsx_path.exists():
+        return False
+
+    wb = load_workbook(xlsx_path)
+    candidate = _safe_sheet_name(rat_id, set())
+    ws = wb[candidate] if candidate in wb.sheetnames else next(
+        (wb[name] for name in wb.sheetnames if name.startswith(candidate[: max(1, len(candidate) - 2)])), None
+    )
+    if ws is None:
+        return False
+
+    row = _find_session_paw_row(ws, session_name, paw)
+    if row is None:
+        return False
+
+    bad = flagged or not auto_usable
+    fill = _BAD_FILL if bad else _CLEAR_FILL
+    font = _BAD_FONT if bad else _CLEAR_FONT
+    for col in range(1, _N_STAT_COLUMNS + 1):
+        cell = ws.cell(row=row, column=col)
+        cell.fill = fill
+        cell.font = font
+    notes_cell = ws.cell(row=row, column=_NOTES_COLUMN, value=(note if flagged else None))
+    notes_cell.fill = fill
+    notes_cell.font = font
+
+    wb.save(xlsx_path)
+    return True

@@ -13,9 +13,6 @@ height/x/y are parameters, nothing hardcoded to NOR's own 294x292 crop
 size), so alliGAITor's 1280x170 tunnel-strip crop is just a different
 config value, not a code change. See config.py's CROP_TARGET_WIDTH/HEIGHT.
 
-RATlab-NOR is MIT-licensed (Copyright (c) 2026 Mitchell Carson); see
-../THIRD_PARTY_NOTICES.md for the full license text.
-
 No GUI/Qt dependency -- usable from the CLI, tests, or a GUI worker
 process alike. Pipes raw frames to ffmpeg directly rather than
 cv2.VideoWriter, since cv2.VideoWriter's built-in encoders were confirmed

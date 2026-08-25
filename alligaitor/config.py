@@ -11,6 +11,8 @@ cameras have not been physically moved.
 
 from __future__ import annotations
 
+import dataclasses
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Union
@@ -26,6 +28,17 @@ def _resolve(base_dir: Path, path: PathLike) -> Path:
     """Resolve ``path`` relative to ``base_dir`` unless it is already absolute."""
     p = Path(path)
     return p if p.is_absolute() else (base_dir / p).resolve()
+
+
+def _relativize(base_dir: Path, path: PathLike) -> str:
+    """Inverse of :func:`_resolve`: render ``path`` relative to ``base_dir``
+    for writing back out to YAML, falling back to an absolute path string
+    if it isn't actually under ``base_dir``."""
+    p = Path(path)
+    try:
+        return str(p.relative_to(base_dir))
+    except ValueError:
+        return str(p)
 
 
 def _require_roles(videos: Dict[str, Path], context: str) -> None:
@@ -200,26 +213,47 @@ class GaitConfig:
             qualifying run at all reports ``NaN`` rather than an average
             built from too little (or too suspect) data. See
             :func:`alligaitor.gait.restrict_to_consecutive_runs`.
-        stillness_speed_threshold_mm_s: Below this frame-to-frame speed,
-            in mm/s, the whole-body reference node (see
-            ``alligaitor.gait.REFERENCE_NODE``) counts as not translating.
-            Used to trim any leading/trailing stretch where the rat has
-            stopped moving -- once the body itself is stationary, a
-            paw's own position can still jitter across
+        stillness_window_seconds: Width, in seconds, of the window the
+            whole-body speed below is measured across (see
+            :func:`alligaitor.gait.windowed_body_speed`). Frame-to-frame
+            speed of a single node is useless for this: measured on real
+            trials, ``mid-back`` swings +/-12mm from reconstruction
+            jitter alone while the rat stands still, which at ~12.5fps
+            pose sampling reads as 150-225 mm/s -- above any threshold
+            that would still sit below a real walking speed. Net
+            displacement across a window cancels that jitter (the node
+            comes back to nearly the same place) while leaving genuine
+            translation untouched. Defaults to ``0.4``: trimmed the same
+            frames at ``0.32`` across every measured trial, so it isn't
+            balanced on a knife's edge, while ``0.48`` started eating
+            genuine slow walking on the slowest trial.
+        stillness_window_speed_mm_s: Below this whole-body speed, in
+            mm/s, measured across ``stillness_window_seconds`` (not
+            between adjacent frames), the reference node (see
+            ``alligaitor.gait.REFERENCE_NODE``) counts as not
+            translating. Used to trim any leading/trailing stretch where
+            the rat has stopped moving -- once the body itself is
+            stationary, a paw's own position can still jitter across
             ``speed_threshold_mm_s`` from tracking noise alone, which
             would otherwise look like a run of real steps in place. This
-            is a much lower bar than ``speed_threshold_mm_s``: it's
-            asking whether the *animal* is translating at all, not
-            whether one paw is currently planted mid-stride. Starting
-            default, not derived from measured data the way
-            ``min_contact_frames`` was -- tune against real trials with
+            asks whether the *animal* is translating at all, not whether
+            one paw is currently planted mid-stride, so it is not
+            comparable to ``speed_threshold_mm_s`` -- the two measure
+            different things over different spans. Defaults to ``100``,
+            which separated stopped stretches (windowed speed under
+            ~80) from walking (240+) on every measured trial, including
+            the slowest. Tune against real trials with
             ``scripts/debug_gait.py``.
-        min_still_frames: How many consecutive frames of sub-threshold
-            body speed, bordering either end of the trial, counts as
+        min_still_seconds: How long a stretch of sub-threshold body
+            speed, bordering either end of the trial, counts as
             "stopped" rather than an ordinary brief slowdown mid-stride.
-            Only a run touching the very start or very end of the trial
-            is ever trimmed -- a pause in the middle is left alone. See
-            :func:`alligaitor.gait.restrict_to_consecutive_runs`.
+            Only a stretch touching the very start or very end of the
+            trial is ever trimmed -- a pause in the middle is left
+            alone. In seconds rather than frames because ``pose_3d`` is
+            sampled at the slowest camera's frame rate (see
+            :func:`alligaitor.pipeline.run_session`), so a frame count
+            means a different real duration on every rig. See
+            :func:`alligaitor.gait.active_window`.
         stride_length_outlier_ratio: A stride longer than this many times
             a paw's own median stride length in the trial is flagged as
             likely hiding a missed step -- e.g. a real stance the speed
@@ -235,9 +269,86 @@ class GaitConfig:
     min_contact_frames: int = 1
     max_bridge_gap_frames: int = 4
     min_consecutive_steps: int = 5
-    stillness_speed_threshold_mm_s: float = 20.0
-    min_still_frames: int = 15
+    stillness_window_seconds: float = 0.4
+    stillness_window_speed_mm_s: float = 100.0
+    min_still_seconds: float = 0.4
     stride_length_outlier_ratio: float = 1.8
+
+    @classmethod
+    def from_raw(cls, raw: Optional[Dict[str, object]]) -> "GaitConfig":
+        """Build from a config file's (or ``settings.json``'s) ``gait``
+        mapping, dropping keys that are no longer fields instead of
+        raising.
+
+        Keeps a ``config.yaml`` or ``app_data/settings.json`` written
+        before a tunable was renamed loadable -- a stale key would
+        otherwise be a ``TypeError`` on every load. Anything dropped
+        falls back to that field's current default, warned about rather
+        than done silently.
+
+        Both stillness tunables were renamed when
+        :func:`alligaitor.gait.active_window` moved to a windowed speed:
+        ``min_still_frames`` -> ``min_still_seconds`` (a frame count
+        means a different duration on every rig), and
+        ``stillness_speed_threshold_mm_s`` ->
+        ``stillness_window_speed_mm_s``. The second is a rename on
+        purpose even though the units didn't change: it compares against
+        a speed measured across ``stillness_window_seconds`` rather than
+        between adjacent frames, so an old file's value is off by more
+        than an order of magnitude and silently honoring it would leave
+        the check doing nothing.
+        """
+        values = dict(raw or {})
+        known = {f.name for f in dataclasses.fields(cls)}
+        unknown = sorted(set(values) - known)
+        if unknown:
+            warnings.warn(
+                f"Ignoring unrecognized gait setting(s) {unknown}; using current defaults "
+                "instead. Re-save this job's config (or Settings > Preferences) to clear this.",
+                stacklevel=2,
+            )
+        return cls(**{k: v for k, v in values.items() if k in known})
+
+
+@dataclass
+class DiscoveryConfig:
+    """Rules for auto-discovering a group's sessions from a folder of
+    videos -- used by the GUI's config editor (see
+    :mod:`alligaitor.discovery`) to (re)build :attr:`PipelineConfig.sessions`
+    from ``input_dir`` rather than requiring them to be hand-written.
+
+    Not consumed by the plain CLI pipeline itself: ``sessions`` is always
+    written out fully resolved (see :meth:`PipelineConfig.to_yaml`), so a
+    GUI-authored config file stays a complete, valid :class:`PipelineConfig`
+    that ``python -m alligaitor.cli run`` can run standalone, with or
+    without this block.
+
+    Attributes:
+        input_dir: Folder of source (pre-crop) videos to discover
+            sessions from.
+        id_regex: Applied to each video's filename; group 1 is the
+            session name (e.g. ``"359a-BL"`` from
+            ``"359a-BL_cam0_coded.mp4"``). Videos sharing a session name,
+            one per camera role, form one session.
+        camera_regex: Applied to each video's filename; group 1 is a
+            camera token (e.g. ``"cam0"``), mapped to a role via
+            :attr:`camera_role_map`.
+        camera_role_map: Camera token -> role (``"left"``/``"right"``/
+            ``"bottom"``). One mapping applies to every video in the
+            group -- a rig's physical camera assignment doesn't change
+            mid-group, unlike across groups (see the port-order caveat
+            on :class:`SessionConfig`).
+        rat_id_overrides: Session name -> rat_id, for sessions where the
+            same rat crosses more than once within this group (see
+            :attr:`SessionConfig.rat_id`). Empty unless the group
+            actually has repeat crossings.
+    """
+
+    input_dir: Path
+    id_regex: str
+    camera_regex: str
+    camera_role_map: Dict[str, str] = field(default_factory=dict)
+    rat_id_overrides: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -255,6 +366,10 @@ class PipelineConfig:
             Defaults to ``<config dir>/reports/<name>.gait_metrics.xlsx``.
         gait: Stance/swing detection thresholds shared by every session
             in this group.
+        discovery: How the GUI's config editor auto-discovered
+            ``sessions`` from a folder of videos, if it did. Round-tripped
+            for editing but not read by :func:`run_pipeline`/`run_group` --
+            ``sessions`` is always the source of truth for a run.
     """
 
     models: ModelConfig
@@ -263,6 +378,7 @@ class PipelineConfig:
     name: str = "group"
     output_xlsx: Optional[Path] = None
     gait: GaitConfig = field(default_factory=GaitConfig)
+    discovery: Optional[DiscoveryConfig] = None
 
     @classmethod
     def from_yaml(cls, path: PathLike) -> "PipelineConfig":
@@ -308,7 +424,18 @@ class PipelineConfig:
             if output_xlsx_raw
             else base_dir / "reports" / f"{name}.gait_metrics.xlsx"
         )
-        gait = GaitConfig(**raw.get("gait", {}))
+        gait = GaitConfig.from_raw(raw.get("gait"))
+
+        discovery_raw = raw.get("discovery")
+        discovery = None
+        if discovery_raw:
+            discovery = DiscoveryConfig(
+                input_dir=_resolve(base_dir, discovery_raw["input_dir"]),
+                id_regex=discovery_raw["id_regex"],
+                camera_regex=discovery_raw["camera_regex"],
+                camera_role_map=dict(discovery_raw.get("camera_role_map", {})),
+                rat_id_overrides=dict(discovery_raw.get("rat_id_overrides", {})),
+            )
 
         return cls(
             models=models,
@@ -317,4 +444,73 @@ class PipelineConfig:
             name=name,
             output_xlsx=output_xlsx,
             gait=gait,
+            discovery=discovery,
         )
+
+    def to_yaml(self, path: PathLike) -> None:
+        """Write this config back out to YAML, in the same schema
+        :meth:`from_yaml` reads. Paths are written relative to ``path``'s
+        parent directory where possible (matching :meth:`from_yaml`'s
+        resolution convention), falling back to absolute if a path isn't
+        actually under it.
+
+        Used by the GUI's config editor to persist a group's
+        ``config.yaml`` after auto-discovery -- the written file always
+        has ``sessions`` fully resolved, so it stays a complete, valid
+        config independent of the GUI (``discovery``, if present, is
+        extra metadata for re-opening the editor, not something a plain
+        ``alligaitor.cli run`` needs).
+        """
+        path = Path(path)
+        base_dir = path.parent
+
+        raw: dict = {
+            "name": self.name,
+            "models": {
+                "side_model_dir": _relativize(base_dir, self.models.side_model_dir),
+                "bottom_model_dir": _relativize(base_dir, self.models.bottom_model_dir),
+            },
+            "calibration": {
+                "videos": {
+                    role: _relativize(base_dir, p) for role, p in self.calibration.videos.items()
+                },
+                "output_path": _relativize(base_dir, self.calibration.output_path),
+                "board_preset": self.calibration.board_preset,
+                "min_corners_extrinsic": self.calibration.min_corners_extrinsic,
+            },
+            "sessions": [
+                {
+                    "name": session.name,
+                    "rat_id": session.rat_id,
+                    "output_dir": _relativize(base_dir, session.output_dir),
+                    "videos": {
+                        role: _relativize(base_dir, p) for role, p in session.videos.items()
+                    },
+                }
+                for session in self.sessions
+            ],
+            "gait": {
+                "speed_threshold_mm_s": self.gait.speed_threshold_mm_s,
+                "min_contact_frames": self.gait.min_contact_frames,
+                "max_bridge_gap_frames": self.gait.max_bridge_gap_frames,
+                "min_consecutive_steps": self.gait.min_consecutive_steps,
+                "stillness_window_seconds": self.gait.stillness_window_seconds,
+                "stillness_window_speed_mm_s": self.gait.stillness_window_speed_mm_s,
+                "min_still_seconds": self.gait.min_still_seconds,
+                "stride_length_outlier_ratio": self.gait.stride_length_outlier_ratio,
+            },
+        }
+        if self.output_xlsx is not None:
+            raw["output_xlsx"] = _relativize(base_dir, self.output_xlsx)
+        if self.discovery is not None:
+            raw["discovery"] = {
+                "input_dir": _relativize(base_dir, self.discovery.input_dir),
+                "id_regex": self.discovery.id_regex,
+                "camera_regex": self.discovery.camera_regex,
+                "camera_role_map": dict(self.discovery.camera_role_map),
+                "rat_id_overrides": dict(self.discovery.rat_id_overrides),
+            }
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
+            yaml.safe_dump(raw, f, sort_keys=False, default_flow_style=False)

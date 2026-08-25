@@ -8,17 +8,17 @@ array keyed by skeleton node name.
 from __future__ import annotations
 
 import re
-import subprocess
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import numpy as np
 import sleap_io as sio
 import yaml
 
 from alligaitor import preprocessing
+from alligaitor.subprocess_streaming import stream_subprocess
 
 DEFAULT_DEVICE = "auto"
 
@@ -137,6 +137,10 @@ def run_inference(
     tracking: bool = False,
     force_grayscale: Optional[bool] = None,
     peak_threshold: Optional[float] = None,
+    log: Callable[[str], None] = print,
+    progress: Optional[Callable[[str], None]] = None,
+    html_progress: bool = False,
+    on_redraw_closed: Optional[Callable[[], None]] = None,
 ) -> Path:
     """Run ``sleap-nn predict`` on a single video and return the output path.
 
@@ -169,6 +173,26 @@ def run_inference(
             own default (``0.2``) when left as ``None``. Lower this to
             compare against SLEAP's GUI inference, which may use a
             different default.
+        log: Receives discrete one-off messages (the command being run;
+            the full subprocess output if it fails -- see
+            :mod:`alligaitor.subprocess_streaming`).
+        progress: Receives ``sleap-nn predict``'s own live tqdm progress
+            output as it runs -- repeated calls for what's conceptually
+            the same redrawing line, as opposed to ``log``'s discrete
+            messages, so a caller that wants to show that in place (the
+            GUI does) can tell the two apart. Defaults to ``log`` if not
+            given.
+        html_progress: If True, ``progress`` receives an HTML rendering
+            of ``sleap-nn predict``'s own colored progress bar instead
+            of plain text -- for a caller wired up to a rich-text widget
+            (the GUI is; see :mod:`alligaitor.ansi_html`). Leave False
+            for a plain-text/print()-based ``progress``.
+        on_redraw_closed: Forwarded to
+            :func:`alligaitor.subprocess_streaming.stream_subprocess` --
+            called whenever a redrawn progress line's definitive final
+            state has just been sent to ``progress``, so a caller
+            redrawing in place can start the next update fresh instead
+            of immediately overwriting it.
 
     Returns:
         Path to the written ``.slp`` predictions file.
@@ -179,6 +203,20 @@ def run_inference(
         output_path = video_path.with_suffix(video_path.suffix + ".predictions.slp")
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if output_path.exists():
+        # A prior run already wrote these predictions -- reuse them rather
+        # than re-running the (expensive, GPU-bound) sleap-nn subprocess
+        # for no reason. This is what makes reset.py's "--output-only"
+        # tier (clear 3D output + report, keep predictions) actually save
+        # time on a re-run instead of just documenting an intent that
+        # never took effect: a job re-run after only a gait-setting
+        # change now skips straight to triangulation for every session
+        # whose .slp files are still on disk. Delete the .slp (reset.py's
+        # default/--all tiers do) to force fresh inference, e.g. after
+        # switching models.
+        log(f"  Reusing existing predictions: {output_path}")
+        return output_path
 
     if force_grayscale is None:
         force_grayscale = not model_trained_on_color(model_dir)
@@ -205,7 +243,16 @@ def run_inference(
     if tracking:
         cmd.append("--tracking")
 
-    subprocess.run(cmd, check=True)
+    log(f"  $ {' '.join(cmd)}")
+    returncode, streamer = stream_subprocess(
+        cmd, log, progress, html_progress=html_progress, on_redraw_closed=on_redraw_closed
+    )
+    if returncode != 0:
+        streamer.dump_plain_lines("run failed")
+        raise RuntimeError(
+            f"sleap-nn predict exited with code {returncode} for {video_path}. "
+            f"See its output above for details."
+        )
     return output_path
 
 
