@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, Optional, Set, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 
@@ -35,19 +35,57 @@ PathLike = Union[str, Path]
 # ---------------------------------------------------------------------------
 
 def save_validation_summary(
-    trial: TrialMetrics,
+    trial: Union[TrialMetrics, List[TrialMetrics]],
     times: np.ndarray,
     positions: Dict[str, np.ndarray],
     config: GaitConfig,
     path: PathLike,
 ) -> None:
-    """Compute and write `trial`'s per-paw usability windows (see
-    :func:`alligaitor.gait.paw_usability_windows`) to `path`."""
-    windows = paw_usability_windows(trial, times, positions, config)
+    """Compute and write per-paw usability windows (see
+    :func:`alligaitor.gait.paw_usability_windows`) to `path`.
+
+    Accepts either one trial or the per-crossing list from
+    :func:`alligaitor.gait.compute_crossing_metrics`. Each crossing gets
+    its own entry under ``crossings``, since a paw can produce a clean
+    run on the way out and nothing usable on the way back.
+
+    ``paws`` stays at the top level, rolled up across crossings: a paw
+    appears usable there if *any* crossing produced a usable run for it,
+    carrying that crossing's window (the longest one, where several
+    qualify). That keeps every existing reader of this file working
+    unchanged and answers the question the validation UI actually asks
+    -- "is there a good run for this paw in this recording?" -- while
+    ``crossings`` holds the detail for a caller that needs per-crossing
+    resolution.
+    """
+    trials = [trial] if isinstance(trial, TrialMetrics) else list(trial)
+    if not trials:
+        raise ValueError("save_validation_summary needs at least one trial")
+
+    per_crossing = []
+    for t in trials:
+        windows = paw_usability_windows(t, times, positions, config)
+        per_crossing.append({
+            "crossing": t.crossing_index + 1,
+            "crossing_count": t.crossing_count,
+            "window": list(t.crossing_window) if t.crossing_window else None,
+            "paws": {paw: (asdict(w) if w is not None else None) for paw, w in windows.items()},
+        })
+
+    def _rolled_up(paw: str):
+        candidates = [c["paws"].get(paw) for c in per_crossing]
+        candidates = [w for w in candidates if w is not None]
+        if not candidates:
+            return None
+        usable = [w for w in candidates if w.get("usable")]
+        pool = usable or candidates
+        return max(pool, key=lambda w: w.get("duration_s", 0.0))
+
     raw = {
-        "session_name": trial.session_name,
-        "rat_id": trial.rat_id,
-        "paws": {paw: (asdict(w) if w is not None else None) for paw, w in windows.items()},
+        "session_name": trials[0].session_name,
+        "rat_id": trials[0].rat_id,
+        "crossings": per_crossing,
+        "paws": {paw: _rolled_up(paw) for paw in PAW_NODES},
     }
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

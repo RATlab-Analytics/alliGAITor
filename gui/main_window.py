@@ -179,9 +179,9 @@ class _PreferencesDialog(QDialog):
             gait["max_bridge_gap_frames"], 0, 1000, "",
             "Untriangulated runs up to this many frames are interpolated before stance is computed. 0 disables bridging.",
         )
-        self.min_consecutive_steps_spin = _int_spin(
-            gait["min_consecutive_steps"], 0, 1000, "",
-            "A paw's reported averages only use steps from a run of at least this many consecutive clean stances.",
+        self.min_consecutive_strides_spin = _int_spin(
+            gait["min_consecutive_strides"], 0, 1000, "",
+            "A paw's reported averages only use strides from a run of at least this many consecutive clean stances.",
         )
         self.stillness_window_spin = _double_spin(
             gait["stillness_window_seconds"], 0.01, 60, 2, " s",
@@ -199,9 +199,14 @@ class _PreferencesDialog(QDialog):
             "How long the rat must stay stationary at the very start/end of a trial to trim it as \"stopped\".",
             step=0.05,
         )
+        self.min_valid_steps_spin = _int_spin(
+            gait["min_valid_steps"], 0, 1000, "",
+            "Fewest valid steps a paw needs before its average step length is reported; below this "
+            "it is blank and flagged on its own.",
+        )
         self.stride_outlier_spin = _double_spin(
             gait["stride_length_outlier_ratio"], 0.1, 100, 2, "×",
-            "A stride longer than this many times a paw's own median stride length is flagged as a likely missed step.",
+            "A stride longer than this many times a paw's own median stride length is flagged as a likely missed stance.",
         )
         self.min_corners_extrinsic_spin = _int_spin(
             min_corners, 1, 10000, "",
@@ -212,10 +217,11 @@ class _PreferencesDialog(QDialog):
         gait_form.addRow("Speed threshold (planted):", self.speed_threshold_spin)
         gait_form.addRow("Min contact frames:", self.min_contact_frames_spin)
         gait_form.addRow("Max bridge gap:", self.max_bridge_gap_spin)
-        gait_form.addRow("Min consecutive steps:", self.min_consecutive_steps_spin)
+        gait_form.addRow("Min consecutive strides:", self.min_consecutive_strides_spin)
         gait_form.addRow("Stillness window:", self.stillness_window_spin)
         gait_form.addRow("Stillness speed threshold:", self.stillness_threshold_spin)
         gait_form.addRow("Min still duration:", self.min_still_seconds_spin)
+        gait_form.addRow("Min valid steps (step length):", self.min_valid_steps_spin)
         gait_form.addRow("Stride length outlier ratio:", self.stride_outlier_spin)
 
         triangulation_form = QFormLayout()
@@ -246,10 +252,11 @@ class _PreferencesDialog(QDialog):
             "speed_threshold_mm_s": self.speed_threshold_spin.value(),
             "min_contact_frames": self.min_contact_frames_spin.value(),
             "max_bridge_gap_frames": self.max_bridge_gap_spin.value(),
-            "min_consecutive_steps": self.min_consecutive_steps_spin.value(),
+            "min_consecutive_strides": self.min_consecutive_strides_spin.value(),
             "stillness_window_seconds": self.stillness_window_spin.value(),
             "stillness_window_speed_mm_s": self.stillness_threshold_spin.value(),
             "min_still_seconds": self.min_still_seconds_spin.value(),
+            "min_valid_steps": self.min_valid_steps_spin.value(),
             "stride_length_outlier_ratio": self.stride_outlier_spin.value(),
         })
         app_settings.set_default_min_corners_extrinsic(self.app_data_dir, self.min_corners_extrinsic_spin.value())

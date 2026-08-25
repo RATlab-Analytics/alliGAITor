@@ -98,7 +98,16 @@ class PawEvents:
 
 @dataclass
 class TrialMetrics:
-    """Gait metrics for one rat's single crossing of the platform."""
+    """Gait metrics for one rat's single crossing of the platform.
+
+    One recording can hold several crossings (see
+    :func:`find_crossings`), each of which is its own trial with its own
+    direction of travel -- so this is per *crossing*, not per session
+    file. ``crossing_index``/``crossing_count`` say which one, and
+    ``crossing_window`` is the frame range it was measured over; a
+    single-crossing recording leaves all three at their defaults and
+    behaves exactly as before.
+    """
 
     session_name: str
     rat_id: str
@@ -111,6 +120,18 @@ class TrialMetrics:
     n_strides: Dict[str, int]
     n_steps: Dict[str, int]
     paw_events: Dict[str, PawEvents]
+    crossing_index: int = 0
+    crossing_count: int = 1
+    crossing_window: Optional[Tuple[int, int]] = None
+
+    @property
+    def crossing_label(self) -> str:
+        """How this trial names itself in the workbook -- the bare
+        session name when the recording held one crossing, else the
+        session name plus which crossing of how many."""
+        if self.crossing_count <= 1:
+            return self.session_name
+        return f"{self.session_name} \u2014 crossing {self.crossing_index + 1} of {self.crossing_count}"
 
 
 def load_pose_3d(
@@ -232,24 +253,50 @@ def windowed_body_speed(times: np.ndarray, xyz: np.ndarray, window_s: float) -> 
     return speed
 
 
-def active_window(times: np.ndarray, ref_xyz: np.ndarray, config: GaitConfig) -> Tuple[int, int]:
-    """First/last frame index of sustained whole-body motion.
+def find_crossings(
+    times: np.ndarray, ref_xyz: np.ndarray, config: GaitConfig
+) -> List[Tuple[int, int]]:
+    """Every separate traversal of the platform in one recording, as
+    ``(start_frame, end_frame)`` windows in the order they happened.
 
-    Trims any leading/trailing stretch of at least
-    ``config.min_still_seconds`` whose whole-body (reference node)
-    windowed speed (see :func:`windowed_body_speed`) stays below
-    ``config.stillness_window_speed_mm_s`` -- e.g. a rat that stops
-    moving well before the recording ends, whose paws can then jitter
-    across the (much more sensitive) per-paw stance-speed threshold and
-    look like one long stance, or a run of real steps taken in place. A
-    brief slowdown in the middle of the trial isn't trimmed, only a
-    stretch bordering either end. Falls back to the full triangulated
-    range if the whole trial reads as "still" by this threshold, rather
-    than collapsing to an empty window.
+    An unedited recording typically holds several crossings back to
+    back: the rat walks the length of the tunnel, stops, turns around,
+    walks back, stops, turns, walks again. Each of those is its own
+    trial -- its own duration, its own direction of travel, its own
+    stride and step measurements -- and averaging them together, or
+    worse measuring them against a single direction vector, is
+    meaningless. (Measured against the whole recording, the net
+    displacement of an out-and-back pair is near zero, which would leave
+    :func:`_crossing_time_and_speed` deriving ``forward`` from noise and
+    reporting roughly half of every trial's strides as negative.)
 
-    A frame with no windowed speed at all (too little triangulated data
-    nearby) counts as moving, not as still: "unknown" should never be
-    grounds for throwing frames away.
+    Crossings are separated on two signals together, because neither
+    alone is sufficient:
+
+    * **A pause.** Bouts of sustained whole-body motion are split by
+      stretches of at least ``config.min_still_seconds`` below
+      ``config.stillness_window_speed_mm_s`` -- the same measure and
+      thresholds :func:`active_window` already uses to trim idle time
+      off a single-crossing recording.
+    * **A reversal.** Two bouts either side of a pause are only
+      *different* crossings if the rat left in the opposite direction.
+      A rat that pauses mid-tunnel to groom or sniff and then carries on
+      the same way was never on a second crossing, and splitting there
+      would cut one real traversal into two half-length ones. Measured
+      on this rig's single-crossing recordings, mid-trial pauses of over
+      a second are common enough that pause-only splitting would
+      fragment them.
+
+    A candidate whose net displacement is under a quarter of the largest
+    candidate's is dropped as shuffling rather than travel -- expressed
+    as a fraction of this recording's own longest traversal rather than
+    an absolute distance, so it carries over to a rig with a
+    differently-sized platform without retuning.
+
+    Always returns at least one window, falling back to the full
+    triangulated range, so a recording that never reads as a clean
+    traversal still yields a trial to look at rather than silently
+    disappearing.
     """
     bridged = bridge_short_gaps(ref_xyz, config.max_bridge_gap_frames)
     valid = ~np.isnan(bridged).any(axis=1)
@@ -263,30 +310,96 @@ def active_window(times: np.ndarray, ref_xyz: np.ndarray, config: GaitConfig) ->
 
     speed = windowed_body_speed(times, bridged, config.stillness_window_seconds)
     with np.errstate(invalid="ignore"):
-        still = speed < config.stillness_window_speed_mm_s  # NaN -> False
+        still = speed < config.stillness_window_speed_mm_s  # NaN -> moving, never grounds for discarding
     min_still_frames = max(1, int(round(config.min_still_seconds * pose_sampling_fps(times))))
 
-    start = first
-    m = first
-    while m < last and still[m]:
-        m += 1
-    if m - first >= min_still_frames:
-        start = m
+    # Maximal runs of moving frames inside the triangulated range, split by
+    # pauses that are actually long enough to be a stop rather than a stride's
+    # own slow moment.
+    bouts: List[Tuple[int, int]] = []
+    i = first
+    while i <= last:
+        if still[i]:
+            i += 1
+            continue
+        j = i
+        while j < last:
+            if not still[j + 1]:
+                j += 1
+                continue
+            k = j + 1
+            while k <= last and still[k]:
+                k += 1
+            if k - (j + 1) >= min_still_frames or k > last:
+                break  # a real stop (or the end) -- this bout ends at j
+            j = k      # too brief to be a stop; keep going through it
+        bouts.append((i, j))
+        i = j + 1
 
-    end = last
-    k = last
-    while k > first and still[k]:
-        k -= 1
-    if last - k >= min_still_frames:
-        end = k
+    if not bouts:
+        return [(first, last)]
 
-    if start >= end:
-        return first, last
-    return start, end
+    def _net(bout: Tuple[int, int]) -> np.ndarray:
+        a, b = bout
+        seg = np.flatnonzero(valid[a : b + 1])
+        if seg.size < 2:
+            return np.zeros(3)
+        return bridged[a + seg[-1]] - bridged[a + seg[0]]
+
+    # Merge across a pause the rat walked straight out of in the same
+    # direction: that was one traversal with a rest in it, not two.
+    merged: List[Tuple[int, int]] = [bouts[0]]
+    for bout in bouts[1:]:
+        prev_net, this_net = _net(merged[-1]), _net(bout)
+        if float(prev_net @ this_net) > 0:
+            merged[-1] = (merged[-1][0], bout[1])
+        else:
+            merged.append(bout)
+
+    distances = [float(np.linalg.norm(_net(b))) for b in merged]
+    longest = max(distances)
+    if longest <= 0:
+        return [(first, last)]
+    crossings = [b for b, d in zip(merged, distances) if d >= 0.25 * longest]
+    return crossings or [(first, last)]
+
+
+def active_window(times: np.ndarray, ref_xyz: np.ndarray, config: GaitConfig) -> Tuple[int, int]:
+    """First/last frame index of sustained whole-body motion, for the
+    *first* crossing in the recording (see :func:`find_crossings`, which
+    this delegates to -- a single-crossing recording has exactly one, so
+    this is that whole recording's active span).
+
+    Trims any leading/trailing stretch of at least
+    ``config.min_still_seconds`` whose whole-body (reference node)
+    windowed speed (see :func:`windowed_body_speed`) stays below
+    ``config.stillness_window_speed_mm_s`` -- e.g. a rat that stops
+    moving well before the recording ends, whose paws can then jitter
+    across the (much more sensitive) per-paw stance-speed threshold and
+    look like one long stance, or a run of real strides taken in place. A
+    brief slowdown in the middle of the trial isn't trimmed, only a
+    stretch bordering either end. Falls back to the full triangulated
+    range if the whole trial reads as "still" by this threshold, rather
+    than collapsing to an empty window.
+
+    A frame with no windowed speed at all (too little triangulated data
+    nearby) counts as moving, not as still: "unknown" should never be
+    grounds for throwing frames away.
+
+    Kept as the single-crossing entry point (and because a caller that
+    only wants "where is the animal actually moving" shouldn't have to
+    care that a recording *might* hold more than one traversal), but the
+    stillness logic itself lives in :func:`find_crossings` so there is
+    only one copy of it.
+    """
+    return find_crossings(times, ref_xyz, config)[0]
 
 
 def _crossing_time_and_speed(
-    times: np.ndarray, ref_xyz: np.ndarray, config: GaitConfig
+    times: np.ndarray,
+    ref_xyz: np.ndarray,
+    config: GaitConfig,
+    window: Optional[Tuple[int, int]] = None,
 ) -> "tuple[float, float, np.ndarray, Tuple[int, int]]":
     """Return (crossing time, average speed, unit forward direction, active window).
 
@@ -294,8 +407,14 @@ def _crossing_time_and_speed(
     than the reference node's raw first-to-last triangulated frame, so
     idle time before the rat starts moving or after it stops doesn't
     inflate the crossing time or drag down the average speed.
+
+    ``window`` names one crossing's ``(start, end)`` explicitly, for a
+    recording holding more than one (see :func:`find_crossings`);
+    omitted, the first crossing is used. ``forward`` is derived from the
+    chosen window alone, so an out-and-back pair gets one direction
+    vector each rather than a single meaningless average of the two.
     """
-    start, end = active_window(times, ref_xyz, config)
+    start, end = window if window is not None else active_window(times, ref_xyz, config)
 
     window = ref_xyz[start : end + 1]
     valid = ~np.isnan(window).any(axis=1)
@@ -399,7 +518,7 @@ def _drop_window_clipped_stances(events: PawEvents, start: int, end: int) -> Paw
 
     Such a phase is not a completed ground contact. Its duration is
     whatever the window happened to cut it to, so counting it inflates
-    ground contact time and pads a qualifying run with a step that never
+    ground contact time and pads a qualifying run with a stride that never
     happened -- and because it is dropped on the endpoint being
     synthetic rather than on where the edge fell, this stays correct
     whether the trim lands a frame early or a frame late.
@@ -446,7 +565,7 @@ def _detect_paw_events(times: np.ndarray, xyz: np.ndarray, config: GaitConfig) -
 
 @dataclass
 class DiscardedStance:
-    """An untriangulated gap that could plausibly be hiding a real step.
+    """An untriangulated gap that could plausibly be hiding a real stance.
 
     Attributes:
         start_frame: First frame of the gap.
@@ -472,8 +591,8 @@ def find_camera_caused_discards(
     ``bridged_xyz`` should already have short gaps interpolated (see
     :func:`bridge_short_gaps`), so what's left here is exactly the
     gaps long/unresolved enough to matter -- the same trajectory
-    :func:`_qualifying_runs` uses to decide whether two detected steps
-    can be trusted as truly consecutive. (An earlier version of this
+    :func:`_qualifying_runs` uses to decide whether two detected stances
+    can be trusted as truly consecutive strides. (An earlier version of this
     function instead looked for stance candidates *rejected* by
     ``min_contact_frames`` for being too short; that check went silently
     vacuous once ``min_contact_frames`` defaulted to 1, since nothing is
@@ -481,7 +600,7 @@ def find_camera_caused_discards(
     directly for real gaps doesn't depend on that threshold at all.)
 
     A gap touching either end of the trial (no bounding valid frame on
-    one side) isn't reported -- there's no before/after step it could
+    one side) isn't reported -- there's no before/after stance it could
     plausibly be separating.
 
     Args:
@@ -566,8 +685,10 @@ def find_stride_length_outliers(
     forward: np.ndarray,
     ratio: float,
 ) -> List[Tuple[int, int, float, float]]:
-    """Adjacent stride pairs whose length exceeds ``ratio`` times this
-    paw's own median stride length in the trial.
+    """Adjacent stride pairs that aren't trustworthy as one real stride:
+    non-positive (the paw's own net forward progress, liftoff to next
+    touchdown, is zero or backward), or long enough to exceed ``ratio``
+    times this paw's own median *positive* stride length in the trial.
 
     A stride long enough to plausibly be two strides' worth of distance
     rather than one usually means a real stance sat in between that the
@@ -576,19 +697,48 @@ def find_stride_length_outliers(
     what :func:`find_camera_caused_discards` (a gap-based check) cannot
     catch. The two are independent and complementary, not overlapping.
 
+    A non-positive stride is a different failure mode, not caught by
+    either: real, non-interpolated liftoff/touchdown positions, with the
+    paw genuinely tracked moving in between -- but no net forward
+    progress. Investigated on real trials by pulling video for the
+    clearest cases: the paw wasn't turning or walking backward (the
+    animal's tracked heading stayed forward-facing throughout every
+    checked case), it was mid-pause -- grooming, sniffing, investigating
+    -- while the speed classifier's fixed threshold still called the
+    movement a "swing." A whole-body speed check across the swing was
+    tried and rejected: even windowed (see :func:`windowed_body_speed`),
+    a real stride's own low point overlaps too much with a paused one's
+    (at a lenient cutoff it still excluded 2% of clearly-fine strides
+    while catching well under half of the non-positive ones). Sign
+    needs no threshold at all -- directed locomotion should never
+    produce a stride with zero or negative net forward progress, so any
+    that does is self-evidently not one, regardless of what caused it.
+
+    The baseline median is computed from positive strides only, so a
+    paused/reversed stride can't drag it down and mask a genuine
+    too-long outlier sitting next to it.
+
     Returns a list of ``(liftoff_frame, touchdown_frame, stride_length_mm,
     median_stride_length_mm)``, one entry per outlier stride.
+    ``median_stride_length_mm`` is ``NaN`` when fewer than two positive
+    strides exist to compute one from.
     """
     strides = _stride_lengths(events, xyz, forward)
-    if strides.size < 2:
+    if strides.size == 0:
         return []
-    median = float(np.median(strides))
-    if median <= 0:
-        return []
+    non_positive = strides <= 0
+    positive = strides[~non_positive]
+    if positive.size >= 2:
+        median = float(np.median(positive))
+        too_long = (~non_positive) & (strides > median * ratio)
+    else:
+        median = float("nan")
+        too_long = np.zeros(strides.size, dtype=bool)
+    is_outlier = non_positive | too_long
     return [
         (int(events.liftoff_frames[i]), int(events.touchdown_frames[i + 1]), float(s), median)
         for i, s in enumerate(strides)
-        if s > median * ratio
+        if is_outlier[i]
     ]
 
 
@@ -606,10 +756,14 @@ def _qualifying_runs(
     no remaining untriangulated frame -- *after* bridging (see
     :func:`bridge_short_gaps`) -- anywhere in the swing between them, and
     the stride between them isn't a
-    :func:`find_stride_length_outliers`-flagged outlier. The first check
-    catches a triangulation gap that could be hiding a real step; the
-    second catches a real step missed despite clean triangulation. Neither
-    alone is sufficient -- see :func:`restrict_to_consecutive_runs`.
+    :func:`find_stride_length_outliers`-flagged outlier (too long, or
+    non-positive -- see that function's docstring for why a stride with
+    no net forward progress gets the same treatment as one implausibly
+    long). The first check catches a triangulation gap that could be
+    hiding a real stance; the second catches a real stance missed
+    despite clean triangulation, or a swing that wasn't a real stride at
+    all. Neither alone is sufficient -- see
+    :func:`restrict_to_consecutive_runs`.
 
     This used to check for a :func:`find_camera_caused_discards` window
     instead of the bridged trajectory directly, but that specifically
@@ -632,9 +786,13 @@ def _qualifying_runs(
     strides = _stride_lengths(events, bridged_xyz, forward)
     stride_clean = np.ones(max(n - 1, 0), dtype=bool)
     if strides.size:
-        median = float(np.median(strides))
-        if median > 0:
-            stride_clean = strides <= median * stride_length_outlier_ratio
+        non_positive = strides <= 0
+        positive = strides[~non_positive]
+        too_long = np.zeros(strides.size, dtype=bool)
+        if positive.size >= 2:
+            median = float(np.median(positive))
+            too_long = (~non_positive) & (strides > median * stride_length_outlier_ratio)
+        stride_clean = ~(non_positive | too_long)
 
     clean_pair = gap_clean & stride_clean
 
@@ -654,10 +812,11 @@ def restrict_to_consecutive_runs(
     times: np.ndarray,
     positions: Dict[str, np.ndarray],
     config: GaitConfig,
+    window: Optional[Tuple[int, int]] = None,
 ) -> TrialMetrics:
     """Recompute stride/step/ground-contact-time averages from only the
-    steps that are part of a qualifying run (see
-    :attr:`alligaitor.config.GaitConfig.min_consecutive_steps` and
+    strides that are part of a qualifying run (see
+    :attr:`alligaitor.config.GaitConfig.min_consecutive_strides` and
     :func:`_qualifying_runs`) -- an isolated good detection outside any
     such run doesn't feed the averages, and a paw with no qualifying run
     at all reports ``NaN``. ``trial.paw_events`` (every stance phase
@@ -674,7 +833,9 @@ def restrict_to_consecutive_runs(
         positions: This trial's per-node positions (see :func:`load_pose_3d`).
         config: The same :class:`GaitConfig` ``trial`` was computed with.
     """
-    _, _, forward, (start, end) = _crossing_time_and_speed(times, positions[REFERENCE_NODE], config)
+    _, _, forward, (start, end) = _crossing_time_and_speed(
+        times, positions[REFERENCE_NODE], config, window or trial.crossing_window
+    )
 
     stride_length_mm, step_length_mm, ground_contact_time_s = {}, {}, {}
     n_contacts, n_strides, n_steps = {}, {}, {}
@@ -686,8 +847,12 @@ def restrict_to_consecutive_runs(
         xyz[:start] = np.nan
         xyz[end + 1 :] = np.nan
         bridged = bridge_short_gaps(xyz, config.max_bridge_gap_frames)
+        contra_xyz = positions[CONTRALATERAL[paw]].copy()
+        contra_xyz[:start] = np.nan
+        contra_xyz[end + 1 :] = np.nan
+        contra_bridged = bridge_short_gaps(contra_xyz, config.max_bridge_gap_frames)
         runs = _qualifying_runs(
-            events, bridged, forward, config.min_consecutive_steps, config.stride_length_outlier_ratio
+            events, bridged, forward, config.min_consecutive_strides, config.stride_length_outlier_ratio
         )
 
         if not runs:
@@ -708,9 +873,17 @@ def restrict_to_consecutive_runs(
                 touchdown_times=events.touchdown_times[s : e + 1],
                 liftoff_times=events.liftoff_times[s : e + 1],
             )
-            strides_parts.append(_stride_lengths(run_events, positions[paw], forward))
+            # `bridged` (masked to the active window, short gaps healed) rather
+            # than raw `positions`: compute_trial_metrics detects events against
+            # that same array, so a touchdown landing on a bridged frame reads
+            # NaN out of the raw one -- and one NaN turns this paw's whole mean
+            # into NaN.
+            strides_parts.append(_stride_lengths(run_events, bridged, forward))
             steps_parts.append(
-                _step_lengths(run_events, contra_events, positions[paw], positions[CONTRALATERAL[paw]], forward)
+                _step_lengths(
+                    run_events, contra_events, bridged, contra_bridged, forward,
+                    config.stride_length_outlier_ratio,
+                )
             )
             durations_parts.append(run_events.liftoff_times - run_events.touchdown_times)
             total_contacts += run_events.touchdown_frames.size
@@ -720,7 +893,12 @@ def restrict_to_consecutive_runs(
         durations = np.concatenate(durations_parts)
 
         stride_length_mm[paw] = float(np.mean(strides)) if strides.size else float("nan")
-        step_length_mm[paw] = float(np.mean(steps)) if steps.size else float("nan")
+        # Step length carries its own evidence bar (config.min_valid_steps): it
+        # is the only metric depending on a second paw, so it can fall short on
+        # a crossing where this paw's own stride/contact numbers are sound.
+        step_length_mm[paw] = (
+            float(np.mean(steps)) if steps.size >= config.min_valid_steps else float("nan")
+        )
         ground_contact_time_s[paw] = float(np.mean(durations)) if durations.size else float("nan")
         n_contacts[paw] = total_contacts
         n_strides[paw] = int(strides.size)
@@ -752,17 +930,86 @@ def _step_lengths(
     xyz: np.ndarray,
     contra_xyz: np.ndarray,
     forward: np.ndarray,
+    outlier_ratio: float,
 ) -> np.ndarray:
-    """Forward distance from each touchdown to the contralateral paw's most recent prior touchdown."""
-    if events.touchdown_frames.size == 0 or contra_events.touchdown_frames.size == 0:
+    """Forward distance from each touchdown to the contralateral paw's
+    most recent touchdown *strictly before* it -- keeping only the
+    pairings that contralateral paw's own record supports.
+
+    "Strictly before," not merely at-or-before: at this rig's 12.5fps
+    pose sampling, two paws' touchdowns can legitimately land in the
+    same discretized frame (a real double-support moment), but "step
+    length" is a distance to the *preceding* footfall and isn't a
+    meaningful measurement between two simultaneous ones. Measured on
+    real trials, these same-frame pairings are 9% of all pairings but
+    39% of the negative step lengths (vs. 12% for a properly sequenced
+    pairing) -- not because the positions are wrong, but because the
+    concept the pairing is supposed to represent doesn't apply to them.
+
+    Step length is the one metric that depends on a *second* paw, so it
+    inherits that paw's detection failures. When the contralateral paw
+    misses a touchdown, the "most recent prior touchdown" silently
+    becomes an older one and the resulting distance spans several gait
+    cycles instead of one: measured on real trials, 12% of raw pairings
+    reach back more than 10 frames and the worst reaches back 43 (3.4s),
+    producing "steps" of 300-400mm against a stride of ~130mm. Averaged
+    in, those shifted the reported mean step length by a median 45%.
+
+    A pairing is rejected when the contralateral touchdown interval
+    bracketing it runs longer than ``outlier_ratio`` times that paw's
+    *own* median touchdown-to-touchdown interval -- the same
+    "suspiciously long compared to this animal's own baseline" test
+    :func:`find_stride_length_outliers` applies to strides. Comparing
+    the contralateral paw only against itself is what keeps this usable
+    on an impaired animal: a rat limping consistently on one leg has a
+    consistently long interval, so its median is long too and nothing
+    flags. A rule assuming left/right alternation would instead reject
+    exactly the long steps that *are* the impairment (measured: 22% of
+    steps, versus 18% here, and it discards genuine non-alternating gait
+    rather than detection failures).
+
+    Untriangulated dropouts are deliberately *not* treated as
+    invalidating on their own: measured across this corpus, 81% of
+    interior gaps have the paw moving through them (motion blur during
+    swing), where no touchdown could have been hidden. A dropout that
+    does hide a touchdown stretches the bracketing interval, so this
+    test already catches it.
+
+    Returns an empty array when the contralateral paw has fewer than two
+    touchdowns -- with no interval of its own there is no baseline to
+    judge a pairing against, so no pairing here can be trusted.
+    """
+    if events.touchdown_frames.size == 0 or contra_events.touchdown_frames.size < 2:
         return np.array([])
-    contra_idx = np.searchsorted(contra_events.touchdown_frames, events.touchdown_frames, side="right") - 1
+
+    contra_idx = np.searchsorted(contra_events.touchdown_frames, events.touchdown_frames, side="left") - 1
     has_prior = contra_idx >= 0
     if not has_prior.any():
         return np.array([])
-    this_pos = xyz[events.touchdown_frames[has_prior]]
-    contra_frames = contra_events.touchdown_frames[contra_idx[has_prior]]
-    contra_pos = contra_xyz[contra_frames]
+
+    contra_intervals = np.diff(contra_events.touchdown_frames)
+    limit = outlier_ratio * float(np.median(contra_intervals))
+
+    this_frames = events.touchdown_frames[has_prior]
+    idx = contra_idx[has_prior]
+    contra_frames = contra_events.touchdown_frames[idx]
+
+    # The contralateral interval bracketing each pairing: that touchdown to
+    # its own next one, or -- for a pairing after the contralateral paw's
+    # last touchdown -- however far it is to this paw's touchdown.
+    nxt = idx + 1
+    has_next = nxt < contra_events.touchdown_frames.size
+    span = np.where(
+        has_next,
+        contra_events.touchdown_frames[np.minimum(nxt, contra_events.touchdown_frames.size - 1)] - contra_frames,
+        this_frames - contra_frames,
+    )
+    keep = span <= limit
+    if not keep.any():
+        return np.array([])
+
+    this_pos = xyz[this_frames[keep]]
+    contra_pos = contra_xyz[contra_frames[keep]]
     return (this_pos - contra_pos) @ forward
 
 
@@ -771,6 +1018,9 @@ def compute_trial_metrics(
     session_name: str,
     rat_id: str,
     config: Optional[GaitConfig] = None,
+    window: Optional[Tuple[int, int]] = None,
+    crossing_index: int = 0,
+    crossing_count: int = 1,
 ) -> TrialMetrics:
     """Compute one trial's gait metrics from its triangulated ``pose_3d.csv``.
 
@@ -792,7 +1042,7 @@ def compute_trial_metrics(
         raise ValueError(f"pose_3d CSV '{csv_path}' is missing required node(s): {missing}")
 
     crossing_time_s, average_speed_mm_s, forward, (start, end) = _crossing_time_and_speed(
-        times, positions[REFERENCE_NODE], config
+        times, positions[REFERENCE_NODE], config, window
     )
 
     # Bridged (short-gap-interpolated) paw positions drive stance
@@ -827,11 +1077,16 @@ def compute_trial_metrics(
         contra_ev = events[CONTRALATERAL[paw]]
 
         strides = _stride_lengths(ev, bridged[paw], forward)
-        steps = _step_lengths(ev, contra_ev, bridged[paw], bridged[CONTRALATERAL[paw]], forward)
+        steps = _step_lengths(
+            ev, contra_ev, bridged[paw], bridged[CONTRALATERAL[paw]], forward,
+            config.stride_length_outlier_ratio,
+        )
         contact_durations = ev.liftoff_times - ev.touchdown_times
 
         stride_length_mm[paw] = float(np.mean(strides)) if strides.size else float("nan")
-        step_length_mm[paw] = float(np.mean(steps)) if steps.size else float("nan")
+        step_length_mm[paw] = (
+            float(np.mean(steps)) if steps.size >= config.min_valid_steps else float("nan")
+        )
         ground_contact_time_s[paw] = float(np.mean(contact_durations)) if contact_durations.size else float("nan")
         n_contacts[paw] = int(ev.touchdown_frames.size)
         n_strides[paw] = int(strides.size)
@@ -840,6 +1095,9 @@ def compute_trial_metrics(
     return TrialMetrics(
         session_name=session_name,
         rat_id=rat_id,
+        crossing_index=crossing_index,
+        crossing_count=crossing_count,
+        crossing_window=(start, end),
         crossing_time_s=crossing_time_s,
         average_speed_mm_s=average_speed_mm_s,
         stride_length_mm=stride_length_mm,
@@ -850,6 +1108,54 @@ def compute_trial_metrics(
         n_steps=n_steps,
         paw_events=events,
     )
+
+
+def compute_crossing_metrics(
+    csv_path: PathLike,
+    session_name: str,
+    rat_id: str,
+    config: Optional[GaitConfig] = None,
+) -> List[TrialMetrics]:
+    """One :class:`TrialMetrics` per crossing in a recording, in the
+    order they happened -- the multi-crossing counterpart to
+    :func:`compute_trial_metrics`.
+
+    An unedited recording holds several traversals back to back (see
+    :func:`find_crossings`). Each is measured independently: its own
+    active window, its own direction of travel, its own stance
+    detection, so a return leg is scored against the direction it was
+    actually walked in rather than against the first leg's. They share a
+    ``rat_id``, which is what puts them on one worksheet tab with a
+    combined average underneath (see :func:`write_group_report`) --
+    exactly how several separate sessions for one rat already behave.
+
+    A single-crossing recording returns a one-element list whose trial
+    is identical to what :func:`compute_trial_metrics` returns for it.
+    """
+    config = config or GaitConfig()
+    times, positions, _ = load_pose_3d(csv_path)
+    if REFERENCE_NODE not in positions:
+        raise ValueError(f"pose_3d CSV '{csv_path}' is missing required node: {REFERENCE_NODE}")
+
+    crossings = find_crossings(times, positions[REFERENCE_NODE], config)
+    trials = []
+    for i, window in enumerate(crossings):
+        try:
+            trials.append(
+                compute_trial_metrics(
+                    csv_path, session_name, rat_id, config,
+                    window=window, crossing_index=i, crossing_count=len(crossings),
+                )
+            )
+        except ValueError as exc:
+            # One unusable crossing (too little triangulated data in its own
+            # window to establish a direction) shouldn't cost the others.
+            warnings.warn(
+                f"{session_name}: skipping crossing {i + 1} of {len(crossings)} "
+                f"(frames {window[0]}-{window[1]}): {exc}",
+                stacklevel=2,
+            )
+    return trials
 
 
 @dataclass
@@ -897,7 +1203,9 @@ def paw_usability_windows(
     phase. ``None`` only when the paw was never detected planted at all in
     this trial.
     """
-    _, _, forward, (start, end) = _crossing_time_and_speed(times, positions[REFERENCE_NODE], config)
+    _, _, forward, (start, end) = _crossing_time_and_speed(
+        times, positions[REFERENCE_NODE], config, trial.crossing_window
+    )
 
     windows: Dict[str, Optional[PawWindow]] = {}
     for paw in PAW_NODES:
@@ -907,7 +1215,7 @@ def paw_usability_windows(
         xyz[end + 1 :] = np.nan
         bridged = bridge_short_gaps(xyz, config.max_bridge_gap_frames)
         runs = _qualifying_runs(
-            events, bridged, forward, config.min_consecutive_steps, config.stride_length_outlier_ratio
+            events, bridged, forward, config.min_consecutive_strides, config.stride_length_outlier_ratio
         )
 
         if runs:
@@ -949,28 +1257,41 @@ def planted_mask(trial: TrialMetrics, n_frames: int) -> Dict[str, np.ndarray]:
     return masks
 
 
-def save_paw_events_csv(trial: TrialMetrics, csv_path: PathLike) -> None:
-    """Write every detected stance phase's frame/time window for one trial.
+def save_paw_events_csv(
+    trial: Union[TrialMetrics, List[TrialMetrics]], csv_path: PathLike
+) -> None:
+    """Write every detected stance phase's frame/time window for one
+    recording -- across all of its crossings, if it holds several.
 
     Kept separate from the averaged metrics in the group workbook so a
     later validation-video tool can overlay exactly the frames treated as
-    ground contact, without recomputing detection.
+    ground contact, without recomputing detection. Accepts either one
+    trial or the per-crossing list from
+    :func:`compute_crossing_metrics`; the ``crossing`` column
+    (1-based) says which traversal each stance belongs to, and is always
+    written so the column set doesn't depend on how many crossings a
+    recording happened to have.
     """
+    trials = [trial] if isinstance(trial, TrialMetrics) else list(trial)
     rows = [
         {
+            "crossing": t.crossing_index + 1,
             "paw": paw,
             "touchdown_frame": int(td_f),
             "liftoff_frame": int(lo_f),
             "touchdown_time_s": float(td_t),
             "liftoff_time_s": float(lo_t),
         }
-        for paw, ev in trial.paw_events.items()
+        for t in trials
+        for paw, ev in t.paw_events.items()
         for td_f, lo_f, td_t, lo_t in zip(
             ev.touchdown_frames, ev.liftoff_frames, ev.touchdown_times, ev.liftoff_times
         )
     ]
     df = pd.DataFrame(
-        rows, columns=["paw", "touchdown_frame", "liftoff_frame", "touchdown_time_s", "liftoff_time_s"]
+        rows,
+        columns=["crossing", "paw", "touchdown_frame", "liftoff_frame",
+                 "touchdown_time_s", "liftoff_time_s"],
     )
     csv_path = Path(csv_path)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -999,6 +1320,9 @@ _STAT_COLUMNS: Tuple[Tuple[str, str, str], ...] = (
     ("n_strides", "Strides (n)", "0"),
     ("n_steps", "Steps (n)", "0"),
 )
+# The stats that can legitimately be NaN for an otherwise-fine paw; the
+# rest are counts (see _paw_has_no_usable_run).
+_NAN_BEARING_STATS = frozenset({"stride_length_mm", "step_length_mm", "ground_contact_time_s"})
 _NOTES_LABEL = "Notes"
 _N_STAT_COLUMNS = 1 + len(_STAT_COLUMNS)  # "Paw" + the stat columns
 _NOTES_COLUMN = _N_STAT_COLUMNS + 1
@@ -1018,7 +1342,7 @@ _CLEAR_FONT = Font()
 def _paw_has_no_usable_run(trial: TrialMetrics, paw: str) -> bool:
     """True if `paw` never formed a run clean/long enough to trust for
     stride length, step length, or ground-contact time on this crossing
-    (all three NaN -- see GaitConfig.min_consecutive_steps). n_contacts
+    (all three NaN -- see GaitConfig.min_consecutive_strides). n_contacts
     et al. can still be a real, nonzero count even when this is True: a
     handful of raw detections that never added up to a qualifying run is
     exactly the case this flags, not "zero contacts detected"."""
@@ -1027,6 +1351,27 @@ def _paw_has_no_usable_run(trial: TrialMetrics, paw: str) -> bool:
         and np.isnan(trial.step_length_mm[paw])
         and np.isnan(trial.ground_contact_time_s[paw])
     )
+
+
+def _stat_is_untrustworthy(trial: TrialMetrics, paw: str, stat: str) -> bool:
+    """True if this one ``(paw, stat)`` cell shouldn't be trusted, as
+    opposed to the whole paw (:func:`_paw_has_no_usable_run`).
+
+    Exists because step length can fail on its own: it is the only
+    metric measured against a *second* paw, so a crossing where this
+    paw's stride length and ground contact time are perfectly sound can
+    still have too few trustworthy step pairings to average (see
+    :attr:`alligaitor.config.GaitConfig.min_valid_steps`). Before this,
+    a paw was either wholly good or wholly bad, and a lone NaN step
+    length was reported as if the paw were fine.
+
+    Only the three length/timing stats can be ``NaN``; the event counts
+    are always a real count (see :func:`_paw_has_no_usable_run`), so
+    they are never untrustworthy on their own.
+    """
+    if stat not in _NAN_BEARING_STATS:
+        return False
+    return bool(np.isnan(getattr(trial, stat)[paw]))
 
 
 def _nanmean(values) -> float:
@@ -1055,15 +1400,20 @@ def _write_paw_block(
     crossing_time_s: float,
     average_speed_cm_s: float,
     get_value: Callable[[str, str], float],
-    is_bad: Callable[[str], bool],
+    is_bad: Callable[[str, str], bool],
     stat_columns: Tuple[Tuple[str, str, str], ...] = _STAT_COLUMNS,
     note_getter: Callable[[str], str] = lambda paw: "",
 ) -> int:
     """Writes one titled block -- crossing time/speed, then a paw x stat
     table -- starting at `start_row`, and returns the row the next block
-    should start at. `get_value(stat, paw)` and `is_bad(paw)` abstract
+    should start at. `get_value(stat, paw)` and `is_bad(paw, stat)` abstract
     over "one trial's own numbers" vs. "this rat's per-paw averages" (see
-    write_group_report), so this one function lays out both. `note_getter(paw)`
+    write_group_report), so this one function lays out both. `is_bad` is
+    per ``(paw, stat)`` rather than per paw, so a single untrustworthy
+    column -- step length being the one that can fail alone, see
+    :func:`_stat_is_untrustworthy` -- is highlighted on its own instead
+    of condemning the whole row; the paw's name cell is highlighted when
+    any of its stats is bad. `note_getter(paw)`
     fills the trailing Notes column -- empty by default, used to record why
     a paw was manually flagged invalid (see :func:`annotate_manual_flag`).
     """
@@ -1094,13 +1444,14 @@ def _write_paw_block(
     row += 1
 
     for paw in PAW_NODES:
-        bad = is_bad(paw)
+        bad_by_stat = {stat: is_bad(paw, stat) for stat, _label, _fmt in stat_columns}
+        bad = any(bad_by_stat.values())
         name_cell = ws.cell(row=row, column=1, value=_PAW_LABELS[paw])
         if bad:
             name_cell.fill = _BAD_FILL
             name_cell.font = _BAD_FONT
         for col, (stat, _label, fmt) in enumerate(stat_columns, start=2):
-            _write_cell(ws, row, col, get_value(stat, paw), fmt, bad=bad)
+            _write_cell(ws, row, col, get_value(stat, paw), fmt, bad=bad_by_stat[stat])
         note_cell = ws.cell(row=row, column=_NOTES_COLUMN, value=note_getter(paw) or None)
         if bad:
             note_cell.fill = _BAD_FILL
@@ -1150,9 +1501,12 @@ def write_group_report(
     final "Average" block in the same shape. A paw with no run in a
     given crossing clean/long enough to trust for its length/timing
     columns (see :func:`_paw_has_no_usable_run`) has its whole row
-    highlighted; the Average block's per-(paw, stat) means are NaN-aware,
-    so a paw's bad crossings don't count against its average from the
-    crossings where it did produce something usable.
+    highlighted; a single column that failed on its own -- step length
+    being the one that can, see :func:`_stat_is_untrustworthy` -- is
+    highlighted by itself, with the paw's name cell marked either way.
+    The Average block's per-(paw, stat) means are NaN-aware, so a paw's
+    bad crossings don't count against its average from the crossings
+    where it did produce something usable.
 
     Args:
         manual_flags: Session name -> (flagged paw names, note), carried
@@ -1187,24 +1541,35 @@ def write_group_report(
                 flagged_paws, note = manual_flags.get(trial.session_name, (set(), ""))
                 row = _write_paw_block(
                     ws, row,
-                    title=f"Session: {trial.session_name}",
+                    title=f"Session: {trial.crossing_label}",
                     crossing_time_s=trial.crossing_time_s,
                     average_speed_cm_s=trial.average_speed_mm_s / 10.0,
                     get_value=lambda stat, paw, t=trial: getattr(t, stat)[paw],
-                    is_bad=lambda paw, t=trial, fp=flagged_paws: _paw_has_no_usable_run(t, paw) or paw in fp,
+                    is_bad=lambda paw, stat, t=trial, fp=flagged_paws: (
+                        _paw_has_no_usable_run(t, paw)
+                        or paw in fp
+                        or _stat_is_untrustworthy(t, paw, stat)
+                    ),
                     note_getter=lambda paw, fp=flagged_paws, n=note: n if paw in fp else "",
                 )
 
             if len(rat_trials) > 1:
                 avg_stat_columns = tuple((stat, label, "0.00") for stat, label, _fmt in _STAT_COLUMNS)
+                sessions_here = {t.session_name for t in rat_trials}
+                if len(sessions_here) == 1:
+                    avg_title = f"Average of {len(rat_trials)} crossings"
+                else:
+                    avg_title = f"Average of {len(rat_trials)} crossings across {len(sessions_here)} sessions"
                 row = _write_paw_block(
                     ws, row,
-                    title="Average",
+                    title=avg_title,
                     crossing_time_s=_nanmean([t.crossing_time_s for t in rat_trials]),
                     average_speed_cm_s=_nanmean([t.average_speed_mm_s for t in rat_trials]) / 10.0,
                     get_value=lambda stat, paw: _nanmean([getattr(t, stat)[paw] for t in rat_trials]),
-                    is_bad=lambda paw: all(
-                        _paw_has_no_usable_run(t, paw) or paw in manual_flags.get(t.session_name, (set(), ""))[0]
+                    is_bad=lambda paw, stat: all(
+                        _paw_has_no_usable_run(t, paw)
+                        or paw in manual_flags.get(t.session_name, (set(), ""))[0]
+                        or _stat_is_untrustworthy(t, paw, stat)
                         for t in rat_trials
                     ),
                     stat_columns=avg_stat_columns,
@@ -1215,24 +1580,39 @@ def write_group_report(
     wb.save(output_path)
 
 
-def _find_session_paw_row(ws, session_name: str, paw: str) -> Optional[int]:
-    """Row index of `paw`'s row within the ``"Session: {session_name}"``
-    block on `ws`, or ``None`` if that block or paw row isn't present --
-    e.g. the workbook predates this session, or was regenerated with
-    different sessions. Searches a bounded window below the title row
-    rather than assuming :func:`_write_paw_block`'s exact row offsets, so
-    it keeps working even if that layout changes shape slightly.
+def _find_session_paw_rows(ws, session_name: str, paw: str) -> List[int]:
+    """Row indices of `paw`'s row in every block on `ws` belonging to
+    `session_name`, in sheet order -- empty if the session or paw row
+    isn't present (e.g. the workbook predates this session, or was
+    regenerated with different sessions).
+
+    A recording holding several crossings contributes one block per
+    crossing, titled ``"Session: {name} -- crossing i of n"`` (see
+    :attr:`TrialMetrics.crossing_label`), so this matches the bare title
+    *and* that prefixed form and returns all of them. The manual-flag
+    UI records a judgement about a paw in a recording, with no way to
+    say "only crossing 2", so :func:`annotate_manual_flag` applies it to
+    every crossing of that recording -- consistent with
+    :func:`write_group_report`, which keys manual flags by session name
+    and so highlights every crossing's block too.
+
+    Searches a bounded window below each title row rather than assuming
+    :func:`_write_paw_block`'s exact row offsets, so it keeps working
+    even if that layout changes shape slightly.
     """
-    title = f"Session: {session_name}"
+    exact = f"Session: {session_name}"
+    prefix = f"{exact} \u2014 crossing "
+    rows: List[int] = []
     for row in ws.iter_rows(min_col=1, max_col=1):
         cell = row[0]
-        if cell.value != title:
+        value = cell.value
+        if not isinstance(value, str) or not (value == exact or value.startswith(prefix)):
             continue
         for r in range(cell.row + 1, cell.row + 16):
             if ws.cell(row=r, column=1).value == _PAW_LABELS[paw]:
-                return r
-        return None
-    return None
+                rows.append(r)
+                break
+    return rows
 
 
 def annotate_manual_flag(
@@ -1274,20 +1654,21 @@ def annotate_manual_flag(
     if ws is None:
         return False
 
-    row = _find_session_paw_row(ws, session_name, paw)
-    if row is None:
+    rows = _find_session_paw_rows(ws, session_name, paw)
+    if not rows:
         return False
 
     bad = flagged or not auto_usable
     fill = _BAD_FILL if bad else _CLEAR_FILL
     font = _BAD_FONT if bad else _CLEAR_FONT
-    for col in range(1, _N_STAT_COLUMNS + 1):
-        cell = ws.cell(row=row, column=col)
-        cell.fill = fill
-        cell.font = font
-    notes_cell = ws.cell(row=row, column=_NOTES_COLUMN, value=(note if flagged else None))
-    notes_cell.fill = fill
-    notes_cell.font = font
+    for row in rows:
+        for col in range(1, _N_STAT_COLUMNS + 1):
+            cell = ws.cell(row=row, column=col)
+            cell.fill = fill
+            cell.font = font
+        notes_cell = ws.cell(row=row, column=_NOTES_COLUMN, value=(note if flagged else None))
+        notes_cell.fill = fill
+        notes_cell.font = font
 
     wb.save(xlsx_path)
     return True

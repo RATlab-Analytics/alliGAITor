@@ -20,7 +20,8 @@ the group workbook is built from, not a separate/simplified pass.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Tuple
+from dataclasses import replace
+from typing import Dict, List, Tuple, Union
 
 import cv2
 import numpy as np
@@ -200,11 +201,44 @@ def _draw_header_strip(width: int, t: float, frame_idx: int, n_frames: int) -> n
     return strip
 
 
+def _merge_crossings(trial: Union[TrialMetrics, List[TrialMetrics]]) -> TrialMetrics:
+    """Collapse a recording's per-crossing trials into one whose
+    ``paw_events`` covers every crossing, for drawing purposes.
+
+    The validation video renders the whole recording in one pass, so it
+    needs every stance event in a single lookup regardless of which
+    crossing produced it. Crossing windows never overlap (see
+    :func:`alligaitor.gait.find_crossings`), so concatenating in frame
+    order is well-defined. Only ``paw_events`` is meaningful on the
+    result -- the averaged metrics are per crossing and are deliberately
+    not recombined here; nothing in the drawing path reads them.
+    """
+    if isinstance(trial, TrialMetrics):
+        return trial
+    trials = list(trial)
+    if not trials:
+        raise ValueError("export_validation_video needs at least one trial")
+    if len(trials) == 1:
+        return trials[0]
+
+    merged_events = {}
+    for paw in PAW_NODES:
+        parts = [t.paw_events[paw] for t in trials]
+        order = np.argsort(np.concatenate([p.touchdown_frames for p in parts]))
+        merged_events[paw] = gait.PawEvents(
+            touchdown_frames=np.concatenate([p.touchdown_frames for p in parts])[order],
+            liftoff_frames=np.concatenate([p.liftoff_frames for p in parts])[order],
+            touchdown_times=np.concatenate([p.touchdown_times for p in parts])[order],
+            liftoff_times=np.concatenate([p.liftoff_times for p in parts])[order],
+        )
+    return replace(trials[0], paw_events=merged_events)
+
+
 def export_validation_video(
     session: SessionConfig,
     csv_path: Path,
     cgroup: CameraGroup,
-    trial: TrialMetrics,
+    trial: Union[TrialMetrics, List[TrialMetrics]],
     config: GaitConfig,
     output_path: Path,
     disagreement_threshold_px: float = 20.0,
@@ -216,8 +250,14 @@ def export_validation_video(
             model-input clips) are what's actually rendered.
         csv_path: This trial's ``pose_3d.csv``.
         cgroup: Calibrated camera group.
-        trial: This trial's already-computed :class:`gait.TrialMetrics`
-            (same instance the group workbook is built from).
+        trial: This recording's already-computed
+            :class:`gait.TrialMetrics` (the same instances the group
+            workbook is built from) -- either one, or the per-crossing
+            list from :func:`alligaitor.gait.compute_crossing_metrics`.
+            The video covers the whole recording, so several crossings
+            are merged into one set of stance events for drawing; their
+            frame ranges are disjoint by construction, so nothing
+            overlaps.
         config: The :class:`GaitConfig` ``trial`` was computed with.
         output_path: Destination ``.mp4`` path.
         disagreement_threshold_px: A node is drawn red, regardless of its
@@ -228,6 +268,7 @@ def export_validation_video(
     """
     times, positions, errors = gait.load_pose_3d(csv_path)
     n_frames = len(times)
+    trial = _merge_crossings(trial)
     planted = gait.planted_mask(trial, n_frames)
 
     cam_names = cgroup.get_names()
