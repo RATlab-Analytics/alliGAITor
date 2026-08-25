@@ -139,10 +139,18 @@ def get_default_gait_overrides(app_data_dir: Path) -> Dict[str, float]:
     """Values used to build the GaitConfig baked into a newly-saved job's
     config.yaml (see group_config_dialog.py's _on_save) -- same
     always-read-fresh-from-Settings pattern as the selected models, not
-    something an individual job can override in the editor UI."""
+    something an individual job can override in the editor UI.
+
+    Keys the current GaitConfig no longer has are dropped rather than
+    carried through: a settings.json written before a tunable was
+    renamed would otherwise hand the config editor a stale key (and the
+    Preferences dialog a missing one). Whatever is dropped falls back to
+    that field's current default.
+    """
     settings = load_settings(app_data_dir)
+    saved = settings.get("default_gait") or {}
     values = dict(DEFAULT_GAIT)
-    values.update(settings.get("default_gait") or {})
+    values.update({k: v for k, v in saved.items() if k in DEFAULT_GAIT})
     return values
 
 

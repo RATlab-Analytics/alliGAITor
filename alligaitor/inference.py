@@ -204,6 +204,20 @@ def run_inference(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    if output_path.exists():
+        # A prior run already wrote these predictions -- reuse them rather
+        # than re-running the (expensive, GPU-bound) sleap-nn subprocess
+        # for no reason. This is what makes reset.py's "--output-only"
+        # tier (clear 3D output + report, keep predictions) actually save
+        # time on a re-run instead of just documenting an intent that
+        # never took effect: a job re-run after only a gait-setting
+        # change now skips straight to triangulation for every session
+        # whose .slp files are still on disk. Delete the .slp (reset.py's
+        # default/--all tiers do) to force fresh inference, e.g. after
+        # switching models.
+        log(f"  Reusing existing predictions: {output_path}")
+        return output_path
+
     if force_grayscale is None:
         force_grayscale = not model_trained_on_color(model_dir)
 

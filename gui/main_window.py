@@ -16,6 +16,7 @@ from __future__ import annotations
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 from PySide6.QtCore import Qt, QTimer, QModelIndex
 from PySide6.QtGui import QActionGroup, QTextCharFormat, QTextCursor
@@ -46,11 +47,14 @@ from regex_help import build_regex_help_panel
 import re
 
 
-def _double_spin(value: float, minimum: float, maximum: float, decimals: int = 1, suffix: str = "", tooltip: str = ""):
+def _double_spin(value: float, minimum: float, maximum: float, decimals: int = 1, suffix: str = "",
+                 tooltip: str = "", step: Optional[float] = None):
     box = QDoubleSpinBox()
     box.setRange(minimum, maximum)
     box.setDecimals(decimals)
     box.setSuffix(suffix)
+    if step is not None:
+        box.setSingleStep(step)
     box.setValue(value)
     if tooltip:
         box.setToolTip(tooltip)
@@ -179,13 +183,21 @@ class _PreferencesDialog(QDialog):
             gait["min_consecutive_steps"], 0, 1000, "",
             "A paw's reported averages only use steps from a run of at least this many consecutive clean stances.",
         )
-        self.stillness_threshold_spin = _double_spin(
-            gait["stillness_speed_threshold_mm_s"], 0, 100000, 1, " mm/s",
-            "Below this whole-body speed, the rat counts as not translating (for trimming a stationary start/end).",
+        self.stillness_window_spin = _double_spin(
+            gait["stillness_window_seconds"], 0.01, 60, 2, " s",
+            "Whole-body speed is measured across a window this wide, so reconstruction jitter at rest "
+            "doesn't read as motion.",
+            step=0.05,
         )
-        self.min_still_frames_spin = _int_spin(
-            gait["min_still_frames"], 0, 10000, "",
-            "Consecutive stationary frames at the very start/end of a trial needed to trim it as \"stopped\".",
+        self.stillness_threshold_spin = _double_spin(
+            gait["stillness_window_speed_mm_s"], 0, 100000, 1, " mm/s",
+            "Below this windowed whole-body speed, the rat counts as not translating (for trimming a "
+            "stationary start/end).",
+        )
+        self.min_still_seconds_spin = _double_spin(
+            gait["min_still_seconds"], 0, 600, 2, " s",
+            "How long the rat must stay stationary at the very start/end of a trial to trim it as \"stopped\".",
+            step=0.05,
         )
         self.stride_outlier_spin = _double_spin(
             gait["stride_length_outlier_ratio"], 0.1, 100, 2, "×",
@@ -201,8 +213,9 @@ class _PreferencesDialog(QDialog):
         gait_form.addRow("Min contact frames:", self.min_contact_frames_spin)
         gait_form.addRow("Max bridge gap:", self.max_bridge_gap_spin)
         gait_form.addRow("Min consecutive steps:", self.min_consecutive_steps_spin)
+        gait_form.addRow("Stillness window:", self.stillness_window_spin)
         gait_form.addRow("Stillness speed threshold:", self.stillness_threshold_spin)
-        gait_form.addRow("Min still frames:", self.min_still_frames_spin)
+        gait_form.addRow("Min still duration:", self.min_still_seconds_spin)
         gait_form.addRow("Stride length outlier ratio:", self.stride_outlier_spin)
 
         triangulation_form = QFormLayout()
@@ -234,8 +247,9 @@ class _PreferencesDialog(QDialog):
             "min_contact_frames": self.min_contact_frames_spin.value(),
             "max_bridge_gap_frames": self.max_bridge_gap_spin.value(),
             "min_consecutive_steps": self.min_consecutive_steps_spin.value(),
-            "stillness_speed_threshold_mm_s": self.stillness_threshold_spin.value(),
-            "min_still_frames": self.min_still_frames_spin.value(),
+            "stillness_window_seconds": self.stillness_window_spin.value(),
+            "stillness_window_speed_mm_s": self.stillness_threshold_spin.value(),
+            "min_still_seconds": self.min_still_seconds_spin.value(),
             "stride_length_outlier_ratio": self.stride_outlier_spin.value(),
         })
         app_settings.set_default_min_corners_extrinsic(self.app_data_dir, self.min_corners_extrinsic_spin.value())

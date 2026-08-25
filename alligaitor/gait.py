@@ -181,19 +181,75 @@ def bridge_short_gaps(xyz: np.ndarray, max_gap: int) -> np.ndarray:
     return xyz
 
 
+def pose_sampling_fps(times: np.ndarray) -> float:
+    """Frames per second of a ``pose_3d`` time column.
+
+    ``pose_3d`` is sampled uniformly at the slowest camera's frame rate
+    (see :func:`alligaitor.pipeline.run_session`), so the median step
+    between consecutive times recovers that rate exactly. Read from the
+    data rather than passed in, so a seconds-valued threshold means the
+    same real duration on any rig -- taken over the median (not the
+    first pair) so a frame missing from the CSV entirely can't skew it.
+    """
+    dt = np.diff(times)
+    dt = dt[np.isfinite(dt) & (dt > 0)]
+    if dt.size == 0:
+        raise ValueError("pose_3d times contain no usable frame interval; cannot determine fps.")
+    return 1.0 / float(np.median(dt))
+
+
+def windowed_body_speed(times: np.ndarray, xyz: np.ndarray, window_s: float) -> np.ndarray:
+    """Per-frame translation speed, in mm/s, measured across a window
+    centered on each frame rather than between adjacent frames.
+
+    Frame-to-frame speed of a single triangulated node is dominated by
+    reconstruction jitter whenever the animal is at rest: measured on
+    real trials, ``mid-back`` swings +/-12mm while the rat stands
+    perfectly still, which at ~12.5fps pose sampling reads as 150-225
+    mm/s -- higher than any threshold that would still fall below a real
+    walking speed, so "has it stopped?" simply cannot be asked one frame
+    at a time. Net displacement between the window's outermost
+    triangulated frames cancels that jitter (the node returns to nearly
+    the same place) while leaving genuine translation untouched.
+
+    ``NaN`` on frames whose window holds fewer than two triangulated
+    frames, or spans no time at all.
+    """
+    n = len(xyz)
+    half = max(1, int(round(window_s * pose_sampling_fps(times) / 2.0)))
+    valid = ~np.isnan(xyz).any(axis=1)
+    speed = np.full(n, np.nan)
+    for i in range(n):
+        lo, hi = max(0, i - half), min(n - 1, i + half)
+        idx = np.flatnonzero(valid[lo : hi + 1])
+        if idx.size < 2:
+            continue
+        a, b = lo + int(idx[0]), lo + int(idx[-1])
+        span = times[b] - times[a]
+        if not span > 0:
+            continue
+        speed[i] = float(np.linalg.norm(xyz[b] - xyz[a]) / span)
+    return speed
+
+
 def active_window(times: np.ndarray, ref_xyz: np.ndarray, config: GaitConfig) -> Tuple[int, int]:
     """First/last frame index of sustained whole-body motion.
 
-    Trims any leading/trailing run of at least ``config.min_still_frames``
-    frames whose whole-body (reference node) frame-to-frame speed stays
-    below ``config.stillness_speed_threshold_mm_s`` -- e.g. a rat that
-    stops moving well before the recording ends, whose paws can then
-    jitter across the (much more sensitive) per-paw stance-speed
-    threshold and look like a run of real steps taken in place. A brief
-    slowdown in the middle of the trial isn't trimmed, only a run
-    bordering either end. Falls back to the full triangulated range if
-    the whole trial reads as "still" by this threshold, rather than
-    collapsing to an empty window.
+    Trims any leading/trailing stretch of at least
+    ``config.min_still_seconds`` whose whole-body (reference node)
+    windowed speed (see :func:`windowed_body_speed`) stays below
+    ``config.stillness_window_speed_mm_s`` -- e.g. a rat that stops
+    moving well before the recording ends, whose paws can then jitter
+    across the (much more sensitive) per-paw stance-speed threshold and
+    look like one long stance, or a run of real steps taken in place. A
+    brief slowdown in the middle of the trial isn't trimmed, only a
+    stretch bordering either end. Falls back to the full triangulated
+    range if the whole trial reads as "still" by this threshold, rather
+    than collapsing to an empty window.
+
+    A frame with no windowed speed at all (too little triangulated data
+    nearby) counts as moving, not as still: "unknown" should never be
+    grounds for throwing frames away.
     """
     bridged = bridge_short_gaps(ref_xyz, config.max_bridge_gap_frames)
     valid = ~np.isnan(bridged).any(axis=1)
@@ -205,25 +261,23 @@ def active_window(times: np.ndarray, ref_xyz: np.ndarray, config: GaitConfig) ->
         )
     first, last = int(valid_idx[0]), int(valid_idx[-1])
 
-    speed = np.full(len(bridged), np.nan)
-    disp = np.linalg.norm(bridged[1:] - bridged[:-1], axis=1)
-    dt = times[1:] - times[:-1]
-    with np.errstate(invalid="ignore", divide="ignore"):
-        speed[1:] = disp / dt
-    moving = speed >= config.stillness_speed_threshold_mm_s
+    speed = windowed_body_speed(times, bridged, config.stillness_window_seconds)
+    with np.errstate(invalid="ignore"):
+        still = speed < config.stillness_window_speed_mm_s  # NaN -> False
+    min_still_frames = max(1, int(round(config.min_still_seconds * pose_sampling_fps(times))))
 
     start = first
     m = first
-    while m < last and not moving[m + 1]:
+    while m < last and still[m]:
         m += 1
-    if m - first >= config.min_still_frames:
+    if m - first >= min_still_frames:
         start = m
 
     end = last
     k = last
-    while k > first and not moving[k]:
+    while k > first and still[k]:
         k -= 1
-    if last - k >= config.min_still_frames:
+    if last - k >= min_still_frames:
         end = k
 
     if start >= end:
@@ -328,6 +382,35 @@ def _raw_stance_candidates(
         runs.append((start, n - 1))
 
     return valid, speed, runs
+
+
+def _drop_window_clipped_stances(events: PawEvents, start: int, end: int) -> PawEvents:
+    """Drop stance phases whose touchdown or liftoff is the active
+    window's boundary rather than a detected event.
+
+    Paw positions are masked to the active window (see
+    :func:`active_window`) before stance detection, so a paw already
+    planted when the window opens -- or still planted when it closes --
+    yields a stance phase with a synthetic endpoint: the mask edge, not
+    a real touchdown or liftoff. The common case is the rat coming to
+    rest, where the paw plants and simply never lifts again (measured on
+    359a-BL: the right hind paw sits within 1mm from f87 through f100,
+    and its "stance" appears to end only because the window does).
+
+    Such a phase is not a completed ground contact. Its duration is
+    whatever the window happened to cut it to, so counting it inflates
+    ground contact time and pads a qualifying run with a step that never
+    happened -- and because it is dropped on the endpoint being
+    synthetic rather than on where the edge fell, this stays correct
+    whether the trim lands a frame early or a frame late.
+    """
+    keep = (events.touchdown_frames > start) & (events.liftoff_frames < end)
+    return PawEvents(
+        touchdown_frames=events.touchdown_frames[keep],
+        liftoff_frames=events.liftoff_frames[keep],
+        touchdown_times=events.touchdown_times[keep],
+        liftoff_times=events.liftoff_times[keep],
+    )
 
 
 def _detect_paw_events(times: np.ndarray, xyz: np.ndarray, config: GaitConfig) -> PawEvents:
@@ -577,10 +660,13 @@ def restrict_to_consecutive_runs(
     :attr:`alligaitor.config.GaitConfig.min_consecutive_steps` and
     :func:`_qualifying_runs`) -- an isolated good detection outside any
     such run doesn't feed the averages, and a paw with no qualifying run
-    at all reports ``NaN``. ``trial.paw_events`` (every detected event,
-    whether or not it ended up counted) is left untouched, so the
-    validation video and raw event log still show everything that was
-    actually detected -- only the summary numbers are restricted.
+    at all reports ``NaN``. ``trial.paw_events`` (every stance phase
+    :func:`compute_trial_metrics` kept, whether or not it ended up
+    counted here) is left untouched, so the validation video and raw
+    event log still show everything that was treated as ground contact
+    -- only the summary numbers are restricted. Phases clipped by the
+    active window's edge are already gone by this point, dropped at
+    detection time (see :func:`_drop_window_clipped_stances`).
 
     Args:
         trial: Already-computed metrics (see :func:`compute_trial_metrics`).
@@ -723,7 +809,15 @@ def compute_trial_metrics(
         xyz[end + 1 :] = np.nan
         bridged[paw] = bridge_short_gaps(xyz, config.max_bridge_gap_frames)
 
-    events = {paw: _detect_paw_events(times, bridged[paw], config) for paw in PAW_NODES}
+    # A stance touching either edge of the active window was cut by the
+    # masking above rather than by a real liftoff/touchdown, so it isn't
+    # a completed ground contact -- see _drop_window_clipped_stances.
+    events = {
+        paw: _drop_window_clipped_stances(
+            _detect_paw_events(times, bridged[paw], config), start, end
+        )
+        for paw in PAW_NODES
+    }
 
     stride_length_mm, step_length_mm, ground_contact_time_s = {}, {}, {}
     n_contacts, n_strides, n_steps = {}, {}, {}

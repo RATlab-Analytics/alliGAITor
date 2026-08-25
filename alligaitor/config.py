@@ -11,6 +11,8 @@ cameras have not been physically moved.
 
 from __future__ import annotations
 
+import dataclasses
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Union
@@ -211,26 +213,47 @@ class GaitConfig:
             qualifying run at all reports ``NaN`` rather than an average
             built from too little (or too suspect) data. See
             :func:`alligaitor.gait.restrict_to_consecutive_runs`.
-        stillness_speed_threshold_mm_s: Below this frame-to-frame speed,
-            in mm/s, the whole-body reference node (see
-            ``alligaitor.gait.REFERENCE_NODE``) counts as not translating.
-            Used to trim any leading/trailing stretch where the rat has
-            stopped moving -- once the body itself is stationary, a
-            paw's own position can still jitter across
+        stillness_window_seconds: Width, in seconds, of the window the
+            whole-body speed below is measured across (see
+            :func:`alligaitor.gait.windowed_body_speed`). Frame-to-frame
+            speed of a single node is useless for this: measured on real
+            trials, ``mid-back`` swings +/-12mm from reconstruction
+            jitter alone while the rat stands still, which at ~12.5fps
+            pose sampling reads as 150-225 mm/s -- above any threshold
+            that would still sit below a real walking speed. Net
+            displacement across a window cancels that jitter (the node
+            comes back to nearly the same place) while leaving genuine
+            translation untouched. Defaults to ``0.4``: trimmed the same
+            frames at ``0.32`` across every measured trial, so it isn't
+            balanced on a knife's edge, while ``0.48`` started eating
+            genuine slow walking on the slowest trial.
+        stillness_window_speed_mm_s: Below this whole-body speed, in
+            mm/s, measured across ``stillness_window_seconds`` (not
+            between adjacent frames), the reference node (see
+            ``alligaitor.gait.REFERENCE_NODE``) counts as not
+            translating. Used to trim any leading/trailing stretch where
+            the rat has stopped moving -- once the body itself is
+            stationary, a paw's own position can still jitter across
             ``speed_threshold_mm_s`` from tracking noise alone, which
             would otherwise look like a run of real steps in place. This
-            is a much lower bar than ``speed_threshold_mm_s``: it's
-            asking whether the *animal* is translating at all, not
-            whether one paw is currently planted mid-stride. Starting
-            default, not derived from measured data the way
-            ``min_contact_frames`` was -- tune against real trials with
+            asks whether the *animal* is translating at all, not whether
+            one paw is currently planted mid-stride, so it is not
+            comparable to ``speed_threshold_mm_s`` -- the two measure
+            different things over different spans. Defaults to ``100``,
+            which separated stopped stretches (windowed speed under
+            ~80) from walking (240+) on every measured trial, including
+            the slowest. Tune against real trials with
             ``scripts/debug_gait.py``.
-        min_still_frames: How many consecutive frames of sub-threshold
-            body speed, bordering either end of the trial, counts as
+        min_still_seconds: How long a stretch of sub-threshold body
+            speed, bordering either end of the trial, counts as
             "stopped" rather than an ordinary brief slowdown mid-stride.
-            Only a run touching the very start or very end of the trial
-            is ever trimmed -- a pause in the middle is left alone. See
-            :func:`alligaitor.gait.restrict_to_consecutive_runs`.
+            Only a stretch touching the very start or very end of the
+            trial is ever trimmed -- a pause in the middle is left
+            alone. In seconds rather than frames because ``pose_3d`` is
+            sampled at the slowest camera's frame rate (see
+            :func:`alligaitor.pipeline.run_session`), so a frame count
+            means a different real duration on every rig. See
+            :func:`alligaitor.gait.active_window`.
         stride_length_outlier_ratio: A stride longer than this many times
             a paw's own median stride length in the trial is flagged as
             likely hiding a missed step -- e.g. a real stance the speed
@@ -246,9 +269,45 @@ class GaitConfig:
     min_contact_frames: int = 1
     max_bridge_gap_frames: int = 4
     min_consecutive_steps: int = 5
-    stillness_speed_threshold_mm_s: float = 20.0
-    min_still_frames: int = 15
+    stillness_window_seconds: float = 0.4
+    stillness_window_speed_mm_s: float = 100.0
+    min_still_seconds: float = 0.4
     stride_length_outlier_ratio: float = 1.8
+
+    @classmethod
+    def from_raw(cls, raw: Optional[Dict[str, object]]) -> "GaitConfig":
+        """Build from a config file's (or ``settings.json``'s) ``gait``
+        mapping, dropping keys that are no longer fields instead of
+        raising.
+
+        Keeps a ``config.yaml`` or ``app_data/settings.json`` written
+        before a tunable was renamed loadable -- a stale key would
+        otherwise be a ``TypeError`` on every load. Anything dropped
+        falls back to that field's current default, warned about rather
+        than done silently.
+
+        Both stillness tunables were renamed when
+        :func:`alligaitor.gait.active_window` moved to a windowed speed:
+        ``min_still_frames`` -> ``min_still_seconds`` (a frame count
+        means a different duration on every rig), and
+        ``stillness_speed_threshold_mm_s`` ->
+        ``stillness_window_speed_mm_s``. The second is a rename on
+        purpose even though the units didn't change: it compares against
+        a speed measured across ``stillness_window_seconds`` rather than
+        between adjacent frames, so an old file's value is off by more
+        than an order of magnitude and silently honoring it would leave
+        the check doing nothing.
+        """
+        values = dict(raw or {})
+        known = {f.name for f in dataclasses.fields(cls)}
+        unknown = sorted(set(values) - known)
+        if unknown:
+            warnings.warn(
+                f"Ignoring unrecognized gait setting(s) {unknown}; using current defaults "
+                "instead. Re-save this job's config (or Settings > Preferences) to clear this.",
+                stacklevel=2,
+            )
+        return cls(**{k: v for k, v in values.items() if k in known})
 
 
 @dataclass
@@ -365,7 +424,7 @@ class PipelineConfig:
             if output_xlsx_raw
             else base_dir / "reports" / f"{name}.gait_metrics.xlsx"
         )
-        gait = GaitConfig(**raw.get("gait", {}))
+        gait = GaitConfig.from_raw(raw.get("gait"))
 
         discovery_raw = raw.get("discovery")
         discovery = None
@@ -435,8 +494,9 @@ class PipelineConfig:
                 "min_contact_frames": self.gait.min_contact_frames,
                 "max_bridge_gap_frames": self.gait.max_bridge_gap_frames,
                 "min_consecutive_steps": self.gait.min_consecutive_steps,
-                "stillness_speed_threshold_mm_s": self.gait.stillness_speed_threshold_mm_s,
-                "min_still_frames": self.gait.min_still_frames,
+                "stillness_window_seconds": self.gait.stillness_window_seconds,
+                "stillness_window_speed_mm_s": self.gait.stillness_window_speed_mm_s,
+                "min_still_seconds": self.gait.min_still_seconds,
                 "stride_length_outlier_ratio": self.gait.stride_length_outlier_ratio,
             },
         }
