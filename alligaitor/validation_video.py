@@ -53,6 +53,14 @@ _FOOTPRINT_COLOR_FOREPAW = (255, 0, 255)  # magenta
 _FOOTPRINT_COLOR_HINDPAW = (255, 255, 0)  # cyan
 _DROP_WARNING_COLOR = (0, 0, 220)
 
+# A footprint left over from an earlier crossing (see find_crossings) is drawn
+# in this flat gray at reduced opacity instead of its usual fore/hindpaw
+# color, once a later crossing has started -- so the accumulating trail from
+# an out-and-back recording doesn't read as one continuous (and geometrically
+# meaningless, since direction of travel differs) crossing.
+_FOOTPRINT_FADED_COLOR = (120, 120, 120)
+_FOOTPRINT_FADED_ALPHA = 0.35
+
 _NODE_RADIUS = 5
 _FOOTPRINT_RADIUS = 4
 
@@ -124,42 +132,89 @@ def _draw_drop_warning(panel: np.ndarray, paws: List[str]) -> None:
     cv2.putText(panel, text, (x0, th + 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
 
+def _crossing_index_of_frame(frame: int, crossing_starts: np.ndarray) -> int:
+    """Which crossing (index into ``crossing_starts``) ``frame`` belongs
+    to -- the last crossing whose start is at or before it.
+
+    Used two ways: once per footprint, to fix which crossing *produced*
+    it (its touchdown frame always falls inside that crossing's own
+    window, so this is exact, not a guess); and once per rendered frame,
+    to find the *current* crossing being watched, against which a
+    footprint's own crossing is compared to decide whether it's faded
+    (see :func:`export_validation_video`). A single-crossing recording
+    has one start at or before every frame, so this is always ``0`` and
+    nothing ever fades -- unchanged from before crossings existed.
+    """
+    return max(0, int(np.searchsorted(crossing_starts, frame, side="right")) - 1)
+
+
 def _reproject_footprints(
     positions: Dict[str, np.ndarray],
     trial: TrialMetrics,
     cgroup: CameraGroup,
     cam_index: Dict[str, int],
     crop_offset: Dict[str, Tuple[float, float]],
-) -> Dict[str, List[Tuple[int, str, Tuple[float, float]]]]:
-    """Per role, a list of ``(touchdown_frame, paw, (px, py))`` footprint
-    markers -- ``paw`` is carried through so each marker can be colored by
-    fore/hind paw category (see :func:`_footprint_color`).
+    crossing_starts: np.ndarray,
+) -> Dict[str, List[Tuple[int, str, int, Tuple[float, float]]]]:
+    """Per role, a list of ``(touchdown_frame, paw, crossing_index, (px, py))``
+    footprint markers -- ``paw`` is carried through so each marker can be
+    colored by fore/hind paw category (see :func:`_footprint_color`), and
+    ``crossing_index`` (see :func:`_crossing_index_of_frame`) so a marker
+    from an earlier crossing than the one currently playing can be faded.
 
     Reprojected once for the whole video (the rig is static), not per frame.
     """
     entries = [
-        (paw, touchdown_frame)
+        (paw, touchdown_frame, _crossing_index_of_frame(touchdown_frame, crossing_starts))
         for paw in PAW_NODES
         for touchdown_frame in trial.paw_events[paw].touchdown_frames
     ]
-    footprints_by_role: Dict[str, List[Tuple[int, str, Tuple[float, float]]]] = {role: [] for role in CAMERA_ROLES}
+    footprints_by_role: Dict[str, List[Tuple[int, str, int, Tuple[float, float]]]] = {
+        role: [] for role in CAMERA_ROLES
+    }
     if not entries:
         return footprints_by_role
 
-    pts3d = np.stack([positions[paw][frame] for paw, frame in entries])
+    pts3d = np.stack([positions[paw][frame] for paw, frame, _ in entries])
     proj = cgroup.project(pts3d)  # (n_cams, n_points, 2)
     for role in CAMERA_ROLES:
         cam_proj = proj[cam_index[role]]
         offset = crop_offset[role]
-        for (paw, frame), (px, py) in zip(entries, cam_proj):
-            footprints_by_role[role].append((int(frame), paw, (float(px - offset[0]), float(py - offset[1]))))
+        for (paw, frame, crossing_idx), (px, py) in zip(entries, cam_proj):
+            footprints_by_role[role].append(
+                (int(frame), paw, crossing_idx, (float(px - offset[0]), float(py - offset[1])))
+            )
     return footprints_by_role
 
 
-def _draw_marker(frame: np.ndarray, xy: Tuple[float, float], radius: int, color, thickness: int = -1) -> None:
+def _draw_marker(
+    frame: np.ndarray, xy: Tuple[float, float], radius: int, color, thickness: int = -1, alpha: float = 1.0
+) -> None:
+    """Draw one marker, alpha-blended into the frame instead of drawn
+    solid when ``alpha < 1`` -- used to fade an earlier crossing's
+    footprints toward the video underneath them rather than just toward
+    a flat color, so they read as "left over" rather than as a still-live
+    marker in a different color.
+
+    Blending is done on a small region-of-interest around the circle,
+    not the whole panel, so fading many accumulated markers stays cheap
+    regardless of panel size.
+    """
     x, y = int(round(xy[0])), int(round(xy[1]))
-    if -radius <= x <= frame.shape[1] + radius and -radius <= y <= frame.shape[0] + radius:
+    h, w = frame.shape[:2]
+    if not (-radius <= x <= w + radius and -radius <= y <= h + radius):
+        return
+    if alpha >= 1.0:
         cv2.circle(frame, (x, y), radius, color, thickness)
+        return
+    x0, x1 = max(x - radius - 1, 0), min(x + radius + 2, w)
+    y0, y1 = max(y - radius - 1, 0), min(y + radius + 2, h)
+    if x1 <= x0 or y1 <= y0:
+        return
+    roi = frame[y0:y1, x0:x1]
+    overlay = roi.copy()
+    cv2.circle(overlay, (x - x0, y - y0), radius, color, thickness)
+    cv2.addWeighted(overlay, alpha, roi, 1 - alpha, 0, dst=roi)
 
 
 _STRIP_HEIGHT = 32
@@ -173,6 +228,7 @@ _LEGEND_ENTRIES = (
     ("reprojection disagreement", _DISAGREEMENT_COLOR),
     ("forepaw footprint", _FOOTPRINT_COLOR_FOREPAW),
     ("hindpaw footprint", _FOOTPRINT_COLOR_HINDPAW),
+    ("footprint (earlier crossing)", _FOOTPRINT_FADED_COLOR),
 )
 
 
@@ -268,6 +324,12 @@ def export_validation_video(
     """
     times, positions, errors = gait.load_pose_3d(csv_path)
     n_frames = len(times)
+    crossings = [trial] if isinstance(trial, TrialMetrics) else list(trial)
+    crossing_starts = np.array(
+        sorted(t.crossing_window[0] for t in crossings if t.crossing_window is not None)
+    )
+    if crossing_starts.size == 0:
+        crossing_starts = np.array([0])  # no window info (e.g. a hand-built trial) -- treat as one crossing
     trial = _merge_crossings(trial)
     planted = gait.planted_mask(trial, n_frames)
 
@@ -278,7 +340,9 @@ def export_validation_video(
     reference_role = min(fps_by_role, key=fps_by_role.get)
     crop_offset = {role: cropping.crop_offset_for_video(session.videos[role]) for role in CAMERA_ROLES}
 
-    footprints_by_role = _reproject_footprints(positions, trial, cgroup, cam_index, crop_offset)
+    footprints_by_role = _reproject_footprints(
+        positions, trial, cgroup, cam_index, crop_offset, crossing_starts
+    )
     drop_warnings_by_role = _camera_drop_warnings(session, times, positions, config)
 
     caps = {role: cv2.VideoCapture(str(session.videos[role])) for role in CAMERA_ROLES}
@@ -291,6 +355,7 @@ def export_validation_video(
     try:
         for i in range(n_frames):
             t = times[i]
+            current_crossing = _crossing_index_of_frame(i, crossing_starts)
             valid_nodes = [
                 node for node, arr in positions.items() if not np.isnan(arr[i]).any()
             ]
@@ -322,8 +387,15 @@ def export_validation_video(
                         pb = tuple(int(round(c)) for c in node_px[b])
                         cv2.line(panel, pa, pb, _EDGE_COLOR, 1, cv2.LINE_AA)
 
-                for touchdown_frame, paw, xy in footprints_by_role.get(role, []):
-                    if touchdown_frame <= i:
+                for touchdown_frame, paw, footprint_crossing, xy in footprints_by_role.get(role, []):
+                    if touchdown_frame > i:
+                        continue
+                    if footprint_crossing < current_crossing:
+                        _draw_marker(
+                            panel, xy, _FOOTPRINT_RADIUS, _FOOTPRINT_FADED_COLOR,
+                            alpha=_FOOTPRINT_FADED_ALPHA,
+                        )
+                    else:
                         _draw_marker(panel, xy, _FOOTPRINT_RADIUS, _footprint_color(paw))
 
                 for node, xy in node_px.items():
