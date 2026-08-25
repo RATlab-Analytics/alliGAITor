@@ -18,10 +18,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, QModelIndex
-from PySide6.QtGui import QActionGroup, QTextCursor
+from PySide6.QtGui import QActionGroup, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTableView,
-    QPushButton, QPlainTextEdit, QDialog, QDialogButtonBox, QFormLayout,
+    QPushButton, QTextEdit, QDialog, QDialogButtonBox, QFormLayout,
     QLineEdit, QMessageBox, QAbstractItemView, QSplitter,
     QProgressBar, QLabel, QTabWidget, QSpinBox, QDoubleSpinBox, QMenu,
 )
@@ -32,6 +32,7 @@ from add_job_dialog import AddJobDialog
 from group_config_dialog import GroupConfigDialog
 from batch_runner import BatchRunner
 from about_dialog import AboutDialog
+from validation_list_dialog import ValidationListDialog
 import app_settings
 import reset as reset_module
 
@@ -286,14 +287,28 @@ class MainWindow(QMainWindow):
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setAlternatingRowColors(True)
-        self.table.doubleClicked.connect(lambda _index: self._on_edit_job())
+        self.table.doubleClicked.connect(lambda _index: self._on_table_double_clicked())
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._on_table_context_menu)
 
-        self.log_panel = QPlainTextEdit()
+        # QTextEdit rather than QPlainTextEdit: sleap-nn's tqdm progress
+        # bar is ANSI-colored, and rendering that (see
+        # alligaitor.ansi_html/_on_progress_line) needs a rich-text
+        # widget. Dark background + monospace font so the colors read
+        # the way they would in a real terminal and the bar's
+        # '|####..|'-style characters stay aligned; QTextEdit has no
+        # setMaximumBlockCount (that's QPlainTextEdit-only), so
+        # _trim_log_panel() does the equivalent by hand.
+        self.log_panel = QTextEdit()
         self.log_panel.setReadOnly(True)
-        self.log_panel.setMaximumBlockCount(5000)
         self.log_panel.setPlaceholderText("Run log will appear here…")
+        self.log_panel.setStyleSheet(
+            "QTextEdit {"
+            " background-color: #1e1e1e; color: #d4d4d4;"
+            " font-family: Menlo, Consolas, 'Courier New', monospace;"
+            " font-size: 12px;"
+            "}"
+        )
 
         self.load_btn = QPushButton("Load Jobs…")
         self.edit_btn = QPushButton("Edit Job…")
@@ -331,6 +346,14 @@ class MainWindow(QMainWindow):
 
         top = QWidget()
         top_layout = QVBoxLayout(top)
+        # No left/right margins: `top` (holding the button row and the
+        # table) and log_panel are sibling children of the splitter
+        # below, but only `top` wraps its content in its own QVBoxLayout
+        # -- that layout's default margins were insetting the table by
+        # ~9px on each side while log_panel, added straight to the
+        # splitter with no such wrapper, had none, so the two ended up
+        # different widths despite both notionally spanning "the window".
+        top_layout.setContentsMargins(0, top_layout.contentsMargins().top(), 0, top_layout.contentsMargins().bottom())
         top_layout.addLayout(btn_row)
         top_layout.addLayout(progress_row)
         top_layout.addWidget(self.table)
@@ -468,6 +491,9 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         menu.addAction("Run Selected Job(s)", self._on_run_selected)
         menu.addSeparator()
+        validation_action = menu.addAction("View Validation…", self._on_view_validation_selected)
+        validation_action.setEnabled(len(jobs) == 1 and jobs[0].status == JobStatus.DONE)
+        menu.addSeparator()
         menu.addAction("Remove Selected", self._on_remove_selected)
         menu.addSeparator()
 
@@ -526,6 +552,24 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Job running", "Can't edit a job while it's running.")
             return
         self._open_config_editor(job)
+
+    def _on_table_double_clicked(self):
+        """A completed job opens the validation viewer, matching the
+        double-click's meaning in every other status ("show me what this
+        row means") -- everything else still opens the config editor."""
+        job = self._selected_job()
+        if job is not None and job.status == JobStatus.DONE:
+            self._open_validation_view(job)
+        else:
+            self._on_edit_job()
+
+    def _open_validation_view(self, job: Job):
+        ValidationListDialog(job, parent=self).exec()
+
+    def _on_view_validation_selected(self):
+        job = self._selected_job()
+        if job is not None and job.status == JobStatus.DONE:
+            self._open_validation_view(job)
 
     def _on_remove_selected(self):
         jobs = self._selected_jobs()
@@ -687,6 +731,7 @@ class MainWindow(QMainWindow):
         self.runner = BatchRunner(jobs, self.repo_dir, device="auto", tracking=False, parent=self)
         self.runner.log.connect(self._log)
         self.runner.progress.connect(self._on_progress_line)
+        self.runner.progress_closed.connect(self._on_progress_closed)
         self.runner.job_started.connect(self._on_job_started)
         self.runner.job_progress.connect(self._on_job_progress)
         self.runner.job_finished.connect(self._on_job_finished)
@@ -800,35 +845,94 @@ class MainWindow(QMainWindow):
 
     # -- logging --
 
+    def _append_plain_line(self, text: str):
+        """QTextEdit has no appendPlainText() (that's QPlainTextEdit-only,
+        and this panel needs to be QTextEdit -- see its construction);
+        this reproduces the same "always start a new paragraph, insert
+        literal (non-HTML) text" behavior by hand.
+
+        Explicitly resets the cursor's character format first: a colored
+        progress-bar redraw (see _on_progress_line) very often leaves a
+        color "open" at the end of its content -- real tqdm output
+        constantly does this, since the color reset code (if any) is
+        wherever tqdm itself put it, not necessarily right at the end of
+        the line -- and insertBlock() alone does NOT clear that; it
+        carries the current character format into the new paragraph.
+        insertText() (unlike insertHtml() with genuinely unstyled
+        content, which does get a clean default) then uses that stale
+        format verbatim, so without this reset every plain log line
+        after any colored one would silently inherit its color.
+        """
+        cursor = self.log_panel.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        if not self.log_panel.document().isEmpty():
+            cursor.insertBlock()
+        cursor.setCharFormat(QTextCharFormat())
+        cursor.insertText(text)
+        self.log_panel.setTextCursor(cursor)
+        self.log_panel.ensureCursorVisible()
+
+    def _trim_log_panel(self, max_blocks: int = 5000):
+        """QPlainTextEdit's setMaximumBlockCount() has no QTextEdit
+        equivalent -- this drops the oldest paragraphs by hand once the
+        document grows past `max_blocks`, so an overnight run's log
+        doesn't grow unbounded."""
+        doc = self.log_panel.document()
+        excess = doc.blockCount() - max_blocks
+        if excess <= 0:
+            return
+        cursor = QTextCursor(doc)
+        cursor.movePosition(QTextCursor.Start)
+        cursor.movePosition(QTextCursor.NextBlock, QTextCursor.KeepAnchor, excess)
+        cursor.removeSelectedText()
+
     def _log(self, message: str):
-        self.log_panel.appendPlainText(message)
+        self._append_plain_line(message)
         # A discrete message always ends any progress-bar redraw in
         # progress -- the next one (a different camera role's inference,
         # most likely) should start its own new line rather than
         # overwriting whatever was just logged here.
         self._progress_line_open = False
+        self._trim_log_panel()
 
-    def _on_progress_line(self, message: str):
+    def _on_progress_line(self, html_message: str):
         """Live inference-progress updates (see
-        alligaitor.subprocess_streaming's `progress` callback) -- redraws
-        the same line in place, the same way the tqdm bar this mirrors
-        does in a real terminal, instead of adding a new line to the log
-        for every redraw."""
+        alligaitor.subprocess_streaming's `progress` callback, HTML-
+        rendered by alligaitor.ansi_html since html_progress=True is
+        what the batch worker passes) -- redraws the same line in place,
+        the same colored way the tqdm bar this mirrors does in a real
+        terminal, instead of adding a new line to the log for every
+        redraw."""
+        cursor = self.log_panel.textCursor()
+        cursor.movePosition(QTextCursor.End)
         if self._progress_line_open:
-            cursor = self.log_panel.textCursor()
-            cursor.movePosition(QTextCursor.End)
             # Selects from the end of the document back to the start of
             # the last line (not the whole document) -- KeepAnchor stops
             # the selection from also eating the newline before it, so
-            # only that one line's text gets replaced.
+            # only that one line's content gets replaced.
             cursor.movePosition(QTextCursor.StartOfBlock, QTextCursor.KeepAnchor)
             cursor.removeSelectedText()
-            cursor.insertText(message)
-            self.log_panel.setTextCursor(cursor)
-        else:
-            self.log_panel.appendPlainText(message)
-            self._progress_line_open = True
+        elif not self.log_panel.document().isEmpty():
+            cursor.insertBlock()
+        cursor.insertHtml(html_message)
+        self.log_panel.setTextCursor(cursor)
+        self._progress_line_open = True
         self.log_panel.ensureCursorVisible()
+        self._trim_log_panel()
+
+    def _on_progress_closed(self):
+        """A redrawn progress line's definitive final state was just
+        shown (see BatchRunner.progress_closed /
+        alligaitor.subprocess_streaming's `on_redraw_closed`) -- ends
+        that redraw so the *next* progress update starts a fresh line
+        instead of immediately overwriting the state that was just
+        displayed. Without this, a session that prints more than one
+        tqdm bar in sequence (e.g. one for loading, a separate one for
+        predicting) would have the second bar's very first redraw
+        instantly overwrite the first bar's just-shown completion --
+        which reads as that line flashing before the "real" bar
+        reappears in its place, even though nothing was actually lost."""
+        self._progress_line_open = False
 
     # -- shutdown --
 

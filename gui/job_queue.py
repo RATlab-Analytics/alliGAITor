@@ -120,6 +120,10 @@ class Job:
     def reports_dir(self) -> Path:
         return Path(self.output_folder) / "reports"
 
+    @property
+    def validation_dir(self) -> Path:
+        return Path(self.output_folder) / "validation"
+
     def to_dict(self) -> dict:
         d = asdict(self)
         d["status"] = self.status.value

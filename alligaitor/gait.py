@@ -758,6 +758,86 @@ def compute_trial_metrics(
     )
 
 
+@dataclass
+class PawWindow:
+    """The single time window a validation-video viewer should highlight
+    for one paw: its longest qualifying run (see :func:`_qualifying_runs`)
+    if it has one, else its longest raw detected run regardless of length
+    -- exactly "the used run, or the longest run if none cross the
+    threshold" a reviewer needs to see. ``usable`` mirrors which case this
+    is, so a caller doesn't have to re-derive it from ``_paw_has_no_usable_run``.
+    """
+
+    start_frame: int
+    end_frame: int
+    start_s: float
+    end_s: float
+    duration_s: float
+    usable: bool
+
+
+def _longest_raw_run(events: PawEvents) -> Optional[Tuple[int, int]]:
+    """Index range (into `events`' arrays) of the longest single detected
+    stance phase, or ``None`` if nothing was ever detected at all. Used as
+    the fallback window for a paw with zero qualifying runs -- there's no
+    "used" run to show, but showing nothing at all would leave a reviewer
+    unable to tell where the pipeline even looked."""
+    n = events.touchdown_frames.size
+    if n == 0:
+        return None
+    durations = events.liftoff_times - events.touchdown_times
+    i = int(np.argmax(durations))
+    return i, i
+
+
+def paw_usability_windows(
+    trial: TrialMetrics,
+    times: np.ndarray,
+    positions: Dict[str, np.ndarray],
+    config: GaitConfig,
+) -> Dict[str, Optional[PawWindow]]:
+    """Per paw, the single window a validation-video viewer should
+    highlight -- the longest qualifying run (see :func:`_qualifying_runs`,
+    the same run-detection :func:`restrict_to_consecutive_runs` uses for
+    its averages) if the paw has one, else its longest raw detected stance
+    phase. ``None`` only when the paw was never detected planted at all in
+    this trial.
+    """
+    _, _, forward, (start, end) = _crossing_time_and_speed(times, positions[REFERENCE_NODE], config)
+
+    windows: Dict[str, Optional[PawWindow]] = {}
+    for paw in PAW_NODES:
+        events = trial.paw_events[paw]
+        xyz = positions[paw].copy()
+        xyz[:start] = np.nan
+        xyz[end + 1 :] = np.nan
+        bridged = bridge_short_gaps(xyz, config.max_bridge_gap_frames)
+        runs = _qualifying_runs(
+            events, bridged, forward, config.min_consecutive_steps, config.stride_length_outlier_ratio
+        )
+
+        if runs:
+            s, e = max(runs, key=lambda r: events.liftoff_times[r[1]] - events.touchdown_times[r[0]])
+            usable = True
+        else:
+            fallback = _longest_raw_run(events)
+            if fallback is None:
+                windows[paw] = None
+                continue
+            s, e = fallback
+            usable = False
+
+        windows[paw] = PawWindow(
+            start_frame=int(events.touchdown_frames[s]),
+            end_frame=int(events.liftoff_frames[e]),
+            start_s=float(events.touchdown_times[s]),
+            end_s=float(events.liftoff_times[e]),
+            duration_s=float(events.liftoff_times[e] - events.touchdown_times[s]),
+            usable=usable,
+        )
+    return windows
+
+
 def planted_mask(trial: TrialMetrics, n_frames: int) -> Dict[str, np.ndarray]:
     """Per-paw boolean array, ``True`` on frames within a detected stance phase.
 
@@ -825,7 +905,10 @@ _STAT_COLUMNS: Tuple[Tuple[str, str, str], ...] = (
     ("n_strides", "Strides (n)", "0"),
     ("n_steps", "Steps (n)", "0"),
 )
-_N_COLUMNS = 1 + len(_STAT_COLUMNS)  # "Paw" + the stat columns
+_NOTES_LABEL = "Notes"
+_N_STAT_COLUMNS = 1 + len(_STAT_COLUMNS)  # "Paw" + the stat columns
+_NOTES_COLUMN = _N_STAT_COLUMNS + 1
+_N_COLUMNS = _NOTES_COLUMN  # "Paw" + the stat columns + Notes
 
 _TITLE_FONT = Font(bold=True, color="FFFFFF", size=12)
 _TITLE_FILL = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
@@ -834,6 +917,8 @@ _HEADER_FONT = Font(bold=True)
 _HEADER_FILL = PatternFill(start_color="DCE6F1", end_color="DCE6F1", fill_type="solid")
 _BAD_FILL = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
 _BAD_FONT = Font(color="9C0006")
+_CLEAR_FILL = PatternFill(fill_type=None)
+_CLEAR_FONT = Font()
 
 
 def _paw_has_no_usable_run(trial: TrialMetrics, paw: str) -> bool:
@@ -878,12 +963,15 @@ def _write_paw_block(
     get_value: Callable[[str, str], float],
     is_bad: Callable[[str], bool],
     stat_columns: Tuple[Tuple[str, str, str], ...] = _STAT_COLUMNS,
+    note_getter: Callable[[str], str] = lambda paw: "",
 ) -> int:
     """Writes one titled block -- crossing time/speed, then a paw x stat
     table -- starting at `start_row`, and returns the row the next block
     should start at. `get_value(stat, paw)` and `is_bad(paw)` abstract
     over "one trial's own numbers" vs. "this rat's per-paw averages" (see
-    write_group_report), so this one function lays out both.
+    write_group_report), so this one function lays out both. `note_getter(paw)`
+    fills the trailing Notes column -- empty by default, used to record why
+    a paw was manually flagged invalid (see :func:`annotate_manual_flag`).
     """
     row = start_row
     title_cell = ws.cell(row=row, column=1, value=title)
@@ -906,6 +994,9 @@ def _write_paw_block(
         cell = ws.cell(row=row, column=col, value=label)
         cell.font = _HEADER_FONT
         cell.fill = _HEADER_FILL
+    notes_header = ws.cell(row=row, column=_NOTES_COLUMN, value=_NOTES_LABEL)
+    notes_header.font = _HEADER_FONT
+    notes_header.fill = _HEADER_FILL
     row += 1
 
     for paw in PAW_NODES:
@@ -916,6 +1007,10 @@ def _write_paw_block(
             name_cell.font = _BAD_FONT
         for col, (stat, _label, fmt) in enumerate(stat_columns, start=2):
             _write_cell(ws, row, col, get_value(stat, paw), fmt, bad=bad)
+        note_cell = ws.cell(row=row, column=_NOTES_COLUMN, value=note_getter(paw) or None)
+        if bad:
+            note_cell.fill = _BAD_FILL
+            note_cell.font = _BAD_FONT
         row += 1
 
     return row + 2  # blank spacer before the next block
@@ -925,6 +1020,7 @@ def _format_sheet(ws):
     ws.column_dimensions["A"].width = 22
     for col in range(2, _N_COLUMNS + 1):
         ws.column_dimensions[get_column_letter(col)].width = 20
+    ws.column_dimensions[get_column_letter(_NOTES_COLUMN)].width = 40
     for row in ws.iter_rows():
         for cell in row:
             if cell.value is not None:
@@ -945,7 +1041,11 @@ def _safe_sheet_name(name: str, used: set) -> str:
     return candidate
 
 
-def write_group_report(trials: List[TrialMetrics], output_path: PathLike) -> None:
+def write_group_report(
+    trials: List[TrialMetrics],
+    output_path: PathLike,
+    manual_flags: Optional[Dict[str, Tuple[set, str]]] = None,
+) -> None:
     """Write one group's gait-metrics workbook: one tab per distinct ``rat_id``.
 
     Each tab stacks one titled block per trial (session) for that rat --
@@ -959,9 +1059,20 @@ def write_group_report(trials: List[TrialMetrics], output_path: PathLike) -> Non
     highlighted; the Average block's per-(paw, stat) means are NaN-aware,
     so a paw's bad crossings don't count against its average from the
     crossings where it did produce something usable.
+
+    Args:
+        manual_flags: Session name -> (flagged paw names, note), carried
+            forward from :func:`alligaitor.validation.load_manual_flags` so
+            a regenerated workbook keeps highlighting a paw a reviewer
+            already flagged invalid by hand, exactly as
+            :func:`annotate_manual_flag` would highlight it on an
+            already-written workbook. A paw already bad from
+            :func:`_paw_has_no_usable_run` stays bad regardless of what's
+            here -- this only ever adds highlighting, never removes it.
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    manual_flags = manual_flags or {}
 
     by_rat: Dict[str, List[TrialMetrics]] = {}
     for trial in trials:
@@ -979,13 +1090,15 @@ def write_group_report(trials: List[TrialMetrics], output_path: PathLike) -> Non
             ws = wb.create_sheet(_safe_sheet_name(rat_id, used_names))
             row = 1
             for trial in rat_trials:
+                flagged_paws, note = manual_flags.get(trial.session_name, (set(), ""))
                 row = _write_paw_block(
                     ws, row,
                     title=f"Session: {trial.session_name}",
                     crossing_time_s=trial.crossing_time_s,
                     average_speed_cm_s=trial.average_speed_mm_s / 10.0,
                     get_value=lambda stat, paw, t=trial: getattr(t, stat)[paw],
-                    is_bad=lambda paw, t=trial: _paw_has_no_usable_run(t, paw),
+                    is_bad=lambda paw, t=trial, fp=flagged_paws: _paw_has_no_usable_run(t, paw) or paw in fp,
+                    note_getter=lambda paw, fp=flagged_paws, n=note: n if paw in fp else "",
                 )
 
             if len(rat_trials) > 1:
@@ -996,10 +1109,91 @@ def write_group_report(trials: List[TrialMetrics], output_path: PathLike) -> Non
                     crossing_time_s=_nanmean([t.crossing_time_s for t in rat_trials]),
                     average_speed_cm_s=_nanmean([t.average_speed_mm_s for t in rat_trials]) / 10.0,
                     get_value=lambda stat, paw: _nanmean([getattr(t, stat)[paw] for t in rat_trials]),
-                    is_bad=lambda paw: all(_paw_has_no_usable_run(t, paw) for t in rat_trials),
+                    is_bad=lambda paw: all(
+                        _paw_has_no_usable_run(t, paw) or paw in manual_flags.get(t.session_name, (set(), ""))[0]
+                        for t in rat_trials
+                    ),
                     stat_columns=avg_stat_columns,
                 )
 
             _format_sheet(ws)
 
     wb.save(output_path)
+
+
+def _find_session_paw_row(ws, session_name: str, paw: str) -> Optional[int]:
+    """Row index of `paw`'s row within the ``"Session: {session_name}"``
+    block on `ws`, or ``None`` if that block or paw row isn't present --
+    e.g. the workbook predates this session, or was regenerated with
+    different sessions. Searches a bounded window below the title row
+    rather than assuming :func:`_write_paw_block`'s exact row offsets, so
+    it keeps working even if that layout changes shape slightly.
+    """
+    title = f"Session: {session_name}"
+    for row in ws.iter_rows(min_col=1, max_col=1):
+        cell = row[0]
+        if cell.value != title:
+            continue
+        for r in range(cell.row + 1, cell.row + 16):
+            if ws.cell(row=r, column=1).value == _PAW_LABELS[paw]:
+                return r
+        return None
+    return None
+
+
+def annotate_manual_flag(
+    xlsx_path: PathLike,
+    rat_id: str,
+    session_name: str,
+    paw: str,
+    auto_usable: bool,
+    flagged: bool,
+    note: str = "",
+) -> bool:
+    """Patch one paw's row in an already-written group workbook to reflect
+    a reviewer's manual flag, without regenerating the whole report from
+    :class:`TrialMetrics`.
+
+    The row is highlighted (and `note` written to its Notes cell) when
+    ``flagged`` or ``not auto_usable`` -- unflagging a paw the automatic
+    detection already called unusable (``auto_usable=False``) leaves it
+    highlighted, since that's a real "no usable run" finding this manual
+    action didn't create and shouldn't be able to erase. Only values/number
+    formats are left untouched; this only ever changes fill/font/notes.
+
+    Returns:
+        ``True`` if the target row was found and patched, ``False`` if the
+        workbook has no matching rat sheet / session block / paw row (the
+        caller should warn rather than assume the flag took effect).
+    """
+    from openpyxl import load_workbook
+
+    xlsx_path = Path(xlsx_path)
+    if not xlsx_path.exists():
+        return False
+
+    wb = load_workbook(xlsx_path)
+    candidate = _safe_sheet_name(rat_id, set())
+    ws = wb[candidate] if candidate in wb.sheetnames else next(
+        (wb[name] for name in wb.sheetnames if name.startswith(candidate[: max(1, len(candidate) - 2)])), None
+    )
+    if ws is None:
+        return False
+
+    row = _find_session_paw_row(ws, session_name, paw)
+    if row is None:
+        return False
+
+    bad = flagged or not auto_usable
+    fill = _BAD_FILL if bad else _CLEAR_FILL
+    font = _BAD_FONT if bad else _CLEAR_FONT
+    for col in range(1, _N_STAT_COLUMNS + 1):
+        cell = ws.cell(row=row, column=col)
+        cell.fill = fill
+        cell.font = font
+    notes_cell = ws.cell(row=row, column=_NOTES_COLUMN, value=(note if flagged else None))
+    notes_cell.fill = fill
+    notes_cell.font = font
+
+    wb.save(xlsx_path)
+    return True

@@ -27,6 +27,7 @@ from job_queue import Job
 class BatchRunner(QObject):
     log = Signal(str)
     progress = Signal(str)                   # same redrawing line updating -- see main_window.py's _on_progress_line
+    progress_closed = Signal()               # a redrawn line's final state was just sent -- start the next one fresh
     job_started = Signal(str)               # job_id
     job_progress = Signal(str, int, int)     # job_id, sessions_done, sessions_total
     job_finished = Signal(str, str, str)     # job_id, status, message
@@ -88,6 +89,8 @@ class BatchRunner(QObject):
             self.log.emit(msg[1])
         elif kind == "progress":
             self.progress.emit(msg[1])
+        elif kind == "progress_closed":
+            self.progress_closed.emit()
         elif kind == "job_started":
             self.job_started.emit(msg[1])
         elif kind == "job_progress":

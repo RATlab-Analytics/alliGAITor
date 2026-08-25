@@ -229,7 +229,7 @@ class GroupConfigDialog(QDialog):
         calib_layout.addWidget(self.calib_existing_widget)
 
         self.calib_output_label = QLabel()
-        self.calib_output_label.setStyleSheet("color: #666; font-size: 11px;")
+        self.calib_output_label.setStyleSheet("color: #9d9d9d; font-size: 11px;")
         calib_layout.addWidget(self.calib_output_label)
         layout.addWidget(calib_box)
 
@@ -440,7 +440,7 @@ class GroupConfigDialog(QDialog):
 
         if not tokens:
             placeholder = QLabel("(no camera tokens detected yet)")
-            placeholder.setStyleSheet("color: #888;")
+            placeholder.setStyleSheet("color: #9d9d9d;")
             self.token_gallery_layout.addWidget(placeholder)
             return
 

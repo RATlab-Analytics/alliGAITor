@@ -139,6 +139,8 @@ def run_inference(
     peak_threshold: Optional[float] = None,
     log: Callable[[str], None] = print,
     progress: Optional[Callable[[str], None]] = None,
+    html_progress: bool = False,
+    on_redraw_closed: Optional[Callable[[], None]] = None,
 ) -> Path:
     """Run ``sleap-nn predict`` on a single video and return the output path.
 
@@ -180,6 +182,17 @@ def run_inference(
             messages, so a caller that wants to show that in place (the
             GUI does) can tell the two apart. Defaults to ``log`` if not
             given.
+        html_progress: If True, ``progress`` receives an HTML rendering
+            of ``sleap-nn predict``'s own colored progress bar instead
+            of plain text -- for a caller wired up to a rich-text widget
+            (the GUI is; see :mod:`alligaitor.ansi_html`). Leave False
+            for a plain-text/print()-based ``progress``.
+        on_redraw_closed: Forwarded to
+            :func:`alligaitor.subprocess_streaming.stream_subprocess` --
+            called whenever a redrawn progress line's definitive final
+            state has just been sent to ``progress``, so a caller
+            redrawing in place can start the next update fresh instead
+            of immediately overwriting it.
 
     Returns:
         Path to the written ``.slp`` predictions file.
@@ -217,7 +230,9 @@ def run_inference(
         cmd.append("--tracking")
 
     log(f"  $ {' '.join(cmd)}")
-    returncode, streamer = stream_subprocess(cmd, log, progress)
+    returncode, streamer = stream_subprocess(
+        cmd, log, progress, html_progress=html_progress, on_redraw_closed=on_redraw_closed
+    )
     if returncode != 0:
         streamer.dump_plain_lines("run failed")
         raise RuntimeError(

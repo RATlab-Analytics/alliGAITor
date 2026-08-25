@@ -101,7 +101,7 @@ def build_regex_help_panel(parent=None, on_toggled=None) -> QWidget:
     help_label = QLabel(_HELP_TEXT)
     help_label.setWordWrap(True)
     help_label.setTextFormat(Qt.RichText)
-    help_label.setStyleSheet("color: #444; background: #f5f5f5; padding: 8px; border-radius: 4px;")
+    help_label.setStyleSheet("color: #d4d4d4; background: #353535; padding: 8px; border-radius: 4px;")
     help_label.setVisible(False)
 
     def _on_toggled(checked: bool):

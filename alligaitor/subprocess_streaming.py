@@ -32,6 +32,8 @@ import sys
 import time
 from typing import Callable, List, Optional, Tuple
 
+from alligaitor.ansi_html import ansi_line_to_html
+
 # A CSI (Control Sequence Introducer) escape sequence is ESC '[', then
 # parameter bytes (0x30-0x3F: digits plus ':;<=>?'), then intermediate
 # bytes (0x20-0x2F), then one final byte (0x40-0x7E) -- matched here as
@@ -70,10 +72,40 @@ class ProgressStreamer:
     than being tied to exit code alone in here.
     """
 
-    def __init__(self, log: Callable[[str], None], progress: Callable[[str], None], min_interval_s: float):
+    def __init__(
+        self,
+        log: Callable[[str], None],
+        progress: Callable[[str], None],
+        min_interval_s: float,
+        html_progress: bool = False,
+        on_redraw_closed: Optional[Callable[[], None]] = None,
+    ):
         self.log = log
         self.progress = progress
         self.min_interval_s = min_interval_s
+        # Whether `progress` wants an HTML rendering of the colored
+        # progress line (a GUI wired up to a rich-text widget) or plain
+        # cleaned text (the default -- e.g. `progress` falling back to
+        # `log`/print() for CLI usage, where dumping raw HTML tags to a
+        # real terminal would be a regression, not an improvement).
+        self.html_progress = html_progress
+        # Called (no args) right after a redraw's *definitive* final
+        # state is emitted (see _flush_progress_final) -- lets a caller
+        # that redraws a line in place (the GUI does) stop treating the
+        # next progress update as "the same line" once this fires.
+        # Without it: a subprocess that runs more than one tqdm bar in
+        # sequence on the same terminal line (e.g. one bar for loading,
+        # a separate one for predicting) would have the second bar's very
+        # first redraw immediately overwrite the first bar's just-shown
+        # completion, which reads as a line of text flashing on screen
+        # for an instant before the "real" bar reappears in its place --
+        # correct in the sense that nothing is lost anymore (see that
+        # method's docstring for the bug where it used to be), but still
+        # a jarring, easy-to-misread flicker. `progress`'s own contract
+        # deliberately isn't touched by this (still plain
+        # Callable[[str], None]) so CLI callers passing plain print()
+        # keep working unchanged.
+        self.on_redraw_closed = on_redraw_closed
         self.buf = ""
         self.last_emit = 0.0
         self.last_logged: Optional[str] = None
@@ -82,6 +114,17 @@ class ProgressStreamer:
         # see feed()'s in-place comment for why this needs one character
         # of lookahead.
         self._pending_cr = False
+        # True once self.buf has started accumulating content that began
+        # right after a real (confirmed-genuine) '\r' redraw separator --
+        # see feed()'s handling of a bare '\n' for why this matters: a
+        # progress bar's *last* redraw is commonly followed by a plain
+        # '\n' (tqdm writing one final newline to move past the bar once
+        # it's done), not by another '\r', and without tracking this that
+        # final state -- the one moment that actually matters, "finished"
+        # -- would be misfiled as an ordinary completed line and never
+        # reach `progress` at all, leaving the last live redraw stuck on
+        # whatever number happened to precede it.
+        self._in_progress_redraw = False
 
     @staticmethod
     def _clean(raw: str) -> str:
@@ -96,23 +139,55 @@ class ProgressStreamer:
         # so an ordinary print()'d line and a real tqdm carriage-return
         # redraw both start by handing us a '\r'; the only way to tell
         # them apart is whether a '\n' immediately follows. Hence the
-        # one-character lookahead via _pending_cr: a '\r' immediately
-        # followed by '\n' is an ordinary line ending (buffered, not
-        # shown live); a '\r' followed by anything else is a genuine
-        # progress-bar redraw (shown live, throttled).
+        # one-character lookahead via _pending_cr.
+        #
+        # That alone isn't quite enough, though: a bar's *last* redraw is
+        # almost always followed by tqdm writing one bare '\n' to move
+        # past it once it's done -- which the pty *also* translates to
+        # '\r\n' before we see it, making it look identical to "the '\r'
+        # immediately before this was itself just a translated '\n'"
+        # (an ordinary line). Getting that case wrong buries the one
+        # redraw that actually matters -- "finished" -- in plain_lines,
+        # where nothing ever displays it live, leaving the last thing
+        # shown stuck on whatever percentage preceded it. _in_progress_
+        # redraw resolves the ambiguity: true only when the '\r'
+        # immediately before the content now in self.buf was itself
+        # already confirmed genuine (not a translated '\n'), so a '\r'
+        # immediately followed by '\n' is treated as "the bar's own
+        # closing newline" (flush self.buf as one last progress update)
+        # exactly when that's what it actually is, and as an ordinary
+        # line ending otherwise.
         if self._pending_cr:
             self._pending_cr = False
             if ch == "\n":
-                self._flush_plain()
+                # This is the bar's own definitive final state if it's
+                # what closed it -- must not be dropped by the normal
+                # throttle (see _flush_progress_final's docstring for
+                # why _flush_progress() here would be a regression, not
+                # just a missed intermediate update).
+                if self._in_progress_redraw:
+                    self._flush_progress_final()
+                else:
+                    self._flush_plain()
+                self._in_progress_redraw = False
                 return
             self._flush_progress()
+            self._in_progress_redraw = True
             # fall through -- `ch` still needs to be processed below,
             # it's the start of whatever comes after the redraw
 
         if ch == "\r":
             self._pending_cr = True
         elif ch == "\n":
-            self._flush_plain()
+            # Only reachable without a preceding '\r' at all on the
+            # Windows pipe fallback (_stream_subprocess_pipe), which
+            # isn't a pty and so never gets the ONLCR translation above
+            # -- there, a bare '\n' is unambiguous.
+            if self._in_progress_redraw:
+                self._flush_progress_final()
+            else:
+                self._flush_plain()
+            self._in_progress_redraw = False
         else:
             self.buf += ch
 
@@ -122,18 +197,58 @@ class ProgressStreamer:
         if line:
             self.plain_lines.append(line)
 
+    def _progress_text(self, raw: str, plain: str) -> str:
+        """The dedup/throttle key (self.last_logged) is always the plain
+        (ANSI-stripped) text -- color alone changing without the text
+        changing isn't a real update worth redrawing for. What's
+        actually sent to `progress` differs by mode: an HTML rendering
+        of the still-ANSI-coded raw bytes for a rich-text caller (the
+        GUI; see alligaitor.ansi_html), or the same plain text used for
+        the dedup key otherwise (e.g. CLI usage where `progress` falls
+        back to `log`/print())."""
+        if self.html_progress:
+            return ansi_line_to_html("    " + raw)
+        return f"    {plain}"
+
     def _flush_progress(self) -> None:
-        line = self._clean(self.buf)
+        """Throttled flush -- for a redraw that is NOT the bar's
+        definitive final state, where dropping one intermediate update is
+        harmless (another one follows shortly after). See
+        _flush_progress_final() for the case where dropping it wouldn't
+        be harmless."""
+        plain = self._clean(self.buf)
+        raw = self.buf
         self.buf = ""
-        if line and line != self.last_logged:
+        if plain and plain != self.last_logged:
             now = time.monotonic()
             if now - self.last_emit >= self.min_interval_s:
-                self.progress(f"    {line}")
+                self.progress(self._progress_text(raw, plain))
                 self.last_emit = now
-                self.last_logged = line
+                self.last_logged = plain
             # else: an intermediate progress-bar redraw, dropped by
-            # design -- the trailing flush in finish() still catches it
-            # if the process happens to exit right after.
+            # design -- another one is expected shortly, so no real
+            # information is lost.
+
+    def _flush_progress_final(self) -> None:
+        """Unconditionally flushes self.buf as a progress update,
+        bypassing the normal throttle -- for content that will never be
+        followed by another update (the bar's own closing '\\r\\n', or
+        whatever's left buffered when the subprocess exits). Using the
+        throttled _flush_progress() for this would still clear self.buf
+        even when the throttle drops the actual call to `progress`,
+        permanently losing the one update that mattered most --
+        "finished" -- with no later chance to recover it (this used to
+        be exactly that bug: the bar's true final state, silently eaten
+        by whatever throttle window it happened to land in)."""
+        plain = self._clean(self.buf)
+        raw = self.buf
+        self.buf = ""
+        if plain and plain != self.last_logged:
+            self.progress(self._progress_text(raw, plain))
+            self.last_emit = time.monotonic()
+            self.last_logged = plain
+            if self.on_redraw_closed is not None:
+                self.on_redraw_closed()
 
     def finish(self) -> None:
         # A trailing '\r' with nothing after it (no more input, EOF) is
@@ -141,14 +256,13 @@ class ProgressStreamer:
         # state right before the process exits, never a real line ending
         # (those get their '\n' before EOF), so treat it as progress.
         if self._pending_cr:
-            self._flush_progress()
+            self._flush_progress_final()
             self._pending_cr = False
 
         # Flush whatever's left unterminated -- e.g. the final "100%"
         # state if it wasn't itself followed by a '\r'/'\n' before exit.
-        tail = self._clean(self.buf)
-        if tail and tail != self.last_logged:
-            self.progress(f"    {tail}")
+        # (A no-op if the branch above already consumed self.buf.)
+        self._flush_progress_final()
 
     def dump_plain_lines(self, reason: str) -> None:
         """Surfaces the buffered ``'\\n'`` output (see class docstring)
@@ -162,7 +276,7 @@ class ProgressStreamer:
             self.log(f"    {line}")
 
 
-def _stream_subprocess_pty(cmd, env, min_interval_s, log, progress) -> Tuple[int, ProgressStreamer]:
+def _stream_subprocess_pty(cmd, env, min_interval_s, log, progress, html_progress, on_redraw_closed) -> Tuple[int, ProgressStreamer]:
     """POSIX (mac/Linux) implementation: runs cmd with its stdout/stderr
     attached to a pseudo-terminal instead of a plain pipe.
 
@@ -195,7 +309,7 @@ def _stream_subprocess_pty(cmd, env, min_interval_s, log, progress) -> Tuple[int
     )
     os.close(slave_fd)  # only the child needs the slave end
 
-    streamer = ProgressStreamer(log, progress, min_interval_s)
+    streamer = ProgressStreamer(log, progress, min_interval_s, html_progress, on_redraw_closed)
     # newline="" disables universal-newlines translation -- the default
     # (newline=None) silently rewrites every '\r' to '\n' before this code
     # ever sees it (true of both os.fdopen and subprocess's own
@@ -221,7 +335,7 @@ def _stream_subprocess_pty(cmd, env, min_interval_s, log, progress) -> Tuple[int
     return proc.returncode, streamer
 
 
-def _stream_subprocess_pipe(cmd, env, min_interval_s, log, progress) -> Tuple[int, ProgressStreamer]:
+def _stream_subprocess_pipe(cmd, env, min_interval_s, log, progress, html_progress, on_redraw_closed) -> Tuple[int, ProgressStreamer]:
     """Windows fallback: a real pty needs platform APIs this codebase
     doesn't otherwise depend on (pywinpty/conpty), so this uses a plain
     pipe instead. PYTHONUNBUFFERED (see stream_subprocess) still fixes
@@ -242,7 +356,7 @@ def _stream_subprocess_pipe(cmd, env, min_interval_s, log, progress) -> Tuple[in
         stdin=subprocess.DEVNULL, env=env,
     )
     stdout_text = io.TextIOWrapper(proc.stdout, encoding="utf-8", errors="replace", newline="")
-    streamer = ProgressStreamer(log, progress, min_interval_s)
+    streamer = ProgressStreamer(log, progress, min_interval_s, html_progress, on_redraw_closed)
     try:
         while True:
             ch = stdout_text.read(1)
@@ -264,6 +378,8 @@ def stream_subprocess(
     log: Callable[[str], None],
     progress: Optional[Callable[[str], None]] = None,
     min_interval_s: float = 0.5,
+    html_progress: bool = False,
+    on_redraw_closed: Optional[Callable[[], None]] = None,
 ) -> Tuple[int, ProgressStreamer]:
     """Runs ``cmd``, forwarding its live tqdm-style progress output
     through ``progress`` as it runs (throttled -- see ProgressStreamer),
@@ -275,6 +391,22 @@ def stream_subprocess(
     GUI does; see main_window.py's ``_on_progress_line``) can tell the
     two apart. Defaults to ``log`` if not given, e.g. for plain
     print()-based callers where "in place" doesn't apply.
+
+    Args:
+        html_progress: If True, the text passed to ``progress`` is an
+            HTML rendering of the command's own ANSI colors/styling (see
+            :mod:`alligaitor.ansi_html`) instead of plain text -- for a
+            caller wired up to a rich-text widget (the GUI is). Leave
+            False for a plain-text/print()-based ``progress`` (the
+            default, and what ``progress`` falling back to ``log``
+            implies): raw HTML tags dumped to a real terminal would be a
+            regression, not an improvement.
+        on_redraw_closed: Forwarded to ProgressStreamer -- called (no
+            args) whenever a redrawn line's definitive final state has
+            just been sent to ``progress``, so a caller redrawing in
+            place can start the next update on a fresh line instead of
+            immediately overwriting that final state (see
+            ProgressStreamer's docstring for the flicker this avoids).
 
     Ordinary ``'\\n'``-terminated output (config dumps, device info,
     warnings -- not the progress bar) is intentionally kept out of the
@@ -295,5 +427,5 @@ def stream_subprocess(
     # lower-level buffering layer underneath it.
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     if sys.platform.startswith("win"):
-        return _stream_subprocess_pipe(cmd, env, min_interval_s, log, progress)
-    return _stream_subprocess_pty(cmd, env, min_interval_s, log, progress)
+        return _stream_subprocess_pipe(cmd, env, min_interval_s, log, progress, html_progress, on_redraw_closed)
+    return _stream_subprocess_pty(cmd, env, min_interval_s, log, progress, html_progress, on_redraw_closed)

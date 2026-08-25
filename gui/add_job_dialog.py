@@ -57,7 +57,7 @@ class AddJobDialog(QDialog):
         output_row, self.output_base_edit, output_browse_btn = _folder_row(default_output_base)
 
         self.video_count_label = QLabel("Pick an input folder to see how many videos it contains.")
-        self.video_count_label.setStyleSheet("color: #666;")
+        self.video_count_label.setStyleSheet("color: #9d9d9d;")
 
         form = QFormLayout()
         form.addRow("Group name:", self.group_name_edit)
@@ -65,7 +65,7 @@ class AddJobDialog(QDialog):
         form.addRow("", self.video_count_label)
         form.addRow("Output base folder:", output_row)
         out_hint = QLabel("Results will be written to <output base>/<group name>/")
-        out_hint.setStyleSheet("color: #666; font-size: 11px;")
+        out_hint.setStyleSheet("color: #9d9d9d; font-size: 11px;")
         form.addRow("", out_hint)
 
         self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -86,10 +86,10 @@ class AddJobDialog(QDialog):
         videos = find_videos(folder)
         if not videos:
             self.video_count_label.setText("No .mp4 files found in this folder (it's searched recursively).")
-            self.video_count_label.setStyleSheet("color: #a94442;")
+            self.video_count_label.setStyleSheet("color: #f28b82;")
         else:
             self.video_count_label.setText(f"{len(videos)} video(s) found.")
-            self.video_count_label.setStyleSheet("color: #2e7d32;")
+            self.video_count_label.setStyleSheet("color: #81c995;")
 
     def _browse_input_folder(self):
         folder = QFileDialog.getExistingDirectory(

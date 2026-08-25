@@ -27,12 +27,15 @@ _STATUS_LABELS = {
     JobStatus.CANCELED: "Canceled",
 }
 
+# Brightened for readable contrast against the app's dark palette (see
+# gui/dark_theme.py) -- the original values were tuned for a light
+# background.
 _STATUS_COLORS = {
-    JobStatus.NEEDS_CONFIG: QColor("#8a6d00"),
-    JobStatus.NEEDS_CROP: QColor("#8a6d00"),
-    JobStatus.RUNNING: QColor("#1565c0"),
-    JobStatus.DONE: QColor("#2e7d32"),
-    JobStatus.FAILED: QColor("#c0392b"),
+    JobStatus.NEEDS_CONFIG: QColor("#ffca28"),
+    JobStatus.NEEDS_CROP: QColor("#ffca28"),
+    JobStatus.RUNNING: QColor("#64b5f6"),
+    JobStatus.DONE: QColor("#81c995"),
+    JobStatus.FAILED: QColor("#f28b82"),
 }
 
 

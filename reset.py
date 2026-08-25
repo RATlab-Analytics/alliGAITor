@@ -79,9 +79,10 @@ def describe_job_targets(job: Job, clear_predictions=False, clear_output=False, 
         lines.append(f"{job.predictions_dir}/<session>/{{left,right,bottom}}.predictions.slp "
                       f"({len(sessions)} session(s))")
     if clear_output:
-        lines.append(f"{job.predictions_dir}/<session>/*.pose_3d.csv, *.paw_events.csv "
-                      f"({len(sessions)} session(s))")
+        lines.append(f"{job.predictions_dir}/<session>/*.pose_3d.csv, *.paw_events.csv, "
+                      f"*.validation_summary.json, *.manual_flags.json ({len(sessions)} session(s))")
         lines.append(str(job.reports_dir))
+        lines.append(str(job.validation_dir))
     if clear_crops:
         lines.append(f"{job.cropped_dir}  (cropped videos -- crop_positions.json is kept)")
     return lines
@@ -110,7 +111,7 @@ def perform_job_reset(job: Job, clear_predictions=False, clear_output=False, cle
     if clear_output:
         for name in sessions:
             session_dir = job.predictions_dir / name
-            for suffix in ("pose_3d.csv", "paw_events.csv"):
+            for suffix in ("pose_3d.csv", "paw_events.csv", "validation_summary.json", "manual_flags.json"):
                 f = session_dir / f"{name}.{suffix}"
                 if f.exists():
                     f.unlink()
@@ -119,6 +120,9 @@ def perform_job_reset(job: Job, clear_predictions=False, clear_output=False, cle
         n = _rmtree_contents(job.reports_dir)
         total += n
         log(f"Cleared {n} item(s) from {job.reports_dir}")
+        n = _rmtree_contents(job.validation_dir)
+        total += n
+        log(f"Cleared {n} item(s) from {job.validation_dir}")
 
     if clear_crops:
         n = _rmtree_contents(job.cropped_dir)

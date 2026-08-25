@@ -26,6 +26,7 @@ for _p in (REPO_DIR, REPO_DIR / "gui", REPO_DIR / "tools"):
 
 from PySide6.QtWidgets import QApplication
 
+from dark_theme import apply_dark_theme
 from job_queue import JobQueue, default_app_data_dir
 from main_window import MainWindow
 
@@ -34,6 +35,7 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("alliGAITor")
     app.setApplicationDisplayName("alliGAITor")
+    apply_dark_theme(app)
 
     app_data_dir = default_app_data_dir(REPO_DIR)
     job_queue = JobQueue(app_data_dir).load()

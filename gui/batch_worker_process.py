@@ -47,6 +47,16 @@ def run_batch_worker(repo_dir: str, job_dicts: list, queue, stop_event,
         # happening, instead of the log going quiet and looking hung).
         queue.put(("progress", message))
 
+    def on_redraw_closed():
+        # A redrawn line's definitive final state was just sent via
+        # progress() above -- tells the GUI to start the next progress
+        # update on a fresh line instead of overwriting that final state
+        # (matters when inference prints more than one tqdm bar in
+        # sequence on the same terminal line; without this, one bar's
+        # true completion flashes on screen for an instant before the
+        # next bar's first redraw immediately overwrites it in place).
+        queue.put(("progress_closed",))
+
     for job_dict in job_dicts:
         job = Job.from_dict(job_dict)
 
@@ -73,7 +83,8 @@ def run_batch_worker(repo_dir: str, job_dicts: list, queue, stop_event,
             log(f"[{job.group_name}] calibrating (or loading saved calibration)...")
             output_path = run_group(
                 config, device=device, tracking=tracking, progress_callback=progress_callback,
-                log=log, progress=progress,
+                log=log, progress=progress, html_progress=True, on_redraw_closed=on_redraw_closed,
+                validation_dir=job.validation_dir,
             )
             log(f"[{job.group_name}] wrote {output_path}")
             queue.put(("job_finished", job.id, JobStatus.DONE.value, ""))
