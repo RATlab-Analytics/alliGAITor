@@ -426,6 +426,15 @@ def export_validation_video(
 
     caps = {role: cv2.VideoCapture(str(session.videos[role])) for role in CAMERA_ROLES}
     native_frame_counts = {role: int(caps[role].get(cv2.CAP_PROP_FRAME_COUNT)) for role in CAMERA_ROLES}
+    # What cap.read() will return next for each role absent a re-seek --
+    # same tracking gui/video_player_widget.py's goto_frame() uses. The
+    # reference role's native_idx is *always* i (see below), i.e. purely
+    # sequential -- calling cap.set() on every one of its frames anyway
+    # was forcing a real seek (nearest-keyframe + decode-forward on
+    # compressed footage) for what should just be the next read(), and
+    # was a large, easily-avoidable chunk of this function's per-frame
+    # cost across all three cameras.
+    next_native_idx = {role: 0 for role in CAMERA_ROLES}
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -453,8 +462,10 @@ def export_validation_video(
             for role in PANEL_ORDER:
                 native_idx = i if role == reference_role else int(round(t * fps_by_role[role]))
                 native_idx = max(0, min(native_idx, native_frame_counts[role] - 1))
-                caps[role].set(cv2.CAP_PROP_POS_FRAMES, native_idx)
+                if native_idx != next_native_idx[role]:
+                    caps[role].set(cv2.CAP_PROP_POS_FRAMES, native_idx)
                 ok, panel = caps[role].read()
+                next_native_idx[role] = native_idx + 1 if ok else next_native_idx[role]
                 if not ok or panel is None:
                     panel = np.zeros((100, 200, 3), dtype=np.uint8)
 

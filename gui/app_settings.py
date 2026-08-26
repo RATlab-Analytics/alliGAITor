@@ -60,6 +60,7 @@ _DEFAULTS = {
     "default_output_base": "",
     "default_gait": dict(DEFAULT_GAIT),
     "default_min_corners_extrinsic": DEFAULT_MIN_CORNERS_EXTRINSIC,
+    "default_skip_validation_videos": False,
 }
 
 
@@ -168,6 +169,24 @@ def get_default_min_corners_extrinsic(app_data_dir: Path) -> int:
 def set_default_min_corners_extrinsic(app_data_dir: Path, value: int) -> None:
     settings = load_settings(app_data_dir)
     settings["default_min_corners_extrinsic"] = value
+    save_settings(app_data_dir, settings)
+
+
+# -- default validation-video skip (Settings > Preferences) --
+
+def get_default_skip_validation_videos(app_data_dir: Path) -> bool:
+    """Whether a newly-saved job's config editor starts with "skip
+    validation videos" checked (see group_config_dialog.py's
+    ``skip_validation_check``) -- same always-read-fresh-from-Settings
+    pattern as the default gait overrides, but still editable per group
+    afterward, unlike those. Defaults to ``False``: validation videos are
+    generated unless a lab opts out."""
+    return bool(load_settings(app_data_dir).get("default_skip_validation_videos", False))
+
+
+def set_default_skip_validation_videos(app_data_dir: Path, value: bool) -> None:
+    settings = load_settings(app_data_dir)
+    settings["default_skip_validation_videos"] = bool(value)
     save_settings(app_data_dir, settings)
 
 

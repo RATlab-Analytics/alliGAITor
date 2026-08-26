@@ -411,6 +411,15 @@ class PipelineConfig:
             ``sessions`` from a folder of videos, if it did. Round-tripped
             for editing but not read by :func:`run_pipeline`/`run_group` --
             ``sessions`` is always the source of truth for a run.
+        skip_validation_videos: If ``True``, :func:`alligaitor.pipeline.run_group`
+            skips rendering an annotated validation video for every
+            session in this group (see
+            :func:`alligaitor.validation_video.export_validation_video`)
+            -- e.g. for a group where render time isn't worth it and the
+            spreadsheet/paw-usability summary alone is enough. Defaults to
+            ``False`` (videos are generated). Editable per group in the
+            config editor; new groups start from
+            ``app_settings.get_default_skip_validation_videos``.
     """
 
     models: ModelConfig
@@ -420,6 +429,7 @@ class PipelineConfig:
     output_xlsx: Optional[Path] = None
     gait: GaitConfig = field(default_factory=GaitConfig)
     discovery: Optional[DiscoveryConfig] = None
+    skip_validation_videos: bool = False
 
     @classmethod
     def from_yaml(cls, path: PathLike) -> "PipelineConfig":
@@ -486,6 +496,7 @@ class PipelineConfig:
             output_xlsx=output_xlsx,
             gait=gait,
             discovery=discovery,
+            skip_validation_videos=bool(raw.get("skip_validation_videos", False)),
         )
 
     def to_yaml(self, path: PathLike) -> None:
@@ -541,6 +552,7 @@ class PipelineConfig:
                 "min_valid_steps": self.gait.min_valid_steps,
                 "stride_length_outlier_ratio": self.gait.stride_length_outlier_ratio,
             },
+            "skip_validation_videos": self.skip_validation_videos,
         }
         if self.output_xlsx is not None:
             raw["output_xlsx"] = _relativize(base_dir, self.output_xlsx)

@@ -115,6 +115,12 @@ class GroupConfigDialog(QDialog):
         info_form.addRow("Output folder:", output_row)
         input_browse_btn.clicked.connect(self._browse_input_folder)
         output_browse_btn.clicked.connect(self._browse_output_folder)
+        self.skip_validation_check = QCheckBox("Skip validation video generation for this job")
+        self.skip_validation_check.setToolTip(
+            "Skips rendering an annotated validation video per session on every run of this "
+            "job -- the spreadsheet and paw-usability summary are still produced either way."
+        )
+        info_form.addRow("Validation videos:", self.skip_validation_check)
         layout.addWidget(info_box)
 
         # -- discovery regexes --
@@ -248,8 +254,14 @@ class GroupConfigDialog(QDialog):
         self.input_folder_edit.setText(self.job.input_folder)
         self.output_folder_edit.setText(self.job.output_folder)
 
-        from app_settings import get_default_camera_tokens, get_default_regexes
+        from app_settings import (
+            get_default_camera_tokens, get_default_regexes, get_default_skip_validation_videos,
+        )
         default_id_regex, default_camera_regex = get_default_regexes(self.app_data_dir)
+        self.skip_validation_check.setChecked(
+            self._existing_config.skip_validation_videos if self._existing_config is not None
+            else get_default_skip_validation_videos(self.app_data_dir)
+        )
 
         # Block textChanged -> _rescan while both fields are set here:
         # setting id_regex_edit alone would otherwise fire a rescan with
@@ -600,6 +612,7 @@ class GroupConfigDialog(QDialog):
             output_xlsx=Path(output_folder) / "reports" / f"{group_name}.gait_metrics.xlsx",
             gait=GaitConfig(**get_default_gait_overrides(self.app_data_dir)),
             discovery=discovery,
+            skip_validation_videos=self.skip_validation_check.isChecked(),
         )
 
         # Update the job's own fields (and therefore job.config_path,

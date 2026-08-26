@@ -233,7 +233,10 @@ def run_group(
             long a render takes. Rendering is best-effort: a failure is
             logged via ``log`` and skipped rather than failing the whole
             run -- the workbook and every other session's video are still
-            produced. ``None`` (the default) skips video export entirely.
+            produced. ``None`` (the default) skips video export entirely,
+            as does ``config.skip_validation_videos`` -- a per-group
+            opt-out (see :class:`alligaitor.config.PipelineConfig`) that
+            takes effect even when a ``validation_dir`` is given.
 
     Returns:
         Path to the written gait-metrics workbook.
@@ -273,7 +276,7 @@ def run_group(
             crossings, times, positions, config.gait,
             session.output_dir / f"{session.name}.validation_summary.json",
         )
-        if validation_dir is not None:
+        if validation_dir is not None and not config.skip_validation_videos:
             try:
                 validation_video.export_validation_video(
                     session, csv_path, cgroup, crossings, config.gait,

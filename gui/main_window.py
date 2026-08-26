@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QPushButton, QTextEdit, QDialog, QDialogButtonBox, QFormLayout,
     QLineEdit, QMessageBox, QAbstractItemView, QSplitter,
     QProgressBar, QLabel, QTabWidget, QSpinBox, QDoubleSpinBox, QMenu,
+    QCheckBox,
 )
 
 from job_queue import Job, JobQueue, JobStatus, refresh_job_readiness
@@ -149,6 +150,12 @@ class _PreferencesDialog(QDialog):
         self.right_token_edit = QLineEdit(tokens["right"])
         self.bottom_token_edit = QLineEdit(tokens["bottom"])
         self.output_base_edit = QLineEdit(app_settings.get_default_output_base(self.app_data_dir))
+        self.skip_validation_check = QCheckBox("Skip validation video generation")
+        self.skip_validation_check.setChecked(app_settings.get_default_skip_validation_videos(self.app_data_dir))
+        self.skip_validation_check.setToolTip(
+            "Starting default for a newly-saved job's config editor -- still editable per job there. "
+            "Unchecked means every run renders an annotated validation video per session."
+        )
 
         form = QFormLayout()
         form.addRow("Default ID regex:", self.id_regex_edit)
@@ -157,6 +164,7 @@ class _PreferencesDialog(QDialog):
         form.addRow("Default token — Right camera:", self.right_token_edit)
         form.addRow("Default token — Bottom camera:", self.bottom_token_edit)
         form.addRow("Default output base folder:", self.output_base_edit)
+        form.addRow("Validation videos:", self.skip_validation_check)
         form.addRow(build_regex_help_panel(self, on_toggled=self._sync_dialog_size))
 
         tab = QWidget()
@@ -248,6 +256,7 @@ class _PreferencesDialog(QDialog):
             "bottom": self.bottom_token_edit.text().strip(),
         })
         app_settings.set_default_output_base(self.app_data_dir, self.output_base_edit.text())
+        app_settings.set_default_skip_validation_videos(self.app_data_dir, self.skip_validation_check.isChecked())
         app_settings.set_default_gait_overrides(self.app_data_dir, {
             "speed_threshold_mm_s": self.speed_threshold_spin.value(),
             "min_contact_frames": self.min_contact_frames_spin.value(),
