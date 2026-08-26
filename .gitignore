@@ -41,6 +41,7 @@ minimal_skeleton.json
 /calibration/*.mp4
 /calibration/*.mov
 /configs
+/reports
 
 # App session storage
-/app_data/
+/app_data

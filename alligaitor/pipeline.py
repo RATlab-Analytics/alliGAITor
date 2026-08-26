@@ -225,11 +225,15 @@ def run_group(
         validation_dir: If given, an annotated validation video (see
             :func:`alligaitor.validation_video.export_validation_video`) is
             rendered for every session into
-            ``validation_dir/<session.name>.validation.mp4``. Rendering is
-            best-effort: a failure is logged via ``log`` and skipped rather
-            than failing the whole run -- the workbook and every other
-            session's video are still produced. ``None`` (the default)
-            skips video export entirely.
+            ``validation_dir/<session.name>.validation.mp4``, reusing the
+            same ``log``/``progress``/``html_progress``/``on_redraw_closed``
+            as inference above -- so rendering shows its own live,
+            tqdm-styled progress line the same way a camera role's
+            inference does, rather than the log going quiet for however
+            long a render takes. Rendering is best-effort: a failure is
+            logged via ``log`` and skipped rather than failing the whole
+            run -- the workbook and every other session's video are still
+            produced. ``None`` (the default) skips video export entirely.
 
     Returns:
         Path to the written gait-metrics workbook.
@@ -274,6 +278,8 @@ def run_group(
                 validation_video.export_validation_video(
                     session, csv_path, cgroup, crossings, config.gait,
                     Path(validation_dir) / f"{session.name}.validation.mp4",
+                    log=log, progress=progress, html_progress=html_progress,
+                    on_redraw_closed=on_redraw_closed,
                 )
             except Exception as exc:
                 log(f"[{session.name}] validation video export failed: {exc}")

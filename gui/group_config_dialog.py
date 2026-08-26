@@ -171,13 +171,13 @@ class GroupConfigDialog(QDialog):
         # -- sessions --
         sessions_box = QGroupBox("Sessions")
         sessions_layout = QVBoxLayout(sessions_box)
-        self.multi_crossing_check = QCheckBox("Multiple crossings per rat in this group")
-        self.multi_crossing_check.setToolTip(
-            "When checked, edit Rat ID per session below to group repeat crossings of the "
-            "same rat onto one spreadsheet tab (with an averaged summary row)."
+        self.multi_session_check = QCheckBox("Multiple sessions per rat")
+        self.multi_session_check.setToolTip(
+            "When checked, edit Rat ID per session below to group multiple sessions (separate "
+            "videos) of the same rat onto one spreadsheet tab (with an averaged summary row)."
         )
-        self.multi_crossing_check.toggled.connect(self._on_multi_crossing_toggled)
-        sessions_layout.addWidget(self.multi_crossing_check)
+        self.multi_session_check.toggled.connect(self._on_multi_session_toggled)
+        sessions_layout.addWidget(self.multi_session_check)
 
         self.session_table = QTableWidget(0, 6)
         self.session_table.setHorizontalHeaderLabels(
@@ -277,7 +277,7 @@ class GroupConfigDialog(QDialog):
         has_overrides = bool(self._rat_id_overrides) or any(
             s.rat_id != s.name for s in (config.sessions if config else [])
         )
-        self.multi_crossing_check.setChecked(has_overrides)
+        self.multi_session_check.setChecked(has_overrides)
 
         if config is not None:
             calib = config.calibration
@@ -366,7 +366,7 @@ class GroupConfigDialog(QDialog):
         self._populate_role_combos(role_to_token={r: c.currentText() for r, c in self.role_combos.items()})
         self._rescan()
 
-    def _on_multi_crossing_toggled(self, checked: bool):
+    def _on_multi_session_toggled(self, checked: bool):
         self.session_table.setColumnHidden(1, not checked)
         if not checked:
             self._rat_id_overrides.clear()

@@ -19,15 +19,18 @@ the group workbook is built from, not a separate/simplified pass.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from dataclasses import replace
-from typing import Dict, List, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
 from aniposelib.cameras import CameraGroup
+from tqdm import tqdm
 
 from alligaitor import cropping, gait, pipeline, triangulation
+from alligaitor.ansi_html import ansi_line_to_html
 from alligaitor.config import CAMERA_ROLES, GaitConfig, SessionConfig
 from alligaitor.gait import PAW_NODES, TrialMetrics
 from alligaitor.timing import video_fps
@@ -63,6 +66,57 @@ _FOOTPRINT_FADED_ALPHA = 0.35
 
 _NODE_RADIUS = 5
 _FOOTPRINT_RADIUS = 4
+
+
+class _FrameProgress:
+    """Throttled tqdm-style progress reporting for this module's per-frame
+    render loop -- the pure-Python equivalent of
+    :class:`alligaitor.subprocess_streaming.ProgressStreamer` for a
+    subprocess's own tqdm bar, so rendering a validation video shows a
+    live progress bar in the GUI log panel that looks and behaves exactly
+    like inference's (same ``tqdm.format_meter`` text, same redraw-in-
+    place/``on_redraw_closed`` contract -- see
+    :func:`alligaitor.inference.run_inference`) instead of the log going
+    quiet for however long a render takes.
+    """
+
+    def __init__(
+        self,
+        desc: str,
+        n_frames: int,
+        progress: Optional[Callable[[str], None]],
+        html_progress: bool,
+        on_redraw_closed: Optional[Callable[[], None]],
+        min_interval_s: float = 0.5,
+    ):
+        self.desc = desc
+        self.n_frames = n_frames
+        self.progress = progress
+        self.html_progress = html_progress
+        self.on_redraw_closed = on_redraw_closed
+        self.min_interval_s = min_interval_s
+        self.start_time = time.monotonic()
+        self.last_emit = 0.0
+
+    def update(self, i: int) -> None:
+        if self.progress is None:
+            return
+        now = time.monotonic()
+        is_final = i >= self.n_frames - 1
+        # Always flush the final frame regardless of the throttle -- same
+        # reasoning as ProgressStreamer._flush_progress_final: dropping an
+        # intermediate 0.5s tick is harmless (another follows shortly),
+        # but silently eating the one update that says "done" leaves the
+        # displayed bar stuck below 100% forever.
+        if not is_final and now - self.last_emit < self.min_interval_s:
+            return
+        elapsed = now - self.start_time
+        bar = tqdm.format_meter(i + 1, self.n_frames, elapsed, prefix=self.desc)
+        text = f"    {bar}"
+        self.progress(ansi_line_to_html(text) if self.html_progress else text)
+        self.last_emit = now
+        if is_final and self.on_redraw_closed is not None:
+            self.on_redraw_closed()
 
 
 def _footprint_color(paw: str):
@@ -298,6 +352,10 @@ def export_validation_video(
     config: GaitConfig,
     output_path: Path,
     disagreement_threshold_px: float = 20.0,
+    log: Callable[[str], None] = print,
+    progress: Optional[Callable[[str], None]] = None,
+    html_progress: bool = False,
+    on_redraw_closed: Optional[Callable[[], None]] = None,
 ) -> Path:
     """Write one session's annotated validation video.
 
@@ -318,12 +376,33 @@ def export_validation_video(
         output_path: Destination ``.mp4`` path.
         disagreement_threshold_px: A node is drawn red, regardless of its
             usual color, when its reprojection error exceeds this.
+        log: Receives discrete one-off messages (frame count at the
+            start) -- same contract as :func:`alligaitor.inference.run_inference`.
+        progress: Receives a live, redrawing tqdm-style progress line as
+            frames render (see :class:`_FrameProgress`), throttled the
+            same way inference's own progress line is. Defaults to
+            ``log`` if not given.
+        html_progress: Whether ``progress`` wants an HTML-rendered line
+            (a rich-text GUI widget) or plain text -- same meaning as
+            :func:`alligaitor.inference.run_inference`'s own flag.
+        on_redraw_closed: Called once the final frame's progress update
+            has been sent to ``progress``, so a caller redrawing a line
+            in place (the GUI does) can start the next thing sharing that
+            line -- e.g. the next session's own inference bar -- fresh
+            instead of overwriting this bar's completed state.
 
     Returns:
         ``output_path``.
     """
+    if progress is None:
+        progress = log
+
     times, positions, errors = gait.load_pose_3d(csv_path)
     n_frames = len(times)
+    log(f"  Rendering validation video for '{session.name}' ({n_frames} frames)...")
+    frame_progress = _FrameProgress(
+        f"{session.name} validation video", n_frames, progress, html_progress, on_redraw_closed
+    )
     crossings = [trial] if isinstance(trial, TrialMetrics) else list(trial)
     crossing_starts = np.array(
         sorted(t.crossing_window[0] for t in crossings if t.crossing_window is not None)
@@ -432,10 +511,12 @@ def export_validation_video(
                 fourcc = cv2.VideoWriter_fourcc(*"avc1")
                 writer = cv2.VideoWriter(str(output_path), fourcc, fps_by_role[reference_role], (composite.shape[1], composite.shape[0]))
             writer.write(composite)
+            frame_progress.update(i)
     finally:
         for cap in caps.values():
             cap.release()
         if writer is not None:
             writer.release()
 
+    log(f"  Wrote validation video: {output_path}")
     return output_path
