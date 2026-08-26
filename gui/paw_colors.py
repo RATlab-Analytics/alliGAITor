@@ -42,14 +42,16 @@ def paw_color(paw: str) -> QColor:
 
 
 def grayed_paw_color(paw: str) -> QColor:
-    """A desaturated/lightened blend of `paw`'s own color, used on the
+    """A heavily desaturated blend of `paw`'s own color, used on the
     scrub bar for an unusable paw's fallback (longest-raw-run) window --
-    muted enough to read as "not trustworthy" while staying identifiable
-    as this specific paw rather than collapsing every unusable paw into
-    one indistinguishable gray."""
+    muted enough to read as "not trustworthy" at a glance (paired with a
+    thinner segment -- see video_player_widget.py's _MultiRowScrubBar)
+    while keeping just enough of a tint to still tell which paw it is,
+    rather than collapsing every unusable paw into one indistinguishable
+    gray."""
     c = _PAW_COLORS[paw]
-    gray = 140
-    blend = 0.55  # fraction gray
+    gray = 120
+    blend = 0.85  # fraction gray -- was 0.55; too close to the full-color segments to read as "muted" at a glance
     return QColor(
         round(c.red() * (1 - blend) + gray * blend),
         round(c.green() * (1 - blend) + gray * blend),

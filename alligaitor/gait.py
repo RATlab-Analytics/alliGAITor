@@ -134,6 +134,21 @@ class TrialMetrics:
         return f"{self.session_name} \u2014 crossing {self.crossing_index + 1} of {self.crossing_count}"
 
 
+def crossing_block_title(session_name: str, crossing_number: int, crossing_count: int) -> str:
+    """The exact title-row text :func:`write_group_report` gives one
+    crossing's block in the workbook -- ``"Session: {name}"`` for a
+    single-crossing recording, else with the crossing number appended
+    (mirrors :attr:`TrialMetrics.crossing_label`, prefixed the same way
+    :func:`write_group_report` prefixes it). Used by
+    :func:`annotate_manual_flag`, which has no :class:`TrialMetrics` to
+    read ``crossing_label`` from -- only the summary JSON's plain
+    ``crossing``/``crossing_count`` numbers -- to target exactly one
+    crossing's block instead of the whole recording's."""
+    if crossing_count <= 1:
+        return f"Session: {session_name}"
+    return f"Session: {session_name} \u2014 crossing {crossing_number} of {crossing_count}"
+
+
 def load_pose_3d(
     csv_path: PathLike,
 ) -> "tuple[np.ndarray, Dict[str, np.ndarray], Dict[str, np.ndarray]]":
@@ -1489,7 +1504,7 @@ def _safe_sheet_name(name: str, used: set) -> str:
 def write_group_report(
     trials: List[TrialMetrics],
     output_path: PathLike,
-    manual_flags: Optional[Dict[str, Tuple[set, str]]] = None,
+    manual_flags: Optional[Dict[str, Dict[int, Tuple[set, str]]]] = None,
 ) -> None:
     """Write one group's gait-metrics workbook: one tab per distinct ``rat_id``.
 
@@ -1509,14 +1524,17 @@ def write_group_report(
     where it did produce something usable.
 
     Args:
-        manual_flags: Session name -> (flagged paw names, note), carried
-            forward from :func:`alligaitor.validation.load_manual_flags` so
-            a regenerated workbook keeps highlighting a paw a reviewer
-            already flagged invalid by hand, exactly as
-            :func:`annotate_manual_flag` would highlight it on an
-            already-written workbook. A paw already bad from
-            :func:`_paw_has_no_usable_run` stays bad regardless of what's
-            here -- this only ever adds highlighting, never removes it.
+        manual_flags: Session name -> crossing number -> (flagged paw
+            names, note), carried forward from
+            :func:`alligaitor.validation.load_group_manual_flags` so a
+            regenerated workbook keeps highlighting a paw a reviewer
+            already flagged invalid by hand *on that specific crossing*,
+            exactly as :func:`annotate_manual_flag` would highlight it on
+            an already-written workbook -- a flag on crossing 2 doesn't
+            touch crossing 1's block for the same paw. A paw already bad
+            from :func:`_paw_has_no_usable_run` stays bad regardless of
+            what's here -- this only ever adds highlighting, never
+            removes it.
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1538,7 +1556,9 @@ def write_group_report(
             ws = wb.create_sheet(_safe_sheet_name(rat_id, used_names))
             row = 1
             for trial in rat_trials:
-                flagged_paws, note = manual_flags.get(trial.session_name, (set(), ""))
+                flagged_paws, note = manual_flags.get(trial.session_name, {}).get(
+                    trial.crossing_index + 1, (set(), "")
+                )
                 row = _write_paw_block(
                     ws, row,
                     title=f"Session: {trial.crossing_label}",
@@ -1568,7 +1588,7 @@ def write_group_report(
                     get_value=lambda stat, paw: _nanmean([getattr(t, stat)[paw] for t in rat_trials]),
                     is_bad=lambda paw, stat: all(
                         _paw_has_no_usable_run(t, paw)
-                        or paw in manual_flags.get(t.session_name, (set(), ""))[0]
+                        or paw in manual_flags.get(t.session_name, {}).get(t.crossing_index + 1, (set(), ""))[0]
                         or _stat_is_untrustworthy(t, paw, stat)
                         for t in rat_trials
                     ),
@@ -1580,64 +1600,64 @@ def write_group_report(
     wb.save(output_path)
 
 
-def _find_session_paw_rows(ws, session_name: str, paw: str) -> List[int]:
-    """Row indices of `paw`'s row in every block on `ws` belonging to
-    `session_name`, in sheet order -- empty if the session or paw row
-    isn't present (e.g. the workbook predates this session, or was
-    regenerated with different sessions).
+def _find_paw_row(ws, title: str, paw: str) -> Optional[int]:
+    """Row index of `paw`'s row within the block whose title cell reads
+    exactly `title` (see :func:`crossing_block_title`), or ``None`` if
+    that block or paw row isn't present (e.g. the workbook predates this
+    crossing, or was regenerated with different sessions).
 
-    A recording holding several crossings contributes one block per
-    crossing, titled ``"Session: {name} -- crossing i of n"`` (see
-    :attr:`TrialMetrics.crossing_label`), so this matches the bare title
-    *and* that prefixed form and returns all of them. The manual-flag
-    UI records a judgement about a paw in a recording, with no way to
-    say "only crossing 2", so :func:`annotate_manual_flag` applies it to
-    every crossing of that recording -- consistent with
-    :func:`write_group_report`, which keys manual flags by session name
-    and so highlights every crossing's block too.
-
-    Searches a bounded window below each title row rather than assuming
+    Searches a bounded window below the title row rather than assuming
     :func:`_write_paw_block`'s exact row offsets, so it keeps working
     even if that layout changes shape slightly.
     """
-    exact = f"Session: {session_name}"
-    prefix = f"{exact} \u2014 crossing "
-    rows: List[int] = []
     for row in ws.iter_rows(min_col=1, max_col=1):
         cell = row[0]
-        value = cell.value
-        if not isinstance(value, str) or not (value == exact or value.startswith(prefix)):
+        if cell.value != title:
             continue
         for r in range(cell.row + 1, cell.row + 16):
             if ws.cell(row=r, column=1).value == _PAW_LABELS[paw]:
-                rows.append(r)
-                break
-    return rows
+                return r
+        return None
+    return None
 
 
 def annotate_manual_flag(
     xlsx_path: PathLike,
     rat_id: str,
     session_name: str,
+    crossing_number: int,
+    crossing_count: int,
     paw: str,
     auto_usable: bool,
     flagged: bool,
     note: str = "",
 ) -> bool:
-    """Patch one paw's row in an already-written group workbook to reflect
-    a reviewer's manual flag, without regenerating the whole report from
-    :class:`TrialMetrics`.
+    """Patch one paw's row, on one specific crossing, in an already-written
+    group workbook to reflect a reviewer's manual flag -- without
+    regenerating the whole report from :class:`TrialMetrics`. A flag on
+    one crossing never touches another crossing's block for the same paw,
+    even within the same recording (see :func:`crossing_block_title`).
 
     The row is highlighted (and `note` written to its Notes cell) when
-    ``flagged`` or ``not auto_usable`` -- unflagging a paw the automatic
-    detection already called unusable (``auto_usable=False``) leaves it
-    highlighted, since that's a real "no usable run" finding this manual
-    action didn't create and shouldn't be able to erase. Only values/number
-    formats are left untouched; this only ever changes fill/font/notes.
+    ``flagged`` or ``not auto_usable`` -- unflagging a paw this crossing's
+    automatic detection already called unusable (``auto_usable=False``)
+    leaves it highlighted, since that's a real "no usable run" finding
+    this manual action didn't create and shouldn't be able to erase. Only
+    values/number formats are left untouched; this only ever changes
+    fill/font/notes.
+
+    Args:
+        crossing_number: 1-based crossing index within the recording
+            (matches :attr:`TrialMetrics.crossing_index` ``+ 1`` and a
+            validation summary's per-crossing ``"crossing"`` field).
+        crossing_count: How many crossings this recording has in total --
+            needed to reconstruct the exact block title (a single-
+            crossing recording's block has no crossing number in its
+            title at all).
 
     Returns:
         ``True`` if the target row was found and patched, ``False`` if the
-        workbook has no matching rat sheet / session block / paw row (the
+        workbook has no matching rat sheet / crossing block / paw row (the
         caller should warn rather than assume the flag took effect).
     """
     from openpyxl import load_workbook
@@ -1654,21 +1674,21 @@ def annotate_manual_flag(
     if ws is None:
         return False
 
-    rows = _find_session_paw_rows(ws, session_name, paw)
-    if not rows:
+    title = crossing_block_title(session_name, crossing_number, crossing_count)
+    row = _find_paw_row(ws, title, paw)
+    if row is None:
         return False
 
     bad = flagged or not auto_usable
     fill = _BAD_FILL if bad else _CLEAR_FILL
     font = _BAD_FONT if bad else _CLEAR_FONT
-    for row in rows:
-        for col in range(1, _N_STAT_COLUMNS + 1):
-            cell = ws.cell(row=row, column=col)
-            cell.fill = fill
-            cell.font = font
-        notes_cell = ws.cell(row=row, column=_NOTES_COLUMN, value=(note if flagged else None))
-        notes_cell.fill = fill
-        notes_cell.font = font
+    for col in range(1, _N_STAT_COLUMNS + 1):
+        cell = ws.cell(row=row, column=col)
+        cell.fill = fill
+        cell.font = font
+    notes_cell = ws.cell(row=row, column=_NOTES_COLUMN, value=(note if flagged else None))
+    notes_cell.fill = fill
+    notes_cell.font = font
 
     wb.save(xlsx_path)
     return True

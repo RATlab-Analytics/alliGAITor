@@ -1,9 +1,11 @@
 """
 Validation list: one row per session in a completed job, showing each
 paw's used-run duration (green if usable, red if not -- see
-alligaitor.validation.effective_usability) and the fraction of paws
-usable, so a reviewer can spot problem sessions at a glance before
-double-clicking into the video (validation_video_dialog.py).
+alligaitor.validation.effective_usability), the fraction of the
+recording's crossings that paw was even visible in (for a multi-crossing
+session), and the fraction of paws usable overall, so a reviewer can spot
+problem sessions at a glance before double-clicking into the video
+(validation_video_dialog.py).
 
 Opened by double-clicking a DONE job in main_window.py's table, or via
 its "View Validation..." context-menu action.
@@ -95,8 +97,8 @@ class ValidationListDialog(QDialog):
             video_path = Path(self.job.validation_dir) / f"{session.name}.validation.mp4"
 
             summary = validation.load_validation_summary(summary_path)
-            flagged_paws, _note = validation.load_manual_flags(flags_path)
-            usability = validation.effective_usability(summary, flagged_paws) if summary is not None else None
+            flags_by_crossing = validation.load_manual_flags(flags_path)
+            usability = validation.effective_usability(summary, flags_by_crossing) if summary is not None else None
 
             self._rows.append({
                 "session": session,
@@ -134,7 +136,8 @@ class ValidationListDialog(QDialog):
             # A recording can hold several crossings (rat walks out, turns, walks
             # back...). The per-paw columns below are rolled up across them by
             # save_validation_summary, so say how many are behind that roll-up.
-            n_crossings = len(summary.get("crossings") or [])
+            crossings = validation.crossings_or_fallback(summary)
+            n_crossings = len(crossings)
             label = session.name if n_crossings <= 1 else f"{session.name}  ({n_crossings} crossings)"
             session_item = QTableWidgetItem(label)
             session_item.setForeground(QBrush(title_color))
@@ -142,10 +145,16 @@ class ValidationListDialog(QDialog):
 
             for col, paw in enumerate(ordered_paws(), start=1):
                 window = summary.get("paws", {}).get(paw)
-                text = f"{window['duration_s']:.2f}s" if window else "0.00s"
+                duration_text = f"{window['duration_s']:.2f}s" if window else "0.00s"
+                n_visible = sum(1 for c in crossings if c.get("paws", {}).get(paw) is not None)
+                # Only worth showing once there's more than one crossing to
+                # be a fraction of -- a single-crossing session's fraction
+                # is always trivially 0/1 or 1/1 and would just be noise.
+                text = duration_text if n_crossings <= 1 else f"{duration_text}  ({n_visible}/{n_crossings})"
                 color = COLOR_USABLE if usability[paw] else COLOR_UNUSABLE
                 item = QTableWidgetItem(text)
                 item.setForeground(QBrush(color))
+                item.setToolTip(f"Visible (tracked) in {n_visible} of {n_crossings} crossing(s)")
                 self.table.setItem(i, col, item)
 
             n_usable = sum(usability.values())
