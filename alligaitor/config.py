@@ -196,23 +196,28 @@ class GaitConfig:
             dropouts during a single swing, not multi-swing outages), and
             the previous default of ``2`` was leaving nearly every one of
             those just barely un-bridged -- fragmenting genuinely
-            consecutive steps into short runs for no reason tied to data
+            consecutive strides into short runs for no reason tied to data
             quality. A bridged gap also stops counting as a camera-caused
             discard (see ``find_camera_caused_discards``), which is why a
             second, independent check
-            (``stride_length_outlier_ratio``) exists for steps a gap
+            (``stride_length_outlier_ratio``) exists for strides a gap
             *doesn't* explain: one silently missing entirely inside a
             span that still reads as clean.
-        min_consecutive_steps: A paw's reported stride/step/ground-contact
-            averages are computed only from steps that are part of a run
+        min_consecutive_strides: A paw's reported stride/step/ground-contact
+            averages are computed only from strides that are part of a run
             of at least this many consecutive accepted stance events with
             no camera-caused discard (see
             :func:`alligaitor.gait.find_camera_caused_discards`) in the
             swing between any pair -- an isolated good detection that
             isn't part of such a run doesn't count, and a paw with no
             qualifying run at all reports ``NaN`` rather than an average
-            built from too little (or too suspect) data. See
-            :func:`alligaitor.gait.restrict_to_consecutive_runs`.
+            built from too little (or too suspect) data. A step (paw vs.
+            the contralateral paw) is a different measurement from a
+            stride (paw vs. itself) and has its own evidence bar -- see
+            ``min_valid_steps`` below -- so this field governs stride,
+            ground-contact-time, and (indirectly, via the same run) step
+            length, but is named for what it actually counts: consecutive
+            strides. See :func:`alligaitor.gait.restrict_to_consecutive_runs`.
         stillness_window_seconds: Width, in seconds, of the window the
             whole-body speed below is measured across (see
             :func:`alligaitor.gait.windowed_body_speed`). Frame-to-frame
@@ -254,24 +259,52 @@ class GaitConfig:
             :func:`alligaitor.pipeline.run_session`), so a frame count
             means a different real duration on every rig. See
             :func:`alligaitor.gait.active_window`.
+        min_valid_steps: Fewest valid steps (see
+            :func:`alligaitor.gait._step_lengths`) a paw needs before its
+            average step length is reported at all; below this it is
+            ``NaN`` and flagged on its own, independently of stride
+            length and ground contact time. Step length is the one
+            metric that depends on a *second* paw -- it measures forward
+            distance from the contralateral paw's most recent touchdown
+            -- so it can be untrustworthy on a crossing where everything
+            else about this paw is clean, and needs a verdict of its
+            own. Defaults to ``5``, holding step length to the same
+            evidence bar a qualifying run must clear
+            (``min_consecutive_strides``); kept a separate field so
+            lowering that threshold to rescue runs doesn't silently
+            lower this one too.
         stride_length_outlier_ratio: A stride longer than this many times
             a paw's own median stride length in the trial is flagged as
-            likely hiding a missed step -- e.g. a real stance the speed
+            likely hiding a missed stance -- e.g. a real stance the speed
             classifier failed to recognize -- rather than being one
             genuine stride, and breaks a qualifying run the same way a
             camera-caused discard does. This catches exactly what
             ``max_bridge_gap_frames`` cannot: triangulation can be clean
             the entire way through and still miss a real, brief stance.
+            A stride with zero or negative net forward progress breaks a
+            run the same way, unconditionally -- not scaled by this
+            ratio, since no multiple of a real stride's length justifies
+            a genuinely backward one. Investigated on real trials: these
+            traced to genuine, cleanly-triangulated paw movement during
+            a brief mid-crossing pause (grooming, sniffing) rather than
+            to turning or walking backward, but the *cause* doesn't
+            matter for this purpose -- directed locomotion shouldn't
+            produce a non-positive stride, so one is never trustworthy
+            regardless of why. This paw's own median (used for the
+            ratio check above) is computed from its positive strides
+            only, so a paused/backward one can't drag it down and mask
+            a real too-long outlier next to it.
             See :func:`alligaitor.gait.find_stride_length_outliers`.
     """
 
     speed_threshold_mm_s: float = 50.0
     min_contact_frames: int = 1
     max_bridge_gap_frames: int = 4
-    min_consecutive_steps: int = 5
+    min_consecutive_strides: int = 5
     stillness_window_seconds: float = 0.4
     stillness_window_speed_mm_s: float = 100.0
     min_still_seconds: float = 0.4
+    min_valid_steps: int = 5
     stride_length_outlier_ratio: float = 1.8
 
     @classmethod
@@ -297,6 +330,14 @@ class GaitConfig:
         between adjacent frames, so an old file's value is off by more
         than an order of magnitude and silently honoring it would leave
         the check doing nothing.
+
+        ``min_consecutive_steps`` -> ``min_consecutive_strides`` was a
+        naming fix, not a behavior change: the field always counted
+        consecutive stance events feeding stride/ground-contact-time
+        averages (paw vs. itself), never the contralateral-paw
+        measurement a "step" actually is (see ``min_valid_steps``) -- an
+        old file's value means exactly what it always meant and just
+        gets dropped-and-defaulted like any other unrecognized key here.
         """
         values = dict(raw or {})
         known = {f.name for f in dataclasses.fields(cls)}
@@ -370,6 +411,15 @@ class PipelineConfig:
             ``sessions`` from a folder of videos, if it did. Round-tripped
             for editing but not read by :func:`run_pipeline`/`run_group` --
             ``sessions`` is always the source of truth for a run.
+        skip_validation_videos: If ``True``, :func:`alligaitor.pipeline.run_group`
+            skips rendering an annotated validation video for every
+            session in this group (see
+            :func:`alligaitor.validation_video.export_validation_video`)
+            -- e.g. for a group where render time isn't worth it and the
+            spreadsheet/paw-usability summary alone is enough. Defaults to
+            ``False`` (videos are generated). Editable per group in the
+            config editor; new groups start from
+            ``app_settings.get_default_skip_validation_videos``.
     """
 
     models: ModelConfig
@@ -379,6 +429,7 @@ class PipelineConfig:
     output_xlsx: Optional[Path] = None
     gait: GaitConfig = field(default_factory=GaitConfig)
     discovery: Optional[DiscoveryConfig] = None
+    skip_validation_videos: bool = False
 
     @classmethod
     def from_yaml(cls, path: PathLike) -> "PipelineConfig":
@@ -445,6 +496,7 @@ class PipelineConfig:
             output_xlsx=output_xlsx,
             gait=gait,
             discovery=discovery,
+            skip_validation_videos=bool(raw.get("skip_validation_videos", False)),
         )
 
     def to_yaml(self, path: PathLike) -> None:
@@ -493,12 +545,14 @@ class PipelineConfig:
                 "speed_threshold_mm_s": self.gait.speed_threshold_mm_s,
                 "min_contact_frames": self.gait.min_contact_frames,
                 "max_bridge_gap_frames": self.gait.max_bridge_gap_frames,
-                "min_consecutive_steps": self.gait.min_consecutive_steps,
+                "min_consecutive_strides": self.gait.min_consecutive_strides,
                 "stillness_window_seconds": self.gait.stillness_window_seconds,
                 "stillness_window_speed_mm_s": self.gait.stillness_window_speed_mm_s,
                 "min_still_seconds": self.gait.min_still_seconds,
+                "min_valid_steps": self.gait.min_valid_steps,
                 "stride_length_outlier_ratio": self.gait.stride_length_outlier_ratio,
             },
+            "skip_validation_videos": self.skip_validation_videos,
         }
         if self.output_xlsx is not None:
             raw["output_xlsx"] = _relativize(base_dir, self.output_xlsx)

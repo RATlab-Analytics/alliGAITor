@@ -225,11 +225,18 @@ def run_group(
         validation_dir: If given, an annotated validation video (see
             :func:`alligaitor.validation_video.export_validation_video`) is
             rendered for every session into
-            ``validation_dir/<session.name>.validation.mp4``. Rendering is
-            best-effort: a failure is logged via ``log`` and skipped rather
-            than failing the whole run -- the workbook and every other
-            session's video are still produced. ``None`` (the default)
-            skips video export entirely.
+            ``validation_dir/<session.name>.validation.mp4``, reusing the
+            same ``log``/``progress``/``html_progress``/``on_redraw_closed``
+            as inference above -- so rendering shows its own live,
+            tqdm-styled progress line the same way a camera role's
+            inference does, rather than the log going quiet for however
+            long a render takes. Rendering is best-effort: a failure is
+            logged via ``log`` and skipped rather than failing the whole
+            run -- the workbook and every other session's video are still
+            produced. ``None`` (the default) skips video export entirely,
+            as does ``config.skip_validation_videos`` -- a per-group
+            opt-out (see :class:`alligaitor.config.PipelineConfig`) that
+            takes effect even when a ``validation_dir`` is given.
 
     Returns:
         Path to the written gait-metrics workbook.
@@ -245,7 +252,10 @@ def run_group(
             session, config.models, cgroup, device=device, tracking=tracking,
             log=log, progress=progress, html_progress=html_progress, on_redraw_closed=on_redraw_closed,
         )
-        trial = gait.compute_trial_metrics(
+        # One recording can hold several crossings (the rat walks the tunnel,
+        # turns, walks back, turns, walks again). Each is its own trial with
+        # its own direction of travel -- see gait.compute_crossing_metrics.
+        crossings = gait.compute_crossing_metrics(
             csv_path,
             session_name=session.name,
             rat_id=session.rat_id,
@@ -253,22 +263,30 @@ def run_group(
         )
 
         times, positions, _ = gait.load_pose_3d(csv_path)
-        trial = gait.restrict_to_consecutive_runs(trial, times, positions, config.gait)
+        crossings = [
+            gait.restrict_to_consecutive_runs(t, times, positions, config.gait)
+            for t in crossings
+        ]
+        if len(crossings) > 1:
+            log(f"[{session.name}] {len(crossings)} crossings detected: "
+                + ", ".join(f"frames {t.crossing_window[0]}-{t.crossing_window[1]}" for t in crossings))
 
-        gait.save_paw_events_csv(trial, session.output_dir / f"{session.name}.paw_events.csv")
+        gait.save_paw_events_csv(crossings, session.output_dir / f"{session.name}.paw_events.csv")
         validation.save_validation_summary(
-            trial, times, positions, config.gait,
+            crossings, times, positions, config.gait,
             session.output_dir / f"{session.name}.validation_summary.json",
         )
-        if validation_dir is not None:
+        if validation_dir is not None and not config.skip_validation_videos:
             try:
                 validation_video.export_validation_video(
-                    session, csv_path, cgroup, trial, config.gait,
+                    session, csv_path, cgroup, crossings, config.gait,
                     Path(validation_dir) / f"{session.name}.validation.mp4",
+                    log=log, progress=progress, html_progress=html_progress,
+                    on_redraw_closed=on_redraw_closed,
                 )
             except Exception as exc:
                 log(f"[{session.name}] validation video export failed: {exc}")
-        trials.append(trial)
+        trials.extend(crossings)
 
         if progress_callback is not None:
             progress_callback(session.name, i, total)

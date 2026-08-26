@@ -131,7 +131,12 @@ class ValidationListDialog(QDialog):
 
             all_usable = all(usability.values())
             title_color = COLOR_USABLE if all_usable else COLOR_UNUSABLE
-            session_item = QTableWidgetItem(session.name)
+            # A recording can hold several crossings (rat walks out, turns, walks
+            # back...). The per-paw columns below are rolled up across them by
+            # save_validation_summary, so say how many are behind that roll-up.
+            n_crossings = len(summary.get("crossings") or [])
+            label = session.name if n_crossings <= 1 else f"{session.name}  ({n_crossings} crossings)"
+            session_item = QTableWidgetItem(label)
             session_item.setForeground(QBrush(title_color))
             self.table.setItem(i, 0, session_item)
 
