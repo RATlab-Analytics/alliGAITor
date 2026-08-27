@@ -17,6 +17,18 @@ from alligaitor.triangulation import Pose3D
 from aniposelib.cameras import CameraGroup
 
 
+def _baseline_pose_3d_csv_path(session: SessionConfig) -> Path:
+    """Where :func:`run_session` writes the pre-fallback triangulation
+    when ``bottom_fallback`` is on -- a plain-triangulation reference
+    :func:`run_group` reads back to guard against the fallback ever
+    making an already-usable paw run worse (see
+    :func:`alligaitor.bottom_fallback.guard_against_regression`). A
+    shared helper so the two functions can't drift onto different
+    filenames for the same thing.
+    """
+    return session.output_dir / f"{session.name}.pose_3d.pre_fallback.csv"
+
+
 def load_track(video_path: Path, slp_path: Path) -> PoseTrack2D:
     """Load one camera view's 2D predictions, corrected into its uncropped source frame.
 
@@ -46,6 +58,7 @@ def run_session(
     progress: Optional[Callable[[str], None]] = None,
     html_progress: bool = False,
     on_redraw_closed: Optional[Callable[[], None]] = None,
+    bottom_fallback: bool = False,
 ) -> Path:
     """Run 2D inference and 3D triangulation for a single session.
 
@@ -68,6 +81,9 @@ def run_session(
             :func:`alligaitor.inference.run_inference` -- called whenever
             a redrawn progress line's definitive final state has just
             been sent to ``progress``.
+        bottom_fallback: See :attr:`alligaitor.config.PipelineConfig.bottom_fallback`.
+            Imported and applied only when ``True``, so this experimental
+            path is never even loaded for a group that doesn't opt in.
 
     Returns:
         Path to the written 3D trajectory CSV.
@@ -96,22 +112,47 @@ def run_session(
     # calibration.world_up_direction's own warning), undermining the
     # "sides are reliable for height" assumption it's built on. Revisit
     # once that calibration issue is understood/fixed.
-    pose_3d = triangulation.triangulate(tracks, cgroup, fps_by_role)
+    baseline_pose_3d = triangulation.triangulate(tracks, cgroup, fps_by_role)
+    pose_3d = baseline_pose_3d
+    fallback_mask = None
+    if bottom_fallback:
+        from alligaitor import bottom_fallback as _bottom_fallback  # local import: see PipelineConfig.bottom_fallback
+
+        pose_3d, fallback_mask = _bottom_fallback.fill_gaps(baseline_pose_3d, tracks, cgroup, fps_by_role)
     # Matches triangulation.align_tracks_by_time's choice of reference
     # timeline: the pose is resampled onto the slowest camera's own frame
     # times, so that view's fps gives the true seconds-per-row of pose_3d.
     reference_fps = min(fps_by_role.values())
 
     csv_path = session.output_dir / f"{session.name}.pose_3d.csv"
-    save_pose_3d_csv(pose_3d, reference_fps, csv_path)
+    save_pose_3d_csv(pose_3d, reference_fps, csv_path, fallback_mask=fallback_mask)
+    if bottom_fallback:
+        # Kept purely for run_group's regression guard (see
+        # _baseline_pose_3d_csv_path) -- not otherwise read by anything.
+        save_pose_3d_csv(baseline_pose_3d, reference_fps, _baseline_pose_3d_csv_path(session))
     return csv_path
 
 
-def save_pose_3d_csv(pose_3d: Pose3D, fps: float, csv_path: Path) -> None:
-    """Write a triangulated pose to a long-format CSV: frame, time_s, node, x, y, z, error."""
+def save_pose_3d_csv(
+    pose_3d: Pose3D, fps: float, csv_path: Path, fallback_mask: Optional[np.ndarray] = None
+) -> None:
+    """Write a triangulated pose to a long-format CSV: frame, time_s, node, x, y, z, error, fallback.
+
+    Args:
+        fallback_mask: Boolean ``(n_frames, n_nodes)`` array, ``True``
+            wherever that point came from
+            :func:`alligaitor.bottom_fallback.fill_gaps` rather than real
+            triangulation (see that function's return value). ``None``
+            (the default -- always the case when
+            ``PipelineConfig.bottom_fallback`` is off) writes the column
+            as all ``False``, so every ``pose_3d.csv`` has the same
+            schema regardless of whether the fallback ran.
+    """
     n_frames, n_nodes, _ = pose_3d.points.shape
     frame_idx, node_idx = np.meshgrid(np.arange(n_frames), np.arange(n_nodes), indexing="ij")
     node_names = np.array(pose_3d.node_names)
+    if fallback_mask is None:
+        fallback_mask = np.zeros((n_frames, n_nodes), dtype=bool)
 
     df = pd.DataFrame(
         {
@@ -122,6 +163,7 @@ def save_pose_3d_csv(pose_3d: Pose3D, fps: float, csv_path: Path) -> None:
             "y": pose_3d.points[..., 1].ravel(),
             "z": pose_3d.points[..., 2].ravel(),
             "reprojection_error_px": pose_3d.reprojection_error.ravel(),
+            "fallback": fallback_mask.ravel(),
         }
     )
     csv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -168,6 +210,7 @@ def run_pipeline(
         run_session(
             session, config.models, cgroup, device=device, tracking=tracking,
             log=log, progress=progress, html_progress=html_progress, on_redraw_closed=on_redraw_closed,
+            bottom_fallback=config.bottom_fallback,
         )
         for session in config.sessions
     ]
@@ -251,6 +294,7 @@ def run_group(
         csv_path = run_session(
             session, config.models, cgroup, device=device, tracking=tracking,
             log=log, progress=progress, html_progress=html_progress, on_redraw_closed=on_redraw_closed,
+            bottom_fallback=config.bottom_fallback,
         )
         # One recording can hold several crossings (the rat walks the tunnel,
         # turns, walks back, turns, walks again). Each is its own trial with
@@ -262,11 +306,30 @@ def run_group(
             config=config.gait,
         )
 
-        times, positions, _ = gait.load_pose_3d(csv_path)
+        times, positions, _, fallback = gait.load_pose_3d(csv_path)
         crossings = [
             gait.restrict_to_consecutive_runs(t, times, positions, config.gait)
             for t in crossings
         ]
+        crossings = [
+            gait.attach_bottom_fallback_fraction(t, times, positions, fallback, config.gait)
+            for t in crossings
+        ]
+        if config.bottom_fallback:
+            from alligaitor import bottom_fallback as _bottom_fallback  # local import: see PipelineConfig.bottom_fallback
+
+            baseline_csv_path = _baseline_pose_3d_csv_path(session)
+            baseline_crossings = gait.compute_crossing_metrics(
+                baseline_csv_path, session_name=session.name, rat_id=session.rat_id, config=config.gait,
+            )
+            baseline_times, baseline_positions, _, _ = gait.load_pose_3d(baseline_csv_path)
+            baseline_crossings = [
+                gait.restrict_to_consecutive_runs(t, baseline_times, baseline_positions, config.gait)
+                for t in baseline_crossings
+            ]
+            crossings = _bottom_fallback.guard_against_regression(
+                crossings, baseline_crossings, baseline_times, baseline_positions, config.gait,
+            )
         if len(crossings) > 1:
             log(f"[{session.name}] {len(crossings)} crossings detected: "
                 + ", ".join(f"frames {t.crossing_window[0]}-{t.crossing_window[1]}" for t in crossings))
@@ -275,6 +338,7 @@ def run_group(
         validation.save_validation_summary(
             crossings, times, positions, config.gait,
             session.output_dir / f"{session.name}.validation_summary.json",
+            fallback_mask=fallback,
         )
         if validation_dir is not None and not config.skip_validation_videos:
             try:

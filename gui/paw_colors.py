@@ -35,6 +35,13 @@ _PAW_COLORS = {
 # red means bad" reads the same way everywhere in the app.
 COLOR_USABLE = QColor("#81c995")
 COLOR_UNUSABLE = QColor("#f28b82")
+# A run that's still usable but leans heavily on the experimental
+# bottom-camera fallback (see alligaitor.gait.BOTTOM_FALLBACK_WARN_THRESHOLD)
+# -- the same amber job_table_model.py's _STATUS_COLORS uses for
+# NEEDS_CONFIG/NEEDS_CROP, so "needs a second look" reads consistently
+# across the app. Never used in place of COLOR_UNUSABLE -- only ever on
+# top of a paw that's already usable.
+COLOR_FALLBACK_WARNING = QColor("#ffca28")
 
 
 def paw_color(paw: str) -> QColor:

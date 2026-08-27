@@ -30,7 +30,13 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 
-from alligaitor.gait import PAW_NODES, GaitConfig, TrialMetrics, paw_usability_windows
+from alligaitor.gait import (
+    BOTTOM_FALLBACK_WARN_THRESHOLD,
+    PAW_NODES,
+    GaitConfig,
+    TrialMetrics,
+    paw_usability_windows,
+)
 
 # crossing_number (1-based) -> (flagged paw names, shared note)
 ManualFlags = Dict[int, Tuple[Set[str], str]]
@@ -48,6 +54,7 @@ def save_validation_summary(
     positions: Dict[str, np.ndarray],
     config: GaitConfig,
     path: PathLike,
+    fallback_mask: Optional[Dict[str, np.ndarray]] = None,
 ) -> None:
     """Compute and write per-paw usability windows (see
     :func:`alligaitor.gait.paw_usability_windows`) to `path`.
@@ -65,6 +72,16 @@ def save_validation_summary(
     -- "is there a good run for this paw in this recording?" -- while
     ``crossings`` holds the detail for a caller that needs per-crossing
     resolution.
+
+    Args:
+        fallback_mask: Per paw, an ``(n_frames,)`` boolean array (see
+            :func:`alligaitor.gait.load_pose_3d`'s ``fallback`` return
+            value), forwarded to :func:`alligaitor.gait.paw_usability_windows`
+            so each written window carries its own
+            ``bottom_fallback_fraction`` -- how much of that window came
+            from :func:`alligaitor.bottom_fallback.fill_gaps` rather than
+            real triangulation. ``None`` (the default) leaves every
+            window's fraction at ``0.0``.
     """
     trials = [trial] if isinstance(trial, TrialMetrics) else list(trial)
     if not trials:
@@ -72,7 +89,7 @@ def save_validation_summary(
 
     per_crossing = []
     for t in trials:
-        windows = paw_usability_windows(t, times, positions, config)
+        windows = paw_usability_windows(t, times, positions, config, bottom_fallback_mask=fallback_mask)
         per_crossing.append({
             "crossing": t.crossing_index + 1,
             "crossing_count": t.crossing_count,
@@ -208,6 +225,36 @@ def effective_usability(summary: dict, flags_by_crossing: ManualFlags) -> Dict[s
                 usable = True
                 break
         result[paw] = usable
+    return result
+
+
+def usable_paws_with_fallback_warning(summary: dict, flags_by_crossing: ManualFlags) -> Dict[str, bool]:
+    """Per paw, whether the crossing that makes it usable (see
+    :func:`effective_usability`) leans heavily on the experimental
+    bottom-camera fallback -- ``True`` when that crossing's window has
+    ``bottom_fallback_fraction`` over :data:`alligaitor.gait.BOTTOM_FALLBACK_WARN_THRESHOLD`.
+
+    Only meaningful for a paw :func:`effective_usability` already reports
+    as usable -- a caller should show this as a yellow caution on top of
+    green, never in place of red, since the run is still usable, just one
+    worth a second look. Walks the exact same crossing that decides
+    usability (not just "any crossing"), so this can never flag a paw
+    whose usable run was untouched by the fallback just because some
+    *other*, already-unusable crossing happened to lean on it.
+    """
+    crossings = crossings_or_fallback(summary)
+    result = {}
+    for paw in PAW_NODES:
+        heavy_fallback = False
+        for crossing in crossings:
+            window = crossing.get("paws", {}).get(paw)
+            if window is None:
+                continue
+            crossing_number = crossing.get("crossing", 1)
+            if window.get("usable") and paw not in crossing_flagged_paws(flags_by_crossing, crossing_number):
+                heavy_fallback = window.get("bottom_fallback_fraction", 0.0) > BOTTOM_FALLBACK_WARN_THRESHOLD
+                break
+        result[paw] = heavy_fallback
     return result
 
 

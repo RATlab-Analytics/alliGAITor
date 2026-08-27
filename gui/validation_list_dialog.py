@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
 
 from alligaitor import validation
 from alligaitor.config import PipelineConfig
-from paw_colors import PAW_SHORT_LABELS, COLOR_USABLE, COLOR_UNUSABLE, ordered_paws
+from paw_colors import PAW_SHORT_LABELS, COLOR_USABLE, COLOR_UNUSABLE, COLOR_FALLBACK_WARNING, ordered_paws
 from validation_video_dialog import ValidationVideoDialog
 
 _COLOR_NEUTRAL = QColor(150, 150, 150)
@@ -71,7 +71,9 @@ class ValidationListDialog(QDialog):
 
         legend = QLabel(
             f'<span style="color:{COLOR_USABLE.name()};">green = usable</span> &nbsp;&nbsp; '
-            f'<span style="color:{COLOR_UNUSABLE.name()};">red = not usable</span>'
+            f'<span style="color:{COLOR_UNUSABLE.name()};">red = not usable</span> &nbsp;&nbsp; '
+            f'<span style="color:{COLOR_FALLBACK_WARNING.name()};">yellow = usable, but &gt;1/3 '
+            f'from the 2D bottom-camera fallback</span>'
         )
 
         layout = QVBoxLayout(self)
@@ -99,11 +101,16 @@ class ValidationListDialog(QDialog):
             summary = validation.load_validation_summary(summary_path)
             flags_by_crossing = validation.load_manual_flags(flags_path)
             usability = validation.effective_usability(summary, flags_by_crossing) if summary is not None else None
+            fallback_warning = (
+                validation.usable_paws_with_fallback_warning(summary, flags_by_crossing)
+                if summary is not None else None
+            )
 
             self._rows.append({
                 "session": session,
                 "summary": summary,
                 "usability": usability,
+                "fallback_warning": fallback_warning,
                 "video_path": video_path,
             })
 
@@ -120,6 +127,7 @@ class ValidationListDialog(QDialog):
             session = row["session"]
             summary = row["summary"]
             usability = row["usability"]
+            fallback_warning = row["fallback_warning"]
 
             if usability is None:
                 session_item = QTableWidgetItem(f"{session.name}  (no validation data yet)")
@@ -151,10 +159,20 @@ class ValidationListDialog(QDialog):
                 # be a fraction of -- a single-crossing session's fraction
                 # is always trivially 0/1 or 1/1 and would just be noise.
                 text = duration_text if n_crossings <= 1 else f"{duration_text}  ({n_visible}/{n_crossings})"
-                color = COLOR_USABLE if usability[paw] else COLOR_UNUSABLE
+                heavy_fallback = usability[paw] and fallback_warning.get(paw, False)
+                if not usability[paw]:
+                    color = COLOR_UNUSABLE
+                elif heavy_fallback:
+                    color = COLOR_FALLBACK_WARNING
+                else:
+                    color = COLOR_USABLE
                 item = QTableWidgetItem(text)
                 item.setForeground(QBrush(color))
-                item.setToolTip(f"Visible (tracked) in {n_visible} of {n_crossings} crossing(s)")
+                tooltip = f"Visible (tracked) in {n_visible} of {n_crossings} crossing(s)"
+                if heavy_fallback:
+                    fraction = (window or {}).get("bottom_fallback_fraction", 0.0)
+                    tooltip += f"\n{fraction:.0%} of this run came from the 2D bottom-camera fallback"
+                item.setToolTip(tooltip)
                 self.table.setItem(i, col, item)
 
             n_usable = sum(usability.values())

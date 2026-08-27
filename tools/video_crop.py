@@ -109,21 +109,31 @@ def _apply_brightness_contrast(frame: np.ndarray, brightness: float, contrast: f
     return out
 
 
-def apply_bottom_up_color_correction(frame_bgr: np.ndarray, strength: float = 1.0) -> np.ndarray:
-    """Stacks the Brightness/Contrast layers in _BC_LAYERS (see module
-    docstring above) on a single BGR frame (uint8), clipping to uint8
-    only once at the end.
+def apply_bottom_up_color_correction(
+    frame_bgr: np.ndarray, strength: float = 1.0, layers: list[tuple[float, float]] | None = None,
+) -> np.ndarray:
+    """Stacks two Brightness/Contrast layers (see module docstring above)
+    on a single BGR frame (uint8), clipping to uint8 only once at the end.
 
     strength scales every layer's brightness/contrast linearly -- 1.0 is
-    the full recipe as documented by the colleague who did this in
-    Photoshop, 0.0 is a no-op, values in between fade toward that no-op
-    (e.g. for the bottom camera's brighter ambient light needing a less
-    stark correction than the side-angle test frames this was tuned
-    against)."""
-    strength = max(0.0, min(1.0, strength))
+    the full _BC_LAYERS recipe as documented by the colleague who did
+    this in Photoshop, 0.0 is a no-op, values in between fade toward that
+    no-op (e.g. for the bottom camera's brighter ambient light needing a
+    less stark correction than the side-angle test frames this was tuned
+    against).
+
+    layers, if given, overrides _BC_LAYERS/strength entirely with an
+    explicit [(layer1_brightness, layer1_contrast), (layer2_brightness,
+    layer2_contrast)] pair in Photoshop's -100..100 range -- this is what
+    the GUI's "Advanced" per-layer sliders drive (see
+    crop_setup_dialog.py), for hand-tuning the correction on input
+    exposures the single strength knob can't reach cleanly."""
+    if layers is None:
+        strength = max(0.0, min(1.0, strength))
+        layers = [(b * strength, c * strength) for b, c in _BC_LAYERS]
     out = frame_bgr.astype(np.float32)
-    for brightness, contrast in _BC_LAYERS:
-        out = _apply_brightness_contrast(out, brightness * strength, contrast * strength)
+    for brightness, contrast in layers:
+        out = _apply_brightness_contrast(out, brightness, contrast)
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
@@ -174,7 +184,8 @@ class CropRegionError(ValueError):
 
 
 def crop_video(video_path, out_path, x: int, y: int, width: int, height: int,
-                log=print, color_grade: bool = False, color_grade_strength: float = 1.0) -> Path:
+                log=print, color_grade: bool = False, color_grade_strength: float = 1.0,
+                color_grade_layers: list[tuple[float, float]] | None = None) -> Path:
     """Crop a single video to the `width`x`height` window starting at
     (x, y), writing to out_path. Raises CropRegionError if that window
     doesn't fit inside the source frame -- never silently clamps, since a
@@ -185,7 +196,9 @@ def crop_video(video_path, out_path, x: int, y: int, width: int, height: int,
     cropped frame before it's written -- for bottom-up (tunnel) footage
     only. Leave False for side-angle footage, which was never processed
     this way. color_grade_strength (0.0-1.0) scales how strong that
-    correction is; ignored when color_grade is False.
+    correction is; ignored when color_grade is False. color_grade_layers,
+    if given, overrides color_grade_strength with explicit per-layer
+    (brightness, contrast) values -- see apply_bottom_up_color_correction().
     """
     video_path = Path(video_path)
     out_path = Path(out_path)
@@ -244,7 +257,9 @@ def crop_video(video_path, out_path, x: int, y: int, width: int, height: int,
                 break
             cropped = frame[y:y + height, x:x + width]
             if color_grade:
-                cropped = apply_bottom_up_color_correction(cropped, strength=color_grade_strength)
+                cropped = apply_bottom_up_color_correction(
+                    cropped, strength=color_grade_strength, layers=color_grade_layers,
+                )
             try:
                 proc.stdin.write(cropped.tobytes())
             except BrokenPipeError:
@@ -268,6 +283,7 @@ def crop_video(video_path, out_path, x: int, y: int, width: int, height: int,
 def crop_folder(
     input_folder, output_folder, x: int, y: int, width: int, height: int,
     log=print, on_progress=None, color_grade: bool = False, color_grade_strength: float = 1.0,
+    color_grade_layers: list[tuple[float, float]] | None = None,
 ) -> list[Path]:
     """Crops every video under input_folder into the equivalent relative
     path under output_folder. A video already exactly the target size
@@ -299,7 +315,8 @@ def crop_folder(
         else:
             log(f"[{i}/{total}] Cropping {video_path.name}...")
             crop_video(video_path, out_path, x, y, width, height, log=log,
-                       color_grade=color_grade, color_grade_strength=color_grade_strength)
+                       color_grade=color_grade, color_grade_strength=color_grade_strength,
+                       color_grade_layers=color_grade_layers)
 
         written.append(out_path)
 
@@ -329,6 +346,7 @@ def crop_videos_with_positions(
     positions: list[tuple],  # [(video_path, x, y), ...]
     input_folder, output_folder, width: int, height: int,
     log=print, on_progress=None, color_grade: bool = False, color_grade_strength: float = 1.0,
+    color_grade_layers: list[tuple[float, float]] | None = None,
 ) -> list[Path]:
     """Like crop_folder(), but each video gets its own (x, y) -- for
     sessions where the camera/tunnel framing shifted between recordings
@@ -354,7 +372,8 @@ def crop_videos_with_positions(
         else:
             log(f"[{i}/{total}] Cropping {video_path.name} at ({x},{y})...")
             crop_video(video_path, out_path, x, y, width, height, log=log,
-                       color_grade=color_grade, color_grade_strength=color_grade_strength)
+                       color_grade=color_grade, color_grade_strength=color_grade_strength,
+                       color_grade_layers=color_grade_layers)
 
         written.append(out_path)
 

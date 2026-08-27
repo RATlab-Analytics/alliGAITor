@@ -427,7 +427,7 @@ def export_validation_video(
     if progress is None:
         progress = log
 
-    times, positions, errors = gait.load_pose_3d(csv_path)
+    times, positions, errors, _fallback = gait.load_pose_3d(csv_path)
     n_frames = len(times)
     log(f"  Rendering validation video for '{session.name}' ({n_frames} frames)...")
     frame_progress = _FrameProgress(

@@ -121,6 +121,13 @@ class GroupConfigDialog(QDialog):
             "job -- the spreadsheet and paw-usability summary are still produced either way."
         )
         info_form.addRow("Validation videos:", self.skip_validation_check)
+        self.bottom_fallback_check = QCheckBox("Use bottom-camera fallback for triangulation gaps (experimental)")
+        self.bottom_fallback_check.setToolTip(
+            "Fills triangulation gaps using the bottom camera's own monocular view wherever it alone "
+            "has a valid 2D detection. Can only add usability a paw didn't already have -- a paw run "
+            "that already worked without it is left untouched. Defaults to off."
+        )
+        info_form.addRow("Bottom fallback:", self.bottom_fallback_check)
         layout.addWidget(info_box)
 
         # -- discovery regexes --
@@ -255,12 +262,17 @@ class GroupConfigDialog(QDialog):
         self.output_folder_edit.setText(self.job.output_folder)
 
         from app_settings import (
-            get_default_camera_tokens, get_default_regexes, get_default_skip_validation_videos,
+            get_default_bottom_fallback, get_default_camera_tokens, get_default_regexes,
+            get_default_skip_validation_videos,
         )
         default_id_regex, default_camera_regex = get_default_regexes(self.app_data_dir)
         self.skip_validation_check.setChecked(
             self._existing_config.skip_validation_videos if self._existing_config is not None
             else get_default_skip_validation_videos(self.app_data_dir)
+        )
+        self.bottom_fallback_check.setChecked(
+            self._existing_config.bottom_fallback if self._existing_config is not None
+            else get_default_bottom_fallback(self.app_data_dir)
         )
 
         # Block textChanged -> _rescan while both fields are set here:
@@ -613,6 +625,7 @@ class GroupConfigDialog(QDialog):
             gait=GaitConfig(**get_default_gait_overrides(self.app_data_dir)),
             discovery=discovery,
             skip_validation_videos=self.skip_validation_check.isChecked(),
+            bottom_fallback=self.bottom_fallback_check.isChecked(),
         )
 
         # Update the job's own fields (and therefore job.config_path,

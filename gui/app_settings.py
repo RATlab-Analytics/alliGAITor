@@ -61,6 +61,7 @@ _DEFAULTS = {
     "default_gait": dict(DEFAULT_GAIT),
     "default_min_corners_extrinsic": DEFAULT_MIN_CORNERS_EXTRINSIC,
     "default_skip_validation_videos": False,
+    "default_bottom_fallback": False,
 }
 
 
@@ -187,6 +188,25 @@ def get_default_skip_validation_videos(app_data_dir: Path) -> bool:
 def set_default_skip_validation_videos(app_data_dir: Path, value: bool) -> None:
     settings = load_settings(app_data_dir)
     settings["default_skip_validation_videos"] = bool(value)
+    save_settings(app_data_dir, settings)
+
+
+# -- default bottom-camera fallback (Settings > Preferences) --
+
+def get_default_bottom_fallback(app_data_dir: Path) -> bool:
+    """Whether a newly-saved job's config editor starts with "bottom
+    fallback" checked (see group_config_dialog.py's
+    ``bottom_fallback_check``) -- same always-read-fresh-from-Settings
+    pattern as the default skip-validation-videos setting, but still
+    editable per group afterward. Defaults to ``False``: a group only
+    pays for the experimental fallback if it (or the lab default) opts
+    in."""
+    return bool(load_settings(app_data_dir).get("default_bottom_fallback", False))
+
+
+def set_default_bottom_fallback(app_data_dir: Path, value: bool) -> None:
+    settings = load_settings(app_data_dir)
+    settings["default_bottom_fallback"] = bool(value)
     save_settings(app_data_dir, settings)
 
 

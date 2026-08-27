@@ -32,7 +32,7 @@ class CropRunner(QObject):
 
     def __init__(self, tools_dir, input_folder, output_folder, width, height,
                  x=None, y=None, positions=None, parent=None, color_grade=False,
-                 color_grade_strength=1.0):
+                 color_grade_strength=1.0, color_grade_layers=None):
         super().__init__(parent)
         if positions is None and (x is None or y is None):
             raise ValueError("CropRunner needs either (x, y) or positions=[...]")
@@ -45,6 +45,7 @@ class CropRunner(QObject):
         self._positions = positions
         self._color_grade = color_grade
         self._color_grade_strength = color_grade_strength
+        self._color_grade_layers = color_grade_layers
 
         self._stop_event = mp.Event()
         self._queue = mp.Queue()
@@ -61,14 +62,14 @@ class CropRunner(QObject):
             args = (
                 self._tools_dir, self._input_folder, self._output_folder,
                 self._positions, self._width, self._height, self._queue, self._stop_event,
-                self._color_grade, self._color_grade_strength,
+                self._color_grade, self._color_grade_strength, self._color_grade_layers,
             )
         else:
             target = run_crop_worker
             args = (
                 self._tools_dir, self._input_folder, self._output_folder,
                 self._x, self._y, self._width, self._height, self._queue, self._stop_event,
-                self._color_grade, self._color_grade_strength,
+                self._color_grade, self._color_grade_strength, self._color_grade_layers,
             )
         self._process = mp.Process(target=target, args=args, daemon=True)
         self._process.start()

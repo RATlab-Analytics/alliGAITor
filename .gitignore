@@ -45,3 +45,5 @@ minimal_skeleton.json
 
 # App session storage
 /app_data
+app_data/queue.json
+.claudeignore

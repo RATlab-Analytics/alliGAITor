@@ -13,6 +13,7 @@ GPLv3 About dialog).
 
 from __future__ import annotations
 
+import html
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,6 +47,26 @@ from crop_config import CROP_TARGET_WIDTH, CROP_TARGET_HEIGHT, side_crop_size_fo
 from regex_help import build_regex_help_panel
 
 import re
+
+# Pulls the "done/total" counts out of a tqdm-style progress line (e.g.
+# "45%|████ | 450/1000 [00:32<00:39, 14.06it/s]") so the ETA can be
+# refreshed on every live redraw of an inference/validation-video-encode
+# progress bar, not just when a whole session finishes -- see
+# MainWindow._on_progress_line. html_message is HTML (spans +
+# &nbsp;), hence the tag-strip/unescape before matching.
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_PROGRESS_FRACTION_RE = re.compile(r"(\d+)/(\d+)\s*\[")
+
+
+def _parse_progress_fraction(html_message: str) -> Optional[float]:
+    plain = html.unescape(_HTML_TAG_RE.sub("", html_message))
+    m = _PROGRESS_FRACTION_RE.search(plain)
+    if not m:
+        return None
+    done, total = int(m.group(1)), int(m.group(2))
+    if total <= 0:
+        return None
+    return max(0.0, min(1.0, done / total))
 
 
 def _double_spin(value: float, minimum: float, maximum: float, decimals: int = 1, suffix: str = "",
@@ -156,6 +177,13 @@ class _PreferencesDialog(QDialog):
             "Starting default for a newly-saved job's config editor -- still editable per job there. "
             "Unchecked means every run renders an annotated validation video per session."
         )
+        self.bottom_fallback_check = QCheckBox("Use bottom-camera fallback for triangulation gaps (experimental)")
+        self.bottom_fallback_check.setChecked(app_settings.get_default_bottom_fallback(self.app_data_dir))
+        self.bottom_fallback_check.setToolTip(
+            "Starting default for a newly-saved job's config editor -- still editable per job there. "
+            "Fills triangulation gaps using the bottom camera's own monocular view wherever it alone "
+            "has a valid 2D detection; can only add usability a paw didn't already have."
+        )
 
         form = QFormLayout()
         form.addRow("Default ID regex:", self.id_regex_edit)
@@ -165,6 +193,7 @@ class _PreferencesDialog(QDialog):
         form.addRow("Default token — Bottom camera:", self.bottom_token_edit)
         form.addRow("Default output base folder:", self.output_base_edit)
         form.addRow("Validation videos:", self.skip_validation_check)
+        form.addRow("Bottom fallback:", self.bottom_fallback_check)
         form.addRow(build_regex_help_panel(self, on_toggled=self._sync_dialog_size))
 
         tab = QWidget()
@@ -257,6 +286,7 @@ class _PreferencesDialog(QDialog):
         })
         app_settings.set_default_output_base(self.app_data_dir, self.output_base_edit.text())
         app_settings.set_default_skip_validation_videos(self.app_data_dir, self.skip_validation_check.isChecked())
+        app_settings.set_default_bottom_fallback(self.app_data_dir, self.bottom_fallback_check.isChecked())
         app_settings.set_default_gait_overrides(self.app_data_dir, {
             "speed_threshold_mm_s": self.speed_threshold_spin.value(),
             "min_contact_frames": self.min_contact_frames_spin.value(),
@@ -286,13 +316,30 @@ class MainWindow(QMainWindow):
         self._run_done_by_job: dict = {}
         self._run_start_time: float | None = None
         # ETA is a countdown snapshot, re-anchored only when real
-        # progress happens (a session finishes) -- see
-        # _recompute_eta_snapshot's docstring for why recomputing the
-        # estimate on every 1Hz tick (against an ever-growing elapsed
-        # time with a numerator that's fixed between completions) made
-        # the displayed ETA count up instead of down.
+        # progress happens -- see _recompute_eta_snapshot's docstring for
+        # why recomputing the estimate on every 1Hz tick (against an
+        # ever-growing elapsed time with a numerator that's fixed between
+        # updates) made the displayed ETA count up instead of down.
         self._eta_remaining_s: float | None = None
         self._eta_snapshot_time: float | None = None
+        # Fractional progress (0..1) through whatever session is
+        # currently running, parsed from its live tqdm-style progress
+        # line (inference or validation-video encode -- see
+        # _on_progress_line/_parse_progress_fraction). Lets the ETA move
+        # within a session instead of only at session boundaries, which
+        # can otherwise be many minutes apart.
+        self._eta_session_fraction: float = 0.0
+        # Exponentially-weighted rate of progress ("sessions" per
+        # second, counting the fraction above), plus the (done, time)
+        # sample it was last updated from. An EMA -- rather than the
+        # done-over-elapsed-since-run-start average this used to be --
+        # so a slowdown partway through a run pulls the rate (and so the
+        # ETA) down within a few samples instead of being permanently
+        # diluted by however much faster the run started out; see
+        # _recompute_eta_snapshot.
+        self._eta_rate_ema: float | None = None
+        self._eta_last_done: float | None = None
+        self._eta_last_sample_time: float | None = None
 
         # Whether the last line written to the log panel is a live
         # progress-bar redraw (as opposed to a discrete log message) --
@@ -757,6 +804,10 @@ class MainWindow(QMainWindow):
         self._run_start_time = time.time()
         self._eta_remaining_s = None
         self._eta_snapshot_time = None
+        self._eta_session_fraction = 0.0
+        self._eta_rate_ema = None
+        self._eta_last_done = None
+        self._eta_last_sample_time = None
 
         self.runner = BatchRunner(jobs, self.repo_dir, device="auto", tracking=False, parent=self)
         self.runner.log.connect(self._log)
@@ -793,6 +844,10 @@ class MainWindow(QMainWindow):
             job.sessions_total = total
             self.job_queue.update(job)
             self.model.refresh()
+        # A session just completed -- the next progress line belongs to
+        # a new session starting from 0, not a continuation of the one
+        # that just finished.
+        self._eta_session_fraction = 0.0
         self._recompute_eta_snapshot()
         self._update_progress_ui()
 
@@ -828,36 +883,67 @@ class MainWindow(QMainWindow):
     def _recompute_eta_snapshot(self):
         """Re-anchors the ETA countdown to a fresh rate estimate.
 
-        Called only when real progress actually happens (a session
-        finishes) -- NOT every second. The previous version recomputed
-        ``(total - done) / (done / elapsed_since_start)`` on every 1Hz
-        tick, with ``elapsed_since_start`` growing continuously while
-        ``done`` stayed fixed between session completions (often several
-        minutes apart, once inference progress is the bottleneck) -- so
-        the *average rate* it computed kept dropping every tick, and the
-        *remaining time* estimate it displayed grew right along with it:
-        the ETA counted up, not down, for however long a session took.
+        Called only when real progress actually happens -- a session
+        finishing (_on_job_progress) or, more often, a live tqdm-style
+        progress line from the inference/validation-video-encode step
+        within the current session moving forward (_on_progress_line via
+        _parse_progress_fraction) -- NOT every second. An earlier version
+        recomputed ``(total - done) / (done / elapsed_since_start)`` on
+        every 1Hz tick, with ``elapsed_since_start`` growing continuously
+        while ``done`` stayed fixed between session completions (often
+        several minutes apart) -- so the *average rate* it computed kept
+        dropping every tick, and the *remaining time* estimate grew right
+        along with it: the ETA counted up, not down, for however long a
+        session took. Recomputing only on real progress fixed the
+        counting-up bug, but with ``rate = done / elapsed_since_start``
+        it was still a *cumulative* average over the whole run: once a
+        run has done a lot of fast progress early on, that history keeps
+        dragging the average up even if the run has since slowed right
+        down, so the ETA stays optimistic and can never fully recover.
 
-        Instead: compute a remaining-seconds estimate here, once, only
-        when there's new information to compute it from, and store it
-        alongside the wall-clock time it was computed at. Between calls,
-        _update_progress_ui's 1Hz tick just subtracts elapsed real time
-        from that fixed estimate -- an ordinary countdown -- rather than
-        re-deriving a new (and, between updates, ever-larger) estimate
-        from scratch.
+        Instead, ``self._eta_rate_ema`` is an exponential moving average
+        of *instantaneous* rate, updated once per call from the delta
+        against the previous (done, time) sample -- see the smoothing
+        constant below. Recent samples dominate within a handful of
+        updates, so a real slowdown (or speedup) shows up in the ETA
+        quickly instead of being permanently diluted by the run's
+        history. The remaining-seconds estimate computed from that rate
+        is stored here alongside the wall-clock time it was computed at;
+        between calls, _update_progress_ui's 1Hz tick just subtracts
+        elapsed real time from that fixed estimate -- an ordinary
+        countdown -- rather than re-deriving a new estimate from scratch.
         """
         if self._run_start_time is None:
             return
-        done = sum(self._run_done_by_job.values())
+        done = sum(self._run_done_by_job.values()) + self._eta_session_fraction
         total = sum(self._run_total_by_job.values()) or 1
-        elapsed = time.time() - self._run_start_time
-        if done <= 0 or elapsed <= 0:
+        now = time.time()
+
+        if self._eta_last_done is not None and self._eta_last_sample_time is not None:
+            dt = now - self._eta_last_sample_time
+            d_done = done - self._eta_last_done
+            # Require a real time gap and genuine forward progress --
+            # skips near-zero-dt redraw spam and (harmlessly) skips the
+            # occasional sample where a session boundary's fraction
+            # reset makes d_done momentarily <= 0, rather than folding
+            # either into the rate as noise.
+            if dt > 0.5 and d_done > 0:
+                instantaneous_rate = d_done / dt
+                if self._eta_rate_ema is None:
+                    self._eta_rate_ema = instantaneous_rate
+                else:
+                    alpha = 0.3  # weight given to each new sample
+                    self._eta_rate_ema = alpha * instantaneous_rate + (1 - alpha) * self._eta_rate_ema
+
+        self._eta_last_done = done
+        self._eta_last_sample_time = now
+
+        if not self._eta_rate_ema or self._eta_rate_ema <= 0:
             self._eta_remaining_s = None
             self._eta_snapshot_time = None
             return
-        rate = done / elapsed
-        self._eta_remaining_s = max(0.0, (total - done) / rate) if rate > 0 else None
-        self._eta_snapshot_time = time.time()
+        self._eta_remaining_s = max(0.0, (total - done) / self._eta_rate_ema)
+        self._eta_snapshot_time = now
 
     def _update_progress_ui(self):
         done = sum(self._run_done_by_job.values())
@@ -932,7 +1018,17 @@ class MainWindow(QMainWindow):
         what the batch worker passes) -- redraws the same line in place,
         the same colored way the tqdm bar this mirrors does in a real
         terminal, instead of adding a new line to the log for every
-        redraw."""
+        redraw. Also feeds the parsed done/total fraction from this same
+        line into the ETA estimate (see _recompute_eta_snapshot) -- this
+        is what lets the ETA update within a session (an inference run
+        or a validation-video encode), rather than only at session
+        boundaries."""
+        fraction = _parse_progress_fraction(html_message)
+        if fraction is not None:
+            self._eta_session_fraction = fraction
+            self._recompute_eta_snapshot()
+            self._update_progress_ui()
+
         cursor = self.log_panel.textCursor()
         cursor.movePosition(QTextCursor.End)
         if self._progress_line_open:
