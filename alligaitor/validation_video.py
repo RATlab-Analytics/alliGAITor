@@ -19,6 +19,7 @@ the group workbook is built from, not a separate/simplified pass.
 
 from __future__ import annotations
 
+import math
 import time
 from pathlib import Path
 from dataclasses import replace
@@ -241,6 +242,31 @@ def _reproject_footprints(
     return footprints_by_role
 
 
+# A reprojected point can land far outside any real pixel coordinate --
+# not just from a genuine calibration/triangulation glitch, but reliably
+# from a misassigned camera role (a session whose left/right/bottom video
+# mapping doesn't match the calibration's), which sends garbage 3D points
+# through a camera model they were never actually seen by. NaN/Inf raise
+# in plain Python before reaching cv2 at all (int(round(...)) errors out
+# first); a huge-but-finite value instead sails through Python and only
+# fails once it hits cv2's own C++ point parser (a `cv::Point` is a 32-bit
+# int), surfacing as a cryptic "Can't parse 'pt2' ... wrong type" -- which
+# used to abort the rest of this session's video, not just skip the one
+# bad node. _MAX_COORD is comfortably beyond any real camera frame but
+# safely inside int32 range, so anything past it is treated the same as
+# "this node/edge isn't drawable this frame" rather than a crash.
+_MAX_COORD = 1_000_000
+
+
+def _finite_point(xy: Tuple[float, float]) -> Optional[Tuple[int, int]]:
+    x, y = xy
+    if not (math.isfinite(x) and math.isfinite(y)):
+        return None
+    if abs(x) > _MAX_COORD or abs(y) > _MAX_COORD:
+        return None
+    return int(round(x)), int(round(y))
+
+
 def _draw_marker(
     frame: np.ndarray, xy: Tuple[float, float], radius: int, color, thickness: int = -1, alpha: float = 1.0
 ) -> None:
@@ -252,9 +278,13 @@ def _draw_marker(
 
     Blending is done on a small region-of-interest around the circle,
     not the whole panel, so fading many accumulated markers stays cheap
-    regardless of panel size.
+    regardless of panel size. Silently skips a non-finite or wildly
+    out-of-range point (see :func:`_finite_point`) rather than raising.
     """
-    x, y = int(round(xy[0])), int(round(xy[1]))
+    point = _finite_point(xy)
+    if point is None:
+        return
+    x, y = point
     h, w = frame.shape[:2]
     if not (-radius <= x <= w + radius and -radius <= y <= h + radius):
         return
@@ -397,7 +427,7 @@ def export_validation_video(
     if progress is None:
         progress = log
 
-    times, positions, errors = gait.load_pose_3d(csv_path)
+    times, positions, errors, _fallback = gait.load_pose_3d(csv_path)
     n_frames = len(times)
     log(f"  Rendering validation video for '{session.name}' ({n_frames} frames)...")
     frame_progress = _FrameProgress(
@@ -473,9 +503,10 @@ def export_validation_video(
 
                 for a, b in SKELETON_EDGES:
                     if a in node_px and b in node_px:
-                        pa = tuple(int(round(c)) for c in node_px[a])
-                        pb = tuple(int(round(c)) for c in node_px[b])
-                        cv2.line(panel, pa, pb, _EDGE_COLOR, 1, cv2.LINE_AA)
+                        pa = _finite_point(node_px[a])
+                        pb = _finite_point(node_px[b])
+                        if pa is not None and pb is not None:
+                            cv2.line(panel, pa, pb, _EDGE_COLOR, 1, cv2.LINE_AA)
 
                 for touchdown_frame, paw, footprint_crossing, xy in footprints_by_role.get(role, []):
                     if touchdown_frame > i:

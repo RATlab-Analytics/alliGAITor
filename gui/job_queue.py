@@ -58,6 +58,7 @@ class JobStatus(str, Enum):
     NEEDS_CONFIG = "needs_config"  # config.yaml not yet confirmed (regexes, roles, calibration)
     NEEDS_CROP = "needs_crop"      # config confirmed, but not every discovered video is cropped yet
     READY = "ready"                 # fully set up, waiting in the queue
+    QUEUED = "queued"               # handed to the batch runner for this run, waiting its turn behind RUNNING
     RUNNING = "running"             # batch runner is actively processing this job
     DONE = "done"                   # finished with no errors
     FAILED = "failed"               # hit an error; batch runner blocked it and moved on
@@ -201,13 +202,19 @@ class JobQueue:
         return self
 
     def _recover_stale_running_jobs(self) -> None:
-        """A job can be left with status=RUNNING in queue.json if the app
-        (or the batch worker process) was killed or crashed mid-run
-        instead of finishing normally -- nothing is actually processing
-        it by the time we're loading this file fresh on startup."""
+        """A job can be left with status=RUNNING (or QUEUED -- handed to
+        the batch runner for a run that never reached it) in queue.json
+        if the app (or the batch worker process) was killed or crashed
+        mid-run instead of finishing normally -- nothing is actually
+        processing it, nor is anything ever going to dequeue it, by the
+        time we're loading this file fresh on startup. Left alone,
+        QUEUED would also stay permanently locked from editing/removing
+        (see main_window.MainWindow._job_locked_by_run), since that lock
+        is keyed on status alone -- there's no live BatchRunner left to
+        eventually flip it to RUNNING and then a terminal status."""
         changed = False
         for job in self.jobs:
-            if job.status == JobStatus.RUNNING:
+            if job.status in (JobStatus.RUNNING, JobStatus.QUEUED):
                 job.status = JobStatus.FAILED
                 job.error_message = "Interrupted -- the app closed or crashed while this job was running."
                 changed = True

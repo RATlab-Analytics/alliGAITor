@@ -35,7 +35,7 @@ exactly the frames this module treated as ground contact.
 from __future__ import annotations
 
 import warnings
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
@@ -77,6 +77,15 @@ FAR_SIDE_CAMERA = {
 # Body-center node used to time the crossing and establish the direction
 # of travel (see minimal_skeleton.json for the full node set).
 REFERENCE_NODE = "mid-back"
+
+# Above this fraction of a paw's usable window coming from the
+# experimental bottom-camera fallback (see :mod:`alligaitor.bottom_fallback`
+# and :attr:`PawWindow.bottom_fallback_fraction`), the run is still counted
+# usable but is worth a reviewer's second look -- shared by
+# :func:`write_group_report`'s workbook annotation and
+# :mod:`alligaitor.validation`'s in-app warning flag so the two can never
+# disagree about which runs qualify.
+BOTTOM_FALLBACK_WARN_THRESHOLD = 1.0 / 3.0
 
 _INVALID_SHEET_CHARS = set("[]:*?/\\")
 
@@ -123,6 +132,7 @@ class TrialMetrics:
     crossing_index: int = 0
     crossing_count: int = 1
     crossing_window: Optional[Tuple[int, int]] = None
+    bottom_fallback_fraction: Dict[str, float] = field(default_factory=dict)
 
     @property
     def crossing_label(self) -> str:
@@ -134,27 +144,49 @@ class TrialMetrics:
         return f"{self.session_name} \u2014 crossing {self.crossing_index + 1} of {self.crossing_count}"
 
 
+def crossing_block_title(session_name: str, crossing_number: int, crossing_count: int) -> str:
+    """The exact title-row text :func:`write_group_report` gives one
+    crossing's block in the workbook -- ``"Session: {name}"`` for a
+    single-crossing recording, else with the crossing number appended
+    (mirrors :attr:`TrialMetrics.crossing_label`, prefixed the same way
+    :func:`write_group_report` prefixes it). Used by
+    :func:`annotate_manual_flag`, which has no :class:`TrialMetrics` to
+    read ``crossing_label`` from -- only the summary JSON's plain
+    ``crossing``/``crossing_count`` numbers -- to target exactly one
+    crossing's block instead of the whole recording's."""
+    if crossing_count <= 1:
+        return f"Session: {session_name}"
+    return f"Session: {session_name} \u2014 crossing {crossing_number} of {crossing_count}"
+
+
 def load_pose_3d(
     csv_path: PathLike,
-) -> "tuple[np.ndarray, Dict[str, np.ndarray], Dict[str, np.ndarray]]":
+) -> "tuple[np.ndarray, Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, np.ndarray]]":
     """Load a ``pose_3d.csv`` into per-node arrays indexed by frame.
 
     Returns:
-        A ``(times, positions, reprojection_error_px)`` triple: ``times``
-        is seconds per frame index; ``positions`` maps node name to an
-        ``(n_frames, 3)`` array of that node's ``x``/``y``/``z``, ``NaN``
-        where untriangulated; ``reprojection_error_px`` maps node name to
-        an ``(n_frames,)`` array of that frame's mean reprojection error
-        (see :class:`alligaitor.triangulation.Pose3D`), ``NaN`` to match.
+        A ``(times, positions, reprojection_error_px, fallback)`` tuple:
+        ``times`` is seconds per frame index; ``positions`` maps node name
+        to an ``(n_frames, 3)`` array of that node's ``x``/``y``/``z``,
+        ``NaN`` where untriangulated; ``reprojection_error_px`` maps node
+        name to an ``(n_frames,)`` array of that frame's mean reprojection
+        error (see :class:`alligaitor.triangulation.Pose3D`), ``NaN`` to
+        match; ``fallback`` maps node name to an ``(n_frames,)`` boolean
+        array, ``True`` wherever that point came from
+        :func:`alligaitor.bottom_fallback.fill_gaps` rather than real
+        triangulation -- all ``False`` if `csv_path` predates that
+        column (see :func:`alligaitor.pipeline.save_pose_3d_csv`).
     """
     df = pd.read_csv(csv_path)
     n_frames = int(df["frame"].max()) + 1
+    has_fallback_col = "fallback" in df.columns
 
     times = np.full(n_frames, np.nan)
     times[df["frame"].to_numpy()] = df["time_s"].to_numpy()
 
     positions = {}
     reprojection_error_px = {}
+    fallback = {}
     for node, sub in df.groupby("node"):
         arr = np.full((n_frames, 3), np.nan)
         arr[sub["frame"].to_numpy()] = sub[["x", "y", "z"]].to_numpy()
@@ -163,7 +195,12 @@ def load_pose_3d(
         err = np.full(n_frames, np.nan)
         err[sub["frame"].to_numpy()] = sub["reprojection_error_px"].to_numpy()
         reprojection_error_px[node] = err
-    return times, positions, reprojection_error_px
+
+        fb = np.zeros(n_frames, dtype=bool)
+        if has_fallback_col:
+            fb[sub["frame"].to_numpy()] = sub["fallback"].to_numpy(dtype=bool)
+        fallback[node] = fb
+    return times, positions, reprojection_error_px, fallback
 
 
 def bridge_short_gaps(xyz: np.ndarray, max_gap: int) -> np.ndarray:
@@ -1035,7 +1072,7 @@ def compute_trial_metrics(
             :class:`GaitConfig`'s own defaults.
     """
     config = config or GaitConfig()
-    times, positions, _ = load_pose_3d(csv_path)
+    times, positions, _, _ = load_pose_3d(csv_path)
 
     missing = [node for node in (REFERENCE_NODE, *PAW_NODES) if node not in positions]
     if missing:
@@ -1133,7 +1170,7 @@ def compute_crossing_metrics(
     is identical to what :func:`compute_trial_metrics` returns for it.
     """
     config = config or GaitConfig()
-    times, positions, _ = load_pose_3d(csv_path)
+    times, positions, _, _ = load_pose_3d(csv_path)
     if REFERENCE_NODE not in positions:
         raise ValueError(f"pose_3d CSV '{csv_path}' is missing required node: {REFERENCE_NODE}")
 
@@ -1174,6 +1211,7 @@ class PawWindow:
     end_s: float
     duration_s: float
     usable: bool
+    bottom_fallback_fraction: float = 0.0
 
 
 def _longest_raw_run(events: PawEvents) -> Optional[Tuple[int, int]]:
@@ -1195,6 +1233,7 @@ def paw_usability_windows(
     times: np.ndarray,
     positions: Dict[str, np.ndarray],
     config: GaitConfig,
+    bottom_fallback_mask: Optional[Dict[str, np.ndarray]] = None,
 ) -> Dict[str, Optional[PawWindow]]:
     """Per paw, the single window a validation-video viewer should
     highlight -- the longest qualifying run (see :func:`_qualifying_runs`,
@@ -1202,6 +1241,15 @@ def paw_usability_windows(
     its averages) if the paw has one, else its longest raw detected stance
     phase. ``None`` only when the paw was never detected planted at all in
     this trial.
+
+    Args:
+        bottom_fallback_mask: Per paw, an ``(n_frames,)`` boolean array
+            (see :func:`load_pose_3d`'s ``fallback`` return value), used
+            to compute the returned window's ``bottom_fallback_fraction``
+            -- how much of *that specific window* came from
+            :func:`alligaitor.bottom_fallback.fill_gaps` rather than real
+            triangulation. ``None`` (the default) leaves every window's
+            fraction at ``0.0``.
     """
     _, _, forward, (start, end) = _crossing_time_and_speed(
         times, positions[REFERENCE_NODE], config, trial.crossing_window
@@ -1229,15 +1277,46 @@ def paw_usability_windows(
             s, e = fallback
             usable = False
 
+        start_frame, end_frame = int(events.touchdown_frames[s]), int(events.liftoff_frames[e])
+        bottom_fallback_fraction = 0.0
+        if bottom_fallback_mask is not None and paw in bottom_fallback_mask:
+            segment = bottom_fallback_mask[paw][start_frame : end_frame + 1]
+            if segment.size:
+                bottom_fallback_fraction = float(segment.mean())
+
         windows[paw] = PawWindow(
-            start_frame=int(events.touchdown_frames[s]),
-            end_frame=int(events.liftoff_frames[e]),
+            start_frame=start_frame,
+            end_frame=end_frame,
             start_s=float(events.touchdown_times[s]),
             end_s=float(events.liftoff_times[e]),
             duration_s=float(events.liftoff_times[e] - events.touchdown_times[s]),
             usable=usable,
+            bottom_fallback_fraction=bottom_fallback_fraction,
         )
     return windows
+
+
+def attach_bottom_fallback_fraction(
+    trial: TrialMetrics,
+    times: np.ndarray,
+    positions: Dict[str, np.ndarray],
+    bottom_fallback_mask: Dict[str, np.ndarray],
+    config: GaitConfig,
+) -> TrialMetrics:
+    """Return `trial` with :attr:`TrialMetrics.bottom_fallback_fraction`
+    populated: per paw, how much of its usable window (see
+    :func:`paw_usability_windows`) came from
+    :func:`alligaitor.bottom_fallback.fill_gaps` rather than real
+    triangulation. A paw with no window at all (never detected planted)
+    gets ``0.0`` -- there's no run to have come from the fallback.
+
+    Used by :func:`alligaitor.pipeline.run_group` so
+    :func:`write_group_report` can warn on a run that's mostly
+    fallback-derived, without recomputing windows itself.
+    """
+    windows = paw_usability_windows(trial, times, positions, config, bottom_fallback_mask=bottom_fallback_mask)
+    fractions = {paw: (w.bottom_fallback_fraction if w is not None else 0.0) for paw, w in windows.items()}
+    return replace(trial, bottom_fallback_fraction=fractions)
 
 
 def planted_mask(trial: TrialMetrics, n_frames: int) -> Dict[str, np.ndarray]:
@@ -1335,6 +1414,12 @@ _HEADER_FONT = Font(bold=True)
 _HEADER_FILL = PatternFill(start_color="DCE6F1", end_color="DCE6F1", fill_type="solid")
 _BAD_FILL = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
 _BAD_FONT = Font(color="9C0006")
+# A run that's still usable but leans heavily on the experimental
+# bottom-camera fallback (see BOTTOM_FALLBACK_WARN_THRESHOLD) -- Excel's
+# standard "Neutral" yellow, deliberately distinct from _BAD_FILL's red so
+# a reviewer doesn't mistake a usable-but-caution run for an unusable one.
+_WARN_FILL = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+_WARN_FONT = Font(color="9C6500")
 _CLEAR_FILL = PatternFill(fill_type=None)
 _CLEAR_FONT = Font()
 
@@ -1403,6 +1488,7 @@ def _write_paw_block(
     is_bad: Callable[[str, str], bool],
     stat_columns: Tuple[Tuple[str, str, str], ...] = _STAT_COLUMNS,
     note_getter: Callable[[str], str] = lambda paw: "",
+    is_warn: Callable[[str], bool] = lambda paw: False,
 ) -> int:
     """Writes one titled block -- crossing time/speed, then a paw x stat
     table -- starting at `start_row`, and returns the row the next block
@@ -1416,6 +1502,10 @@ def _write_paw_block(
     any of its stats is bad. `note_getter(paw)`
     fills the trailing Notes column -- empty by default, used to record why
     a paw was manually flagged invalid (see :func:`annotate_manual_flag`).
+    `is_warn(paw)` marks a paw yellow instead of red -- still a usable run,
+    just one worth a second look (see ``BOTTOM_FALLBACK_WARN_THRESHOLD``)
+    -- and is only checked when the paw isn't already `is_bad`, since red
+    always wins over yellow.
     """
     row = start_row
     title_cell = ws.cell(row=row, column=1, value=title)
@@ -1446,16 +1536,23 @@ def _write_paw_block(
     for paw in PAW_NODES:
         bad_by_stat = {stat: is_bad(paw, stat) for stat, _label, _fmt in stat_columns}
         bad = any(bad_by_stat.values())
+        warn = (not bad) and is_warn(paw)
         name_cell = ws.cell(row=row, column=1, value=_PAW_LABELS[paw])
         if bad:
             name_cell.fill = _BAD_FILL
             name_cell.font = _BAD_FONT
+        elif warn:
+            name_cell.fill = _WARN_FILL
+            name_cell.font = _WARN_FONT
         for col, (stat, _label, fmt) in enumerate(stat_columns, start=2):
             _write_cell(ws, row, col, get_value(stat, paw), fmt, bad=bad_by_stat[stat])
         note_cell = ws.cell(row=row, column=_NOTES_COLUMN, value=note_getter(paw) or None)
         if bad:
             note_cell.fill = _BAD_FILL
             note_cell.font = _BAD_FONT
+        elif warn:
+            note_cell.fill = _WARN_FILL
+            note_cell.font = _WARN_FONT
         row += 1
 
     return row + 2  # blank spacer before the next block
@@ -1489,7 +1586,7 @@ def _safe_sheet_name(name: str, used: set) -> str:
 def write_group_report(
     trials: List[TrialMetrics],
     output_path: PathLike,
-    manual_flags: Optional[Dict[str, Tuple[set, str]]] = None,
+    manual_flags: Optional[Dict[str, Dict[int, Tuple[set, str]]]] = None,
 ) -> None:
     """Write one group's gait-metrics workbook: one tab per distinct ``rat_id``.
 
@@ -1509,14 +1606,17 @@ def write_group_report(
     where it did produce something usable.
 
     Args:
-        manual_flags: Session name -> (flagged paw names, note), carried
-            forward from :func:`alligaitor.validation.load_manual_flags` so
-            a regenerated workbook keeps highlighting a paw a reviewer
-            already flagged invalid by hand, exactly as
-            :func:`annotate_manual_flag` would highlight it on an
-            already-written workbook. A paw already bad from
-            :func:`_paw_has_no_usable_run` stays bad regardless of what's
-            here -- this only ever adds highlighting, never removes it.
+        manual_flags: Session name -> crossing number -> (flagged paw
+            names, note), carried forward from
+            :func:`alligaitor.validation.load_group_manual_flags` so a
+            regenerated workbook keeps highlighting a paw a reviewer
+            already flagged invalid by hand *on that specific crossing*,
+            exactly as :func:`annotate_manual_flag` would highlight it on
+            an already-written workbook -- a flag on crossing 2 doesn't
+            touch crossing 1's block for the same paw. A paw already bad
+            from :func:`_paw_has_no_usable_run` stays bad regardless of
+            what's here -- this only ever adds highlighting, never
+            removes it.
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1538,7 +1638,9 @@ def write_group_report(
             ws = wb.create_sheet(_safe_sheet_name(rat_id, used_names))
             row = 1
             for trial in rat_trials:
-                flagged_paws, note = manual_flags.get(trial.session_name, (set(), ""))
+                flagged_paws, note = manual_flags.get(trial.session_name, {}).get(
+                    trial.crossing_index + 1, (set(), "")
+                )
                 row = _write_paw_block(
                     ws, row,
                     title=f"Session: {trial.crossing_label}",
@@ -1550,7 +1652,18 @@ def write_group_report(
                         or paw in fp
                         or _stat_is_untrustworthy(t, paw, stat)
                     ),
-                    note_getter=lambda paw, fp=flagged_paws, n=note: n if paw in fp else "",
+                    is_warn=lambda paw, t=trial: (
+                        t.bottom_fallback_fraction.get(paw, 0.0) > BOTTOM_FALLBACK_WARN_THRESHOLD
+                    ),
+                    note_getter=lambda paw, fp=flagged_paws, n=note, t=trial: (
+                        n if paw in fp
+                        else (
+                            f"{t.bottom_fallback_fraction.get(paw, 0.0):.0%} of this run came from the "
+                            "2D bottom-camera fallback"
+                            if t.bottom_fallback_fraction.get(paw, 0.0) > BOTTOM_FALLBACK_WARN_THRESHOLD
+                            else ""
+                        )
+                    ),
                 )
 
             if len(rat_trials) > 1:
@@ -1568,8 +1681,12 @@ def write_group_report(
                     get_value=lambda stat, paw: _nanmean([getattr(t, stat)[paw] for t in rat_trials]),
                     is_bad=lambda paw, stat: all(
                         _paw_has_no_usable_run(t, paw)
-                        or paw in manual_flags.get(t.session_name, (set(), ""))[0]
+                        or paw in manual_flags.get(t.session_name, {}).get(t.crossing_index + 1, (set(), ""))[0]
                         or _stat_is_untrustworthy(t, paw, stat)
+                        for t in rat_trials
+                    ),
+                    is_warn=lambda paw: any(
+                        t.bottom_fallback_fraction.get(paw, 0.0) > BOTTOM_FALLBACK_WARN_THRESHOLD
                         for t in rat_trials
                     ),
                     stat_columns=avg_stat_columns,
@@ -1580,64 +1697,64 @@ def write_group_report(
     wb.save(output_path)
 
 
-def _find_session_paw_rows(ws, session_name: str, paw: str) -> List[int]:
-    """Row indices of `paw`'s row in every block on `ws` belonging to
-    `session_name`, in sheet order -- empty if the session or paw row
-    isn't present (e.g. the workbook predates this session, or was
-    regenerated with different sessions).
+def _find_paw_row(ws, title: str, paw: str) -> Optional[int]:
+    """Row index of `paw`'s row within the block whose title cell reads
+    exactly `title` (see :func:`crossing_block_title`), or ``None`` if
+    that block or paw row isn't present (e.g. the workbook predates this
+    crossing, or was regenerated with different sessions).
 
-    A recording holding several crossings contributes one block per
-    crossing, titled ``"Session: {name} -- crossing i of n"`` (see
-    :attr:`TrialMetrics.crossing_label`), so this matches the bare title
-    *and* that prefixed form and returns all of them. The manual-flag
-    UI records a judgement about a paw in a recording, with no way to
-    say "only crossing 2", so :func:`annotate_manual_flag` applies it to
-    every crossing of that recording -- consistent with
-    :func:`write_group_report`, which keys manual flags by session name
-    and so highlights every crossing's block too.
-
-    Searches a bounded window below each title row rather than assuming
+    Searches a bounded window below the title row rather than assuming
     :func:`_write_paw_block`'s exact row offsets, so it keeps working
     even if that layout changes shape slightly.
     """
-    exact = f"Session: {session_name}"
-    prefix = f"{exact} \u2014 crossing "
-    rows: List[int] = []
     for row in ws.iter_rows(min_col=1, max_col=1):
         cell = row[0]
-        value = cell.value
-        if not isinstance(value, str) or not (value == exact or value.startswith(prefix)):
+        if cell.value != title:
             continue
         for r in range(cell.row + 1, cell.row + 16):
             if ws.cell(row=r, column=1).value == _PAW_LABELS[paw]:
-                rows.append(r)
-                break
-    return rows
+                return r
+        return None
+    return None
 
 
 def annotate_manual_flag(
     xlsx_path: PathLike,
     rat_id: str,
     session_name: str,
+    crossing_number: int,
+    crossing_count: int,
     paw: str,
     auto_usable: bool,
     flagged: bool,
     note: str = "",
 ) -> bool:
-    """Patch one paw's row in an already-written group workbook to reflect
-    a reviewer's manual flag, without regenerating the whole report from
-    :class:`TrialMetrics`.
+    """Patch one paw's row, on one specific crossing, in an already-written
+    group workbook to reflect a reviewer's manual flag -- without
+    regenerating the whole report from :class:`TrialMetrics`. A flag on
+    one crossing never touches another crossing's block for the same paw,
+    even within the same recording (see :func:`crossing_block_title`).
 
     The row is highlighted (and `note` written to its Notes cell) when
-    ``flagged`` or ``not auto_usable`` -- unflagging a paw the automatic
-    detection already called unusable (``auto_usable=False``) leaves it
-    highlighted, since that's a real "no usable run" finding this manual
-    action didn't create and shouldn't be able to erase. Only values/number
-    formats are left untouched; this only ever changes fill/font/notes.
+    ``flagged`` or ``not auto_usable`` -- unflagging a paw this crossing's
+    automatic detection already called unusable (``auto_usable=False``)
+    leaves it highlighted, since that's a real "no usable run" finding
+    this manual action didn't create and shouldn't be able to erase. Only
+    values/number formats are left untouched; this only ever changes
+    fill/font/notes.
+
+    Args:
+        crossing_number: 1-based crossing index within the recording
+            (matches :attr:`TrialMetrics.crossing_index` ``+ 1`` and a
+            validation summary's per-crossing ``"crossing"`` field).
+        crossing_count: How many crossings this recording has in total --
+            needed to reconstruct the exact block title (a single-
+            crossing recording's block has no crossing number in its
+            title at all).
 
     Returns:
         ``True`` if the target row was found and patched, ``False`` if the
-        workbook has no matching rat sheet / session block / paw row (the
+        workbook has no matching rat sheet / crossing block / paw row (the
         caller should warn rather than assume the flag took effect).
     """
     from openpyxl import load_workbook
@@ -1654,21 +1771,21 @@ def annotate_manual_flag(
     if ws is None:
         return False
 
-    rows = _find_session_paw_rows(ws, session_name, paw)
-    if not rows:
+    title = crossing_block_title(session_name, crossing_number, crossing_count)
+    row = _find_paw_row(ws, title, paw)
+    if row is None:
         return False
 
     bad = flagged or not auto_usable
     fill = _BAD_FILL if bad else _CLEAR_FILL
     font = _BAD_FONT if bad else _CLEAR_FONT
-    for row in rows:
-        for col in range(1, _N_STAT_COLUMNS + 1):
-            cell = ws.cell(row=row, column=col)
-            cell.fill = fill
-            cell.font = font
-        notes_cell = ws.cell(row=row, column=_NOTES_COLUMN, value=(note if flagged else None))
-        notes_cell.fill = fill
-        notes_cell.font = font
+    for col in range(1, _N_STAT_COLUMNS + 1):
+        cell = ws.cell(row=row, column=col)
+        cell.fill = fill
+        cell.font = font
+    notes_cell = ws.cell(row=row, column=_NOTES_COLUMN, value=(note if flagged else None))
+    notes_cell.fill = fill
+    notes_cell.font = font
 
     wb.save(xlsx_path)
     return True

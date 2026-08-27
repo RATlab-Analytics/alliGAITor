@@ -25,7 +25,8 @@ from pathlib import Path
 
 def run_crop_worker(tools_dir: str, input_folder: str, output_folder: str,
                      x: int, y: int, width: int, height: int, queue, stop_event,
-                     color_grade: bool = False, color_grade_strength: float = 1.0):
+                     color_grade: bool = False, color_grade_strength: float = 1.0,
+                     color_grade_layers=None):
     if tools_dir not in sys.path:
         sys.path.insert(0, tools_dir)
 
@@ -67,7 +68,8 @@ def run_crop_worker(tools_dir: str, input_folder: str, output_folder: str,
             else:
                 log(f"[{i}/{total}] Cropping {video_path.name}...")
                 vc.crop_video(video_path, out_path, x, y, width, height, log=log,
-                               color_grade=color_grade, color_grade_strength=color_grade_strength)
+                               color_grade=color_grade, color_grade_strength=color_grade_strength,
+                               color_grade_layers=color_grade_layers)
         except Exception as exc:
             log(f"  ERROR on {video_path.name}: {exc}")
             queue.put(("finished", "failed", f"{video_path.name}: {exc}"))
@@ -82,7 +84,8 @@ def run_crop_worker(tools_dir: str, input_folder: str, output_folder: str,
 
 def run_crop_worker_positions(tools_dir: str, input_folder: str, output_folder: str,
                                positions: list, width: int, height: int, queue, stop_event,
-                               color_grade: bool = False, color_grade_strength: float = 1.0):
+                               color_grade: bool = False, color_grade_strength: float = 1.0,
+                               color_grade_layers=None):
     """Like run_crop_worker(), but each video has its own (x, y) --
     `positions` is a plain list of (video_path_str, x, y) tuples (not a
     dict, to keep this a simple pickle-safe argument across the process
@@ -127,7 +130,8 @@ def run_crop_worker_positions(tools_dir: str, input_folder: str, output_folder: 
             else:
                 log(f"[{i}/{total}] Cropping {video_path.name} at ({x},{y})...")
                 vc.crop_video(video_path, out_path, x, y, width, height, log=log,
-                               color_grade=color_grade, color_grade_strength=color_grade_strength)
+                               color_grade=color_grade, color_grade_strength=color_grade_strength,
+                               color_grade_layers=color_grade_layers)
         except Exception as exc:
             log(f"  ERROR on {video_path.name}: {exc}")
             queue.put(("finished", "failed", f"{video_path.name}: {exc}"))

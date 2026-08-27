@@ -57,6 +57,8 @@ def bgr_frame_to_qimage(frame) -> QImage:
 _SCRUB_MARGIN = 8
 _SCRUB_LABEL_WIDTH = 92
 _SCRUB_ROW_HEIGHT = 22
+_SCRUB_MARKER_WIDTH = 9
+_SCRUB_MARKER_WIDTH_MUTED = 3  # an unusable/flagged segment -- thinner, on top of its already-grayed color
 _SCRUB_TRACK_COLOR = QColor(190, 190, 190)
 _SCRUB_HANDLE_COLOR = QColor(40, 90, 200)
 _SCRUB_HANDLE_BORDER = QColor(20, 50, 120)
@@ -65,13 +67,17 @@ _SCRUB_LABEL_COLOR = QColor(220, 220, 220)
 
 class _MultiRowScrubBar(QWidget):
     """Click/drag horizontal seek bar with one labeled row per paw, each
-    showing that paw's single highlighted window (see
-    alligaitor.gait.PawWindow) as a colored segment on its own track --
+    showing that paw's highlighted window(s) (see
+    alligaitor.gait.PawWindow) as colored segments on its own track --
     rows stack top to bottom rather than overlapping on one line, so e.g.
     all four paws' windows stay independently readable even when they
-    overlap in time. A single vertical playhead line spans every row, and
-    clicking/dragging anywhere (regardless of which row's y) seeks, since
-    every row shares the same frame -> x mapping.
+    overlap in time. A row can hold more than one segment -- a
+    multi-crossing recording gives each paw its own window per crossing,
+    and crossings never overlap in frame range (see
+    alligaitor.validation_video's docstring), so multiple segments on one
+    row never collide. A single vertical playhead line spans every row,
+    and clicking/dragging anywhere (regardless of which row's y) seeks,
+    since every row shares the same frame -> x mapping.
     """
 
     seek_requested = Signal(int)
@@ -80,8 +86,8 @@ class _MultiRowScrubBar(QWidget):
         super().__init__(parent)
         self.n_frames = 1
         self.current_frame = 0
-        # (label, start_frame or None, end_frame or None, QColor)
-        self.rows: list[tuple[str, "int | None", "int | None", QColor]] = []
+        # (label, [(start_frame, end_frame, QColor, usable), ...])
+        self.rows: list[tuple[str, list[tuple[int, int, QColor, bool]]]] = []
         self.setMouseTracking(True)
         self.setCursor(Qt.PointingHandCursor)
         self._relayout()
@@ -95,10 +101,16 @@ class _MultiRowScrubBar(QWidget):
         self.update()
 
     def set_paw_windows(self, rows):
-        """`rows`: iterable of (label, start_frame_or_None,
-        end_frame_or_None, QColor), one entry per paw, in the order they
-        should be stacked top to bottom. A ``None`` start/end means that
-        paw has nothing to highlight (never detected at all this trial)."""
+        """`rows`: iterable of (label, segments), one entry per paw, in
+        the order they should be stacked top to bottom. `segments` is a
+        list of (start_frame, end_frame, QColor, usable) tuples -- one
+        per crossing that has a highlighted window for this paw, normally
+        just one for a single-crossing recording. `usable` draws a
+        thinner segment for a `False` entry (an unusable/flagged
+        crossing), on top of its already-muted color, so a bad crossing
+        reads as visually lighter-weight than a good one at a glance
+        rather than requiring a close look at hue alone. An empty list
+        means nothing to highlight for that paw (never detected at all)."""
         self.rows = list(rows)
         self._relayout()
         self.update()
@@ -134,11 +146,10 @@ class _MultiRowScrubBar(QWidget):
         track_pen = QPen(_SCRUB_TRACK_COLOR, 3)
         track_pen.setCapStyle(Qt.RoundCap)
         marker_pen = QPen()
-        marker_pen.setWidth(9)
         marker_pen.setCapStyle(Qt.FlatCap)
 
-        rows = self.rows or [("", None, None, _SCRUB_HANDLE_COLOR)]
-        for i, (label, start, stop, color) in enumerate(rows):
+        rows = self.rows or [("", [])]
+        for i, (label, segments) in enumerate(rows):
             mid_y = i * _SCRUB_ROW_HEIGHT + _SCRUB_ROW_HEIGHT / 2
 
             painter.setPen(QPen(_SCRUB_LABEL_COLOR))
@@ -150,10 +161,13 @@ class _MultiRowScrubBar(QWidget):
             painter.setPen(track_pen)
             painter.drawLine(QPointF(left, mid_y), QPointF(right, mid_y))
 
-            if start is not None and stop is not None:
+            for start, stop, color, usable in segments:
+                if start is None or stop is None:
+                    continue
                 x0 = self._frame_to_x(start)
                 x1 = max(self._frame_to_x(max(stop, start)), x0 + 1)
                 marker_pen.setColor(color)
+                marker_pen.setWidth(_SCRUB_MARKER_WIDTH if usable else _SCRUB_MARKER_WIDTH_MUTED)
                 painter.setPen(marker_pen)
                 painter.drawLine(QPointF(x0, mid_y), QPointF(x1, mid_y))
 

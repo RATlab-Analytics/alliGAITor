@@ -420,6 +420,18 @@ class PipelineConfig:
             ``False`` (videos are generated). Editable per group in the
             config editor; new groups start from
             ``app_settings.get_default_skip_validation_videos``.
+        bottom_fallback: If ``True``, :func:`alligaitor.pipeline.run_session`
+            fills triangulation gaps using the experimental bottom-camera
+            monocular fallback (see :mod:`alligaitor.bottom_fallback`)
+            wherever the bottom camera alone has a valid 2D detection.
+            :func:`alligaitor.pipeline.run_group` then guards every paw
+            that already had a usable run without the fallback, splicing
+            its exact pre-fallback numbers back in -- the fallback can
+            only ever add usability a paw didn't already have, never take
+            one away (see :func:`alligaitor.bottom_fallback.guard_against_regression`).
+            Defaults to ``False`` -- a group only pays for this if it
+            opts in, and a group that doesn't need it runs on plain
+            triangulation exactly as before.
     """
 
     models: ModelConfig
@@ -430,6 +442,7 @@ class PipelineConfig:
     gait: GaitConfig = field(default_factory=GaitConfig)
     discovery: Optional[DiscoveryConfig] = None
     skip_validation_videos: bool = False
+    bottom_fallback: bool = False
 
     @classmethod
     def from_yaml(cls, path: PathLike) -> "PipelineConfig":
@@ -497,6 +510,7 @@ class PipelineConfig:
             gait=gait,
             discovery=discovery,
             skip_validation_videos=bool(raw.get("skip_validation_videos", False)),
+            bottom_fallback=bool(raw.get("bottom_fallback", False)),
         )
 
     def to_yaml(self, path: PathLike) -> None:
@@ -553,6 +567,7 @@ class PipelineConfig:
                 "stride_length_outlier_ratio": self.gait.stride_length_outlier_ratio,
             },
             "skip_validation_videos": self.skip_validation_videos,
+            "bottom_fallback": self.bottom_fallback,
         }
         if self.output_xlsx is not None:
             raw["output_xlsx"] = _relativize(base_dir, self.output_xlsx)

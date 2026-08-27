@@ -66,6 +66,7 @@ from PySide6.QtWidgets import (
 
 from frame_utils import video_key, grab_middle_frame, bgr_frame_to_qimage
 import video_crop as vc
+from video_crop import _BC_LAYERS
 from crop_runner import CropRunner
 
 _RECT_COLOR = QColor(255, 140, 0)
@@ -306,6 +307,40 @@ class CropSetupDialog(QDialog):
             self.strength_slider.setEnabled(self.color_grade)
             self.strength_label.setEnabled(self.color_grade)
 
+        # "Advanced" mode: exposes all four Brightness/Contrast layer
+        # parameters (see video_crop._BC_LAYERS) directly, instead of the
+        # single strength knob that scales both layers together. The
+        # bottom camera's exposure varies enough across setups that
+        # sometimes one layer needs pushing harder than the other to get
+        # a clean result -- strength alone can't reach that, since it
+        # scales both layers by the same factor. Only offered alongside
+        # the strength slider (i.e. wherever grading itself is offered).
+        self.advanced_checkbox = None
+        self.layer_sliders = None  # [(brightness_slider, brightness_label, contrast_slider, contrast_label), ...]
+        if self.mode != "side":
+            self.advanced_checkbox = QCheckBox("Advanced (per-layer brightness/contrast)")
+            self.advanced_checkbox.setChecked(False)
+            self.advanced_checkbox.toggled.connect(self._on_advanced_toggled)
+            self.advanced_checkbox.setEnabled(self.color_grade)
+
+            self.layer_sliders = []
+            for brightness, contrast in _BC_LAYERS:
+                b_slider = QSlider(Qt.Horizontal)
+                b_slider.setRange(-100, 100)
+                b_slider.setValue(int(brightness))
+                b_label = QLabel(f"{int(brightness)}")
+                b_label.setMinimumWidth(40)
+                b_slider.valueChanged.connect(self._on_layer_slider_changed)
+
+                c_slider = QSlider(Qt.Horizontal)
+                c_slider.setRange(-100, 100)
+                c_slider.setValue(int(contrast))
+                c_label = QLabel(f"{int(contrast)}")
+                c_label.setMinimumWidth(40)
+                c_slider.valueChanged.connect(self._on_layer_slider_changed)
+
+                self.layer_sliders.append((b_slider, b_label, c_slider, c_label))
+
         self.info_label = QLabel()
         self.info_label.setWordWrap(True)
         self.progress_label = QLabel()
@@ -358,6 +393,30 @@ class CropSetupDialog(QDialog):
             strength_row.addWidget(self.strength_slider, stretch=1)
             strength_row.addWidget(self.strength_label)
 
+        advanced_row = None
+        layer_rows = None
+        if self.advanced_checkbox is not None:
+            advanced_row = QHBoxLayout()
+            advanced_row.addWidget(self.advanced_checkbox)
+            advanced_row.addStretch()
+
+            layer_rows = []
+            for i, (b_slider, b_label, c_slider, c_label) in enumerate(self.layer_sliders, start=1):
+                row = QHBoxLayout()
+                row.addWidget(QLabel(f"Layer {i} brightness:"))
+                row.addWidget(b_slider, stretch=1)
+                row.addWidget(b_label)
+                row.addWidget(QLabel(f"Layer {i} contrast:"))
+                row.addWidget(c_slider, stretch=1)
+                row.addWidget(c_label)
+                # Wrapped in a QWidget (rather than added as a bare
+                # QHBoxLayout) so the whole row can be hidden as a unit --
+                # a QLayout itself has no setVisible, only its widgets do.
+                row_widget = QWidget()
+                row_widget.setLayout(row)
+                row_widget.setVisible(False)  # advanced mode starts off
+                layer_rows.append(row_widget)
+
         nav_row = QHBoxLayout()
         nav_row.addWidget(self.back_btn)
         nav_row.addWidget(self.forward_btn)
@@ -369,6 +428,12 @@ class CropSetupDialog(QDialog):
             layout.addLayout(angle_row)
         if strength_row is not None:
             layout.addLayout(strength_row)
+        if advanced_row is not None:
+            layout.addLayout(advanced_row)
+        self.layer_rows = layer_rows
+        if layer_rows is not None:
+            for row_widget in layer_rows:
+                layout.addWidget(row_widget)
         layout.addWidget(self.canvas, stretch=1)  # the one thing that should grow when the dialog is resized
         layout.addWidget(self.info_label)
         layout.addLayout(nav_row)
@@ -411,29 +476,73 @@ class CropSetupDialog(QDialog):
             return 0.0
         return self.strength_slider.value() / 100.0
 
+    @property
+    def advanced(self) -> bool:
+        return self.advanced_checkbox is not None and self.advanced_checkbox.isChecked()
+
+    @property
+    def color_grade_layers(self) -> list[tuple[float, float]] | None:
+        """Explicit per-layer (brightness, contrast) values from the
+        Advanced sliders, or None to fall back to color_grade_strength
+        scaling the default recipe (see apply_bottom_up_color_correction)."""
+        if not self.advanced or self.layer_sliders is None:
+            return None
+        return [(b_slider.value(), c_slider.value()) for b_slider, _, c_slider, _ in self.layer_sliders]
+
     # -- preview --
 
     def _on_grade_changed(self, checked=None):
         if self.strength_slider is not None:
-            self.strength_slider.setEnabled(self.color_grade)
-            self.strength_label.setEnabled(self.color_grade)
+            self.strength_slider.setEnabled(self.color_grade and not self.advanced)
+            self.strength_label.setEnabled(self.color_grade and not self.advanced)
+        if self.advanced_checkbox is not None:
+            self.advanced_checkbox.setEnabled(self.color_grade)
+        self._set_layer_sliders_enabled(self.color_grade and self.advanced)
         self._update_preview()
 
     def _on_strength_changed(self, value):
         self.strength_label.setText(f"{value}%")
         self._update_preview()
 
+    def _on_advanced_toggled(self, checked):
+        if self.strength_slider is not None:
+            self.strength_slider.setEnabled(self.color_grade and not checked)
+            self.strength_label.setEnabled(self.color_grade and not checked)
+        if self.layer_rows is not None:
+            for row_widget in self.layer_rows:
+                row_widget.setVisible(checked)
+        self._set_layer_sliders_enabled(self.color_grade and checked)
+        self._update_preview()
+
+    def _on_layer_slider_changed(self, value):
+        for b_slider, b_label, c_slider, c_label in self.layer_sliders:
+            b_label.setText(str(b_slider.value()))
+            c_label.setText(str(c_slider.value()))
+        self._update_preview()
+
+    def _set_layer_sliders_enabled(self, enabled):
+        if self.layer_sliders is None:
+            return
+        for b_slider, b_label, c_slider, c_label in self.layer_sliders:
+            b_slider.setEnabled(enabled)
+            b_label.setEnabled(enabled)
+            c_slider.setEnabled(enabled)
+            c_label.setEnabled(enabled)
+
     def _update_preview(self):
         """Re-renders the canvas's displayed frame from the last-loaded
-        raw frame -- called whenever the angle toggle or strength slider
-        changes, so the preview reflects what the crop will actually
-        produce without re-reading the video. Preserves the current crop
-        box position (set_frame re-clamps rather than resetting it)."""
+        raw frame -- called whenever the angle toggle, strength slider,
+        or advanced per-layer sliders change, so the preview reflects
+        what the crop will actually produce without re-reading the
+        video. Preserves the current crop box position (set_frame
+        re-clamps rather than resetting it)."""
         if self._current_raw_frame is None:
             return
         frame = self._current_raw_frame
         if self.color_grade:
-            frame = vc.apply_bottom_up_color_correction(frame, strength=self.color_grade_strength)
+            frame = vc.apply_bottom_up_color_correction(
+                frame, strength=self.color_grade_strength, layers=self.color_grade_layers,
+            )
         qimage = bgr_frame_to_qimage(frame)
         self.canvas.set_frame(qimage, self.width_spin.value(), self.height_spin.value())
 
@@ -515,6 +624,7 @@ class CropSetupDialog(QDialog):
                 video_path, self._out_path_for(video_path), x, y,
                 self.width_spin.value(), self.height_spin.value(),
                 color_grade=self.color_grade, color_grade_strength=self.color_grade_strength,
+                color_grade_layers=self.color_grade_layers,
             )
         except Exception as exc:
             QMessageBox.warning(self, "Crop failed", f"Couldn't crop {video_path.name}:\n{exc}")
@@ -571,6 +681,7 @@ class CropSetupDialog(QDialog):
             self.tools_dir, str(self.input_folder), str(self.output_folder),
             self.width_spin.value(), self.height_spin.value(), positions=positions,
             color_grade=self.color_grade, color_grade_strength=self.color_grade_strength,
+            color_grade_layers=self.color_grade_layers,
         )
         self.runner.log.connect(self.bulk_log.appendPlainText)
         self.runner.progress.connect(self._on_bulk_progress)
@@ -613,8 +724,11 @@ class CropSetupDialog(QDialog):
         elif self.mode == "bottom":
             self.grade_checkbox.setEnabled(enabled)
         if self.strength_slider is not None:
-            self.strength_slider.setEnabled(enabled and self.color_grade)
-            self.strength_label.setEnabled(enabled and self.color_grade)
+            self.strength_slider.setEnabled(enabled and self.color_grade and not self.advanced)
+            self.strength_label.setEnabled(enabled and self.color_grade and not self.advanced)
+        if self.advanced_checkbox is not None:
+            self.advanced_checkbox.setEnabled(enabled and self.color_grade)
+        self._set_layer_sliders_enabled(enabled and self.color_grade and self.advanced)
 
     # -- keyboard shortcuts (dialog-level, so they work regardless of --
     # -- exactly which child widget currently has focus) --

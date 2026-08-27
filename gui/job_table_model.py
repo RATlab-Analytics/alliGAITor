@@ -21,6 +21,7 @@ _STATUS_LABELS = {
     JobStatus.NEEDS_CONFIG: "Needs config",
     JobStatus.NEEDS_CROP: "Needs crop",
     JobStatus.READY: "Ready",
+    JobStatus.QUEUED: "Queued",
     JobStatus.RUNNING: "Running…",
     JobStatus.DONE: "Done",
     JobStatus.FAILED: "Failed",
@@ -33,6 +34,7 @@ _STATUS_LABELS = {
 _STATUS_COLORS = {
     JobStatus.NEEDS_CONFIG: QColor("#ffca28"),
     JobStatus.NEEDS_CROP: QColor("#ffca28"),
+    JobStatus.QUEUED: QColor("#64b5f6"),
     JobStatus.RUNNING: QColor("#64b5f6"),
     JobStatus.DONE: QColor("#81c995"),
     JobStatus.FAILED: QColor("#f28b82"),
