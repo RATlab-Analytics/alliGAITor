@@ -13,8 +13,8 @@ GPLv3 About dialog).
 
 from __future__ import annotations
 
-import html
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -45,28 +45,6 @@ from alligaitor.discovery import find_videos
 from crop_setup_dialog import CropSetupDialog
 from crop_config import CROP_TARGET_WIDTH, CROP_TARGET_HEIGHT, side_crop_size_for_model
 from regex_help import build_regex_help_panel
-
-import re
-
-# Pulls the "done/total" counts out of a tqdm-style progress line (e.g.
-# "45%|████ | 450/1000 [00:32<00:39, 14.06it/s]") so the ETA can be
-# refreshed on every live redraw of an inference/validation-video-encode
-# progress bar, not just when a whole session finishes -- see
-# MainWindow._on_progress_line. html_message is HTML (spans +
-# &nbsp;), hence the tag-strip/unescape before matching.
-_HTML_TAG_RE = re.compile(r"<[^>]+>")
-_PROGRESS_FRACTION_RE = re.compile(r"(\d+)/(\d+)\s*\[")
-
-
-def _parse_progress_fraction(html_message: str) -> Optional[float]:
-    plain = html.unescape(_HTML_TAG_RE.sub("", html_message))
-    m = _PROGRESS_FRACTION_RE.search(plain)
-    if not m:
-        return None
-    done, total = int(m.group(1)), int(m.group(2))
-    if total <= 0:
-        return None
-    return max(0.0, min(1.0, done / total))
 
 
 def _double_spin(value: float, minimum: float, maximum: float, decimals: int = 1, suffix: str = "",
@@ -322,24 +300,21 @@ class MainWindow(QMainWindow):
         # updates) made the displayed ETA count up instead of down.
         self._eta_remaining_s: float | None = None
         self._eta_snapshot_time: float | None = None
-        # Fractional progress (0..1) through whatever session is
-        # currently running, parsed from its live tqdm-style progress
-        # line (inference or validation-video encode -- see
-        # _on_progress_line/_parse_progress_fraction). Lets the ETA move
-        # within a session instead of only at session boundaries, which
-        # can otherwise be many minutes apart.
-        self._eta_session_fraction: float = 0.0
-        # Exponentially-weighted rate of progress ("sessions" per
-        # second, counting the fraction above), plus the (done, time)
-        # sample it was last updated from. An EMA -- rather than the
-        # done-over-elapsed-since-run-start average this used to be --
-        # so a slowdown partway through a run pulls the rate (and so the
-        # ETA) down within a few samples instead of being permanently
-        # diluted by however much faster the run started out; see
-        # _recompute_eta_snapshot.
-        self._eta_rate_ema: float | None = None
-        self._eta_last_done: float | None = None
-        self._eta_last_sample_time: float | None = None
+        # EMA of whole-session wall-clock duration, measured between
+        # consecutive _on_job_progress calls (a session finishing) --
+        # deliberately session-granularity only, not per-bar/per-video.
+        # A finer-grained ETA (tracking each camera role's own inference
+        # progress live, accounting for bottom running faster than side,
+        # video-length differences between sessions, etc.) was tried and
+        # scrapped: it needed identifying *which* role a given progress
+        # bar belongs to, which nothing in the progress text actually
+        # says (see alligaitor.pipeline.run_session -- no per-role log
+        # message precedes each role's inference), so the correlation
+        # was too fragile to trust. Per-session is coarser (only updates
+        # once per session, which can be minutes) but robust: real data,
+        # no guessing at bar identity.
+        self._eta_session_duration_ema: float | None = None
+        self._eta_last_session_done_time: float | None = None
 
         # Whether the last line written to the log panel is a live
         # progress-bar redraw (as opposed to a discrete log message) --
@@ -458,6 +433,8 @@ class MainWindow(QMainWindow):
         job_menu.addAction("Remove Selected", self._on_remove_selected)
         job_menu.addSeparator()
         job_menu.addAction("Re-crop Selected…", self._on_recrop_selected)
+        job_menu.addSeparator()
+        job_menu.addAction("Retry Failed Job(s)…", self._on_retry_failed)
 
         reset_menu = self.menuBar().addMenu("Reset")
         reset_menu.addAction(
@@ -511,7 +488,38 @@ class MainWindow(QMainWindow):
 
     def _on_select_model(self, role: str, name: str):
         app_settings.set_selected_model(self.app_data_dir, role, name)
-        self._log(f"{role.capitalize()} model set to '{name}' -- applies to any job saved/run from now on.")
+        updated = self._propagate_model_selection(role, name)
+        suffix = f" -- updated {updated} saved job(s)." if updated else " -- no saved jobs to update."
+        self._log(f"{role.capitalize()} model set to '{name}'{suffix}")
+
+    def _propagate_model_selection(self, role: str, name: str) -> int:
+        """Writes the newly selected model straight into every already-saved
+        job's config.yaml, rather than leaving it to only apply the next time
+        each job's config editor happens to be re-saved -- checking a model in
+        this menu should mean every job now runs with it, not silently keep
+        stale jobs on whatever model they were saved with last."""
+        field = f"{role}_model_dir"
+        model_path = self.repo_dir / "models" / name
+        updated = 0
+        for job in self.job_queue.jobs:
+            if job.status in (JobStatus.RUNNING, JobStatus.QUEUED):
+                continue  # never rewrite the config out from under an active/pending run
+            if not job.config_path.exists():
+                continue
+            try:
+                config = PipelineConfig.from_yaml(job.config_path)
+            except Exception:
+                continue
+            if getattr(config.models, field) == model_path:
+                continue
+            config.models = replace(config.models, **{field: model_path})
+            config.to_yaml(job.config_path)
+            refresh_job_readiness(job)
+            self.job_queue.update(job)
+            updated += 1
+        if updated:
+            self.model.refresh()
+        return updated
 
     def _on_open_preferences(self):
         dialog = _PreferencesDialog(self.app_data_dir, parent=self)
@@ -567,6 +575,8 @@ class MainWindow(QMainWindow):
         menu.addAction("Crop…", self._on_recrop_selected)
         menu.addSeparator()
         menu.addAction("Run Selected Job(s)", self._on_run_selected)
+        retry_action = menu.addAction("Retry Failed Job(s)…", self._on_retry_failed)
+        retry_action.setEnabled(any(j.status == JobStatus.FAILED for j in jobs))
         menu.addSeparator()
         validation_action = menu.addAction("View Validation…", self._on_view_validation_selected)
         validation_action.setEnabled(len(jobs) == 1 and jobs[0].status == JobStatus.DONE)
@@ -620,12 +630,21 @@ class MainWindow(QMainWindow):
         if job.status == JobStatus.NEEDS_CROP:
             self._open_crop_step(job)
 
+    def _job_locked_by_run(self, job: Job) -> bool:
+        """True while `job` is either actually RUNNING or still QUEUED
+        behind the running job in the current BatchRunner -- BatchRunner
+        snapshotted its own copy of every job at start() (see
+        batch_runner.py), so editing/removing/resetting a queued job
+        here wouldn't reach it and would leave the run working from
+        stale data."""
+        return job.status in (JobStatus.RUNNING, JobStatus.QUEUED)
+
     def _on_edit_job(self):
         job = self._selected_job()
         if job is None:
             QMessageBox.information(self, "Select a job", "Select exactly one job to edit.")
             return
-        if job.status == JobStatus.RUNNING:
+        if self._job_locked_by_run(job):
             QMessageBox.information(self, "Job running", "Can't edit a job while it's running.")
             return
         self._open_config_editor(job)
@@ -648,11 +667,59 @@ class MainWindow(QMainWindow):
         if job is not None and job.status == JobStatus.DONE:
             self._open_validation_view(job)
 
+    def _confirm_retry(self, jobs: list[Job]) -> bool:
+        """Shows each job's actual failure reason and asks to confirm
+        retrying it -- a job failed for a specific, possibly still-
+        unresolved reason, so retrying it silently would either waste
+        however long it takes to fail the same way again, or (worse)
+        succeed having silently masked whatever was actually wrong."""
+        if len(jobs) == 1:
+            job = jobs[0]
+            reason = job.error_message or "(no error message recorded)"
+            detail = f"'{job.group_name}' previously failed with:\n\n{reason}\n\nRetry this job anyway?"
+        else:
+            reason_lines = "\n\n".join(
+                f"'{j.group_name}': {j.error_message or '(no error message recorded)'}" for j in jobs
+            )
+            detail = f"Retry {len(jobs)} failed job(s) anyway? Their errors:\n\n{reason_lines}"
+        reply = QMessageBox.warning(
+            self, "Retry failed job(s)", detail, QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        return reply == QMessageBox.Yes
+
+    def _retry_jobs(self, jobs: list[Job]) -> None:
+        """Moves FAILED job(s) back to READY (or NEEDS_CROP, if
+        refresh_job_readiness finds the crop step itself is why it's not
+        ready -- see that function) so they're picked up by Run All/Run
+        Selected again, same as any other READY job. Caller's
+        responsibility to confirm first (see _confirm_retry) and to
+        refresh the model/table after."""
+        for job in jobs:
+            job.error_message = ""
+            # refresh_job_readiness deliberately leaves FAILED (and
+            # RUNNING/DONE/CANCELED) alone -- those are runner-owned
+            # states it won't recompute out of (see its docstring).
+            # READY is the assumption to recompute *from*; it'll still
+            # correctly downgrade to NEEDS_CROP/NEEDS_CONFIG below if
+            # disk state has drifted since this job failed (e.g. a crop
+            # output got cleaned up).
+            job.status = JobStatus.READY
+            refresh_job_readiness(job)
+            self.job_queue.update(job)
+            self._log(f"'{job.group_name}' retry requested -- now {job.status.value}.")
+
+    def _on_retry_failed(self):
+        jobs = [j for j in self._selected_jobs() if j.status == JobStatus.FAILED]
+        if not jobs or not self._confirm_retry(jobs):
+            return
+        self._retry_jobs(jobs)
+        self.model.refresh()
+
     def _on_remove_selected(self):
         jobs = self._selected_jobs()
         if not jobs:
             return
-        if any(j.status == JobStatus.RUNNING for j in jobs):
+        if any(self._job_locked_by_run(j) for j in jobs):
             QMessageBox.information(self, "Job running", "Stop the run before removing a running job.")
             return
         reply = QMessageBox.question(
@@ -675,7 +742,7 @@ class MainWindow(QMainWindow):
         if job is None:
             QMessageBox.information(self, "Select a job", "Select exactly one job to re-crop.")
             return
-        if job.status == JobStatus.RUNNING:
+        if self._job_locked_by_run(job):
             QMessageBox.information(self, "Job running", "Can't re-crop a job while it's running.")
             return
         self._open_crop_step(job)
@@ -746,7 +813,7 @@ class MainWindow(QMainWindow):
 
     def _on_reset_selected(self, clear_predictions: bool, clear_output: bool, clear_crops: bool):
         jobs = self._selected_jobs()
-        targetable = [j for j in jobs if j.status != JobStatus.RUNNING]
+        targetable = [j for j in jobs if not self._job_locked_by_run(j)]
         if len(targetable) < len(jobs):
             self._log("Skipping running job(s) -- can't reset while running.")
         if not targetable:
@@ -778,10 +845,27 @@ class MainWindow(QMainWindow):
     # -- run --
 
     def _on_run_queue(self):
+        # A FAILED job sitting in the queue is exactly the case
+        # _retry_jobs exists for, and "Run All" is a reasonable place to
+        # offer that rather than requiring the user to already know
+        # about the separate Retry action (see _on_retry_failed) first.
+        # Checked unconditionally, not just when there's nothing else
+        # READY to run -- a FAILED job alongside a READY one should
+        # still get offered a retry, not silently skipped in favor of
+        # whatever else happens to be runnable.
+        failed = [j for j in self.job_queue.jobs if j.status == JobStatus.FAILED]
+        if failed and self._confirm_retry(failed):
+            self._retry_jobs(failed)
+            self.model.refresh()
         self._run_jobs(self.job_queue.runnable_jobs())
 
     def _on_run_selected(self):
-        jobs = [j for j in self._selected_jobs() if j.status == JobStatus.READY]
+        selected = self._selected_jobs()
+        failed = [j for j in selected if j.status == JobStatus.FAILED]
+        if failed and self._confirm_retry(failed):
+            self._retry_jobs(failed)
+            self.model.refresh()
+        jobs = [j for j in selected if j.status == JobStatus.READY]
         self._run_jobs(jobs)
 
     def _run_jobs(self, jobs: list[Job]):
@@ -792,9 +876,14 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Already running", "A run is already in progress.")
             return
 
+        # Only the job actually executing should read RUNNING -- the rest
+        # of this batch reads QUEUED (not READY) until BatchRunner
+        # reaches it (see _on_job_started, which flips a job to RUNNING
+        # one at a time as it's dequeued). QUEUED, not READY, so it's
+        # still locked from editing/removing/resetting in the meantime --
+        # see _job_locked_by_run.
         for job in jobs:
-            job.status = JobStatus.RUNNING
-            job.started_at = datetime.now(timezone.utc).isoformat()
+            job.status = JobStatus.QUEUED
             job.sessions_done = 0
             self.job_queue.update(job)
         self.model.refresh()
@@ -804,10 +893,8 @@ class MainWindow(QMainWindow):
         self._run_start_time = time.time()
         self._eta_remaining_s = None
         self._eta_snapshot_time = None
-        self._eta_session_fraction = 0.0
-        self._eta_rate_ema = None
-        self._eta_last_done = None
-        self._eta_last_sample_time = None
+        self._eta_session_duration_ema = None
+        self._eta_last_session_done_time = self._run_start_time
 
         self.runner = BatchRunner(jobs, self.repo_dir, device="auto", tracking=False, parent=self)
         self.runner.log.connect(self._log)
@@ -833,6 +920,11 @@ class MainWindow(QMainWindow):
 
     def _on_job_started(self, job_id: str):
         job = self.job_queue.get(job_id)
+        if job is not None:
+            job.status = JobStatus.RUNNING
+            job.started_at = datetime.now(timezone.utc).isoformat()
+            self.job_queue.update(job)
+            self.model.refresh()
         self._log(f"Started '{job.group_name if job else job_id}'.")
 
     def _on_job_progress(self, job_id: str, done: int, total: int):
@@ -844,10 +936,24 @@ class MainWindow(QMainWindow):
             job.sessions_total = total
             self.job_queue.update(job)
             self.model.refresh()
-        # A session just completed -- the next progress line belongs to
-        # a new session starting from 0, not a continuation of the one
-        # that just finished.
-        self._eta_session_fraction = 0.0
+
+        # A whole session just finished -- fold its wall-clock duration
+        # into the session-duration EMA (see __init__'s docstring for why
+        # this, rather than a cumulative since-start average: a real
+        # slowdown partway through a run should pull the estimate down
+        # within a few sessions, not stay diluted forever by however fast
+        # the run started out).
+        now = time.time()
+        if self._eta_last_session_done_time is not None:
+            duration = now - self._eta_last_session_done_time
+            if duration > 0:
+                if self._eta_session_duration_ema is None:
+                    self._eta_session_duration_ema = duration
+                else:
+                    alpha = 0.3
+                    self._eta_session_duration_ema = alpha * duration + (1 - alpha) * self._eta_session_duration_ema
+        self._eta_last_session_done_time = now
+
         self._recompute_eta_snapshot()
         self._update_progress_ui()
 
@@ -881,69 +987,45 @@ class MainWindow(QMainWindow):
             self._log("Stop requested -- the current job will finish; remaining queued job(s) will be canceled.")
 
     def _recompute_eta_snapshot(self):
-        """Re-anchors the ETA countdown to a fresh rate estimate.
+        """Re-anchors the ETA countdown to a fresh remaining-time estimate.
 
         Called only when real progress actually happens -- a session
-        finishing (_on_job_progress) or, more often, a live tqdm-style
-        progress line from the inference/validation-video-encode step
-        within the current session moving forward (_on_progress_line via
-        _parse_progress_fraction) -- NOT every second. An earlier version
-        recomputed ``(total - done) / (done / elapsed_since_start)`` on
-        every 1Hz tick, with ``elapsed_since_start`` growing continuously
-        while ``done`` stayed fixed between session completions (often
-        several minutes apart) -- so the *average rate* it computed kept
-        dropping every tick, and the *remaining time* estimate grew right
-        along with it: the ETA counted up, not down, for however long a
-        session took. Recomputing only on real progress fixed the
-        counting-up bug, but with ``rate = done / elapsed_since_start``
-        it was still a *cumulative* average over the whole run: once a
-        run has done a lot of fast progress early on, that history keeps
-        dragging the average up even if the run has since slowed right
-        down, so the ETA stays optimistic and can never fully recover.
+        finishing (_on_job_progress) -- NOT every second; see
+        _update_progress_ui for the 1Hz countdown between calls. An
+        earlier version recomputed ``(total - done) / (done /
+        elapsed_since_start)`` on every 1Hz tick, with
+        ``elapsed_since_start`` growing continuously while ``done``
+        stayed fixed between session completions (often several minutes
+        apart) -- so the *average rate* it computed kept dropping every
+        tick, and the *remaining time* estimate grew right along with
+        it: the ETA counted up, not down, for however long a session
+        took. Recomputing only on real progress fixed the counting-up
+        bug, but a single ``done / elapsed_since_start`` rate was still
+        a *cumulative* average over the whole run -- once a run has done
+        a lot of fast progress early on, that history keeps dragging the
+        average up even after the run has since slowed right down, so
+        the ETA stayed optimistic and could never fully recover.
 
-        Instead, ``self._eta_rate_ema`` is an exponential moving average
-        of *instantaneous* rate, updated once per call from the delta
-        against the previous (done, time) sample -- see the smoothing
-        constant below. Recent samples dominate within a handful of
-        updates, so a real slowdown (or speedup) shows up in the ETA
-        quickly instead of being permanently diluted by the run's
-        history. The remaining-seconds estimate computed from that rate
-        is stored here alongside the wall-clock time it was computed at;
-        between calls, _update_progress_ui's 1Hz tick just subtracts
-        elapsed real time from that fixed estimate -- an ordinary
-        countdown -- rather than re-deriving a new estimate from scratch.
+        ``_eta_session_duration_ema`` (see __init__'s docstring) fixes
+        both: it's recency-weighted, so a real slowdown pulls the
+        estimate down within a few sessions, and it's only ever updated
+        from an actual completed session's real duration -- no attempt
+        is made to track progress *within* a session (that was tried and
+        scrapped; see __init__'s docstring for why). No estimate is
+        shown until at least one session has finished.
         """
         if self._run_start_time is None:
             return
-        done = sum(self._run_done_by_job.values()) + self._eta_session_fraction
-        total = sum(self._run_total_by_job.values()) or 1
-        now = time.time()
+        sessions_done = sum(self._run_done_by_job.values())
+        sessions_total = sum(self._run_total_by_job.values()) or 1
+        sessions_remaining = max(0, sessions_total - sessions_done)
 
-        if self._eta_last_done is not None and self._eta_last_sample_time is not None:
-            dt = now - self._eta_last_sample_time
-            d_done = done - self._eta_last_done
-            # Require a real time gap and genuine forward progress --
-            # skips near-zero-dt redraw spam and (harmlessly) skips the
-            # occasional sample where a session boundary's fraction
-            # reset makes d_done momentarily <= 0, rather than folding
-            # either into the rate as noise.
-            if dt > 0.5 and d_done > 0:
-                instantaneous_rate = d_done / dt
-                if self._eta_rate_ema is None:
-                    self._eta_rate_ema = instantaneous_rate
-                else:
-                    alpha = 0.3  # weight given to each new sample
-                    self._eta_rate_ema = alpha * instantaneous_rate + (1 - alpha) * self._eta_rate_ema
-
-        self._eta_last_done = done
-        self._eta_last_sample_time = now
-
-        if not self._eta_rate_ema or self._eta_rate_ema <= 0:
+        if self._eta_session_duration_ema is None or sessions_remaining <= 0:
             self._eta_remaining_s = None
             self._eta_snapshot_time = None
             return
-        self._eta_remaining_s = max(0.0, (total - done) / self._eta_rate_ema)
-        self._eta_snapshot_time = now
+        self._eta_remaining_s = sessions_remaining * self._eta_session_duration_ema
+        self._eta_snapshot_time = time.time()
 
     def _update_progress_ui(self):
         done = sum(self._run_done_by_job.values())
@@ -1018,17 +1100,9 @@ class MainWindow(QMainWindow):
         what the batch worker passes) -- redraws the same line in place,
         the same colored way the tqdm bar this mirrors does in a real
         terminal, instead of adding a new line to the log for every
-        redraw. Also feeds the parsed done/total fraction from this same
-        line into the ETA estimate (see _recompute_eta_snapshot) -- this
-        is what lets the ETA update within a session (an inference run
-        or a validation-video encode), rather than only at session
-        boundaries."""
-        fraction = _parse_progress_fraction(html_message)
-        if fraction is not None:
-            self._eta_session_fraction = fraction
-            self._recompute_eta_snapshot()
-            self._update_progress_ui()
-
+        redraw. Purely a log-panel display concern -- the ETA is
+        session-granularity only (see __init__'s docstring on
+        _eta_session_duration_ema for why), so nothing here feeds it."""
         cursor = self.log_panel.textCursor()
         cursor.movePosition(QTextCursor.End)
         if self._progress_line_open:
