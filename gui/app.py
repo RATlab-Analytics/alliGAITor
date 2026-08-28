@@ -24,10 +24,66 @@ Run with:
 from __future__ import annotations
 
 import multiprocessing
+import os
+import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 REPO_DIR = Path(__file__).resolve().parent.parent
+
+
+def _uv_tool_bin_dir() -> Path:
+    """Default shim directory `uv tool install` (the standard way to install
+    sleap-nn) places executables in, per uv's own precedence: UV_TOOL_BIN_DIR,
+    then XDG_BIN_HOME, then XDG_DATA_HOME/../bin, then ~/.local/bin."""
+    override = os.environ.get("UV_TOOL_BIN_DIR")
+    if override:
+        return Path(override)
+    xdg_bin = os.environ.get("XDG_BIN_HOME")
+    if xdg_bin:
+        return Path(xdg_bin)
+    xdg_data = os.environ.get("XDG_DATA_HOME")
+    if xdg_data:
+        return Path(xdg_data).parent / "bin"
+    return Path.home() / ".local" / "bin"
+
+
+def _login_shell_path() -> Optional[str]:
+    """A GUI app launched from Finder/Dock (or an AppImage/desktop entry on
+    Linux) doesn't inherit the user's shell PATH, only Windows does -- so a
+    CLI tool only added to PATH in .zshrc/.bashrc is invisible here even
+    though it works fine from a terminal."""
+    if sys.platform.startswith("win"):
+        return None
+    shell = os.environ.get("SHELL", "/bin/zsh")
+    try:
+        result = subprocess.run(
+            [shell, "-ilc", 'echo -n "$PATH"'],
+            capture_output=True, text=True, timeout=5,
+        )
+        lines = result.stdout.strip().splitlines()
+        return lines[-1] if lines else None
+    except Exception:
+        return None
+
+
+def _fix_path_env() -> None:
+    """Merge in the user's real login-shell PATH plus uv's tool-shim directory
+    so subprocess calls (sleap-nn, etc.) resolve the same way they do from a
+    terminal, regardless of how this app was launched."""
+    entries = (os.environ.get("PATH") or "").split(os.pathsep)
+
+    shell_path = _login_shell_path()
+    if shell_path:
+        entries = shell_path.split(":") + entries
+
+    uv_bin = _uv_tool_bin_dir()
+    if uv_bin.is_dir():
+        entries = [str(uv_bin)] + entries
+
+    merged = list(dict.fromkeys(p for p in entries if p))
+    os.environ["PATH"] = os.pathsep.join(merged)
 
 # Ensure repo root and tools/ are on sys.path in case this runs before
 # gui/__init__.py's own setup (e.g. `python gui/app.py` directly).
@@ -50,6 +106,7 @@ def _icon_path() -> Path:
 
 
 def main():
+    _fix_path_env()
     app = QApplication(sys.argv)
     app.setApplicationName("alliGAITor")
     app.setApplicationDisplayName("alliGAITor")
