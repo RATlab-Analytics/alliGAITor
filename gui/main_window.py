@@ -6,6 +6,7 @@ panel, and a progress bar + ETA shown while a run is in flight.
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import replace
 from datetime import datetime, timezone
