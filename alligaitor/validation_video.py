@@ -1,20 +1,10 @@
 """Annotated validation videos for auditing the 3D gait pipeline by eye.
 
-Stacks a session's three camera views vertically (left, bottom, right --
-each the same cropped, model-input clip :mod:`alligaitor.inference`
-actually ran on) with the triangulated skeleton reprojected back into
-every view: skeleton edges, paw nodes colored by ground-contact state (and
-red wherever the contributing cameras substantially disagree), an
-accumulating footprint marker at each detected touchdown, and a
-per-camera warning banner wherever that specific camera's dropped
-detection looks like it broke up a real stance phase into fragments too
-short to survive :attr:`alligaitor.config.GaitConfig.min_contact_frames`
-(see :func:`alligaitor.gait.find_camera_caused_discards`).
-
-Meant as the audit trail for tuning :class:`alligaitor.config.GaitConfig`
-by eye rather than by staring at numbers alone: every color and marker
-here is drawn from exactly the same :class:`alligaitor.gait.TrialMetrics`
-the group workbook is built from, not a separate/simplified pass.
+Stacks a session's three camera views vertically with the triangulated skeleton reprojected
+back into each: skeleton edges, paw nodes colored by contact state, footprint markers at each
+touchdown, and a per-camera warning banner where a dropped detection likely broke up a stance
+phase. Colors and markers are drawn from the same :class:`alligaitor.gait.TrialMetrics` the
+group workbook is built from.
 """
 
 from __future__ import annotations
@@ -57,11 +47,8 @@ _FOOTPRINT_COLOR_FOREPAW = (255, 0, 255)  # magenta
 _FOOTPRINT_COLOR_HINDPAW = (255, 255, 0)  # cyan
 _DROP_WARNING_COLOR = (0, 0, 220)
 
-# A footprint left over from an earlier crossing (see find_crossings) is drawn
-# in this flat gray at reduced opacity instead of its usual fore/hindpaw
-# color, once a later crossing has started -- so the accumulating trail from
-# an out-and-back recording doesn't read as one continuous (and geometrically
-# meaningless, since direction of travel differs) crossing.
+# Footprints from an earlier crossing fade to flat gray once a later crossing has started,
+# so an out-and-back recording's trail doesn't read as one continuous crossing.
 _FOOTPRINT_FADED_COLOR = (120, 120, 120)
 _FOOTPRINT_FADED_ALPHA = 0.35
 
@@ -70,15 +57,10 @@ _FOOTPRINT_RADIUS = 4
 
 
 class _FrameProgress:
-    """Throttled tqdm-style progress reporting for this module's per-frame
-    render loop -- the pure-Python equivalent of
-    :class:`alligaitor.subprocess_streaming.ProgressStreamer` for a
-    subprocess's own tqdm bar, so rendering a validation video shows a
-    live progress bar in the GUI log panel that looks and behaves exactly
-    like inference's (same ``tqdm.format_meter`` text, same redraw-in-
-    place/``on_redraw_closed`` contract -- see
-    :func:`alligaitor.inference.run_inference`) instead of the log going
-    quiet for however long a render takes.
+    """Throttled tqdm-style progress reporting for this module's per-frame render loop.
+
+    The pure-Python equivalent of :class:`alligaitor.subprocess_streaming.ProgressStreamer`,
+    matching the same redraw-in-place/``on_redraw_closed`` contract.
     """
 
     def __init__(
@@ -104,11 +86,7 @@ class _FrameProgress:
             return
         now = time.monotonic()
         is_final = i >= self.n_frames - 1
-        # Always flush the final frame regardless of the throttle -- same
-        # reasoning as ProgressStreamer._flush_progress_final: dropping an
-        # intermediate 0.5s tick is harmless (another follows shortly),
-        # but silently eating the one update that says "done" leaves the
-        # displayed bar stuck below 100% forever.
+        # Always flush the final frame regardless of throttle, so the bar doesn't stick below 100%.
         if not is_final and now - self.last_emit < self.min_interval_s:
             return
         elapsed = now - self.start_time
@@ -121,11 +99,7 @@ class _FrameProgress:
 
 
 def _footprint_color(paw: str):
-    """Forepaw and hind-paw footprints get distinct colors so a trial's
-    two paw categories -- currently tracked with very different
-    reliability, see :mod:`alligaitor.gait` -- are visually distinguishable
-    at a glance rather than blending into one undifferentiated trail.
-    """
+    """Forepaw and hind-paw footprints get distinct colors."""
     return _FOOTPRINT_COLOR_HINDPAW if "hind" in paw else _FOOTPRINT_COLOR_FOREPAW
 
 
@@ -135,20 +109,11 @@ def _camera_drop_warnings(
     positions: Dict[str, np.ndarray],
     config: GaitConfig,
 ) -> Dict[str, Dict[int, List[str]]]:
-    """Per role, per (shared-timeline) frame, which paw(s) that camera's
-    dropped detection plausibly cost a stance phase -- see
-    :func:`alligaitor.gait.find_camera_caused_discards`.
+    """Per role, per shared-timeline frame, which paw(s) that camera's dropped detection
+    plausibly cost a stance phase.
 
-    Reloads and re-aligns each role's raw 2D predictions (the same cached
-    ``<role>.predictions.slp`` triangulation used) to see which camera(s)
-    actually had a valid detection on each frame, independent of whether
-    the fused 3D point survived. ``positions`` is bridged the same way
-    :func:`alligaitor.gait.compute_trial_metrics` bridges it (see
-    :func:`alligaitor.gait.bridge_short_gaps`) before looking for
-    discards, so this diagnostic only flags gaps actually long enough to
-    have mattered to the real classification -- a short gap the trial's
-    own stance detection already bridged over isn't a discard to warn
-    about.
+    Reloads and re-aligns each role's raw 2D predictions to see which camera(s) actually had
+    a valid detection on each frame, independent of whether the fused 3D point survived.
     """
     tracks = {}
     fps_by_role = {}
@@ -165,13 +130,8 @@ def _camera_drop_warnings(
         cam_valid = cam_valid_by_paw[paw]
         exclude_camera = gait.FAR_SIDE_CAMERA[paw]
         for discard in discards_by_paw[paw]:
-            # discard.dropped_by is the union of whichever camera(s) were
-            # missing at the window's start vs. end boundary -- not every
-            # camera in that set was necessarily missing on every frame
-            # in between. Re-check per frame so a camera that had a
-            # perfectly good detection partway through the window (see
-            # frames 80-81 in the 79-82 example this was built against)
-            # isn't shown as having dropped it there too.
+            # Re-check per frame: not every camera missing at the window boundary was
+            # necessarily missing on every frame in between.
             for f in range(discard.start_frame, discard.end_frame + 1):
                 for role in CAMERA_ROLES:
                     if role != exclude_camera and not cam_valid[role][f]:
@@ -188,18 +148,7 @@ def _draw_drop_warning(panel: np.ndarray, paws: List[str]) -> None:
 
 
 def _crossing_index_of_frame(frame: int, crossing_starts: np.ndarray) -> int:
-    """Which crossing (index into ``crossing_starts``) ``frame`` belongs
-    to -- the last crossing whose start is at or before it.
-
-    Used two ways: once per footprint, to fix which crossing *produced*
-    it (its touchdown frame always falls inside that crossing's own
-    window, so this is exact, not a guess); and once per rendered frame,
-    to find the *current* crossing being watched, against which a
-    footprint's own crossing is compared to decide whether it's faded
-    (see :func:`export_validation_video`). A single-crossing recording
-    has one start at or before every frame, so this is always ``0`` and
-    nothing ever fades -- unchanged from before crossings existed.
-    """
+    """Which crossing (index into ``crossing_starts``) ``frame`` belongs to."""
     return max(0, int(np.searchsorted(crossing_starts, frame, side="right")) - 1)
 
 
@@ -211,13 +160,8 @@ def _reproject_footprints(
     crop_offset: Dict[str, Tuple[float, float]],
     crossing_starts: np.ndarray,
 ) -> Dict[str, List[Tuple[int, str, int, Tuple[float, float]]]]:
-    """Per role, a list of ``(touchdown_frame, paw, crossing_index, (px, py))``
-    footprint markers -- ``paw`` is carried through so each marker can be
-    colored by fore/hind paw category (see :func:`_footprint_color`), and
-    ``crossing_index`` (see :func:`_crossing_index_of_frame`) so a marker
-    from an earlier crossing than the one currently playing can be faded.
-
-    Reprojected once for the whole video (the rig is static), not per frame.
+    """Per role, a list of ``(touchdown_frame, paw, crossing_index, (px, py))`` footprint
+    markers, reprojected once for the whole video since the rig is static.
     """
     entries = [
         (paw, touchdown_frame, _crossing_index_of_frame(touchdown_frame, crossing_starts))
@@ -242,19 +186,9 @@ def _reproject_footprints(
     return footprints_by_role
 
 
-# A reprojected point can land far outside any real pixel coordinate --
-# not just from a genuine calibration/triangulation glitch, but reliably
-# from a misassigned camera role (a session whose left/right/bottom video
-# mapping doesn't match the calibration's), which sends garbage 3D points
-# through a camera model they were never actually seen by. NaN/Inf raise
-# in plain Python before reaching cv2 at all (int(round(...)) errors out
-# first); a huge-but-finite value instead sails through Python and only
-# fails once it hits cv2's own C++ point parser (a `cv::Point` is a 32-bit
-# int), surfacing as a cryptic "Can't parse 'pt2' ... wrong type" -- which
-# used to abort the rest of this session's video, not just skip the one
-# bad node. _MAX_COORD is comfortably beyond any real camera frame but
-# safely inside int32 range, so anything past it is treated the same as
-# "this node/edge isn't drawable this frame" rather than a crash.
+# A reprojected point can land far outside any real pixel coordinate (e.g. a misassigned
+# camera role). A huge-but-finite value would otherwise reach cv2's C++ point parser and
+# crash; _MAX_COORD bounds anything drawable, safely inside int32 range.
 _MAX_COORD = 1_000_000
 
 
@@ -270,16 +204,8 @@ def _finite_point(xy: Tuple[float, float]) -> Optional[Tuple[int, int]]:
 def _draw_marker(
     frame: np.ndarray, xy: Tuple[float, float], radius: int, color, thickness: int = -1, alpha: float = 1.0
 ) -> None:
-    """Draw one marker, alpha-blended into the frame instead of drawn
-    solid when ``alpha < 1`` -- used to fade an earlier crossing's
-    footprints toward the video underneath them rather than just toward
-    a flat color, so they read as "left over" rather than as a still-live
-    marker in a different color.
-
-    Blending is done on a small region-of-interest around the circle,
-    not the whole panel, so fading many accumulated markers stays cheap
-    regardless of panel size. Silently skips a non-finite or wildly
-    out-of-range point (see :func:`_finite_point`) rather than raising.
+    """Draw one marker, alpha-blended into the frame when ``alpha < 1`` (used to fade an
+    earlier crossing's footprints). Silently skips a non-finite or out-of-range point.
     """
     point = _finite_point(xy)
     if point is None:
@@ -303,8 +229,7 @@ def _draw_marker(
 
 _STRIP_HEIGHT = 32
 _STRIP_BG_COLOR = (40, 40, 40)
-# (label, color) -- every marker color actually drawn elsewhere in this
-# module, so the legend can't drift out of sync with what's on screen.
+# (label, color), matching every marker color drawn elsewhere in this module.
 _LEGEND_ENTRIES = (
     ("body node", _NODE_COLOR),
     ("paw (swing)", _PAW_SWING_COLOR),
@@ -317,11 +242,8 @@ _LEGEND_ENTRIES = (
 
 
 def _draw_header_strip(width: int, t: float, frame_idx: int, n_frames: int) -> np.ndarray:
-    """A dedicated top strip: shared-timeline time/frame index on the left,
-    a color legend (matching every marker color drawn per-panel) filling
-    the rest -- kept in its own band above the camera panels rather than
-    overlaid on top of video pixels, so neither obscures the other.
-    """
+    """A top strip showing shared-timeline time/frame index and a color legend, kept above
+    the camera panels rather than overlaid on the video."""
     strip = np.full((_STRIP_HEIGHT, width, 3), _STRIP_BG_COLOR, dtype=np.uint8)
     baseline_y = _STRIP_HEIGHT // 2 + 5
 
@@ -332,7 +254,7 @@ def _draw_header_strip(width: int, t: float, frame_idx: int, n_frames: int) -> n
     x = 8 + tw + 28
     for label, color in _LEGEND_ENTRIES:
         if x > width - 20:
-            break  # ran out of room on a narrow panel -- drop remaining entries rather than overflow
+            break  # out of room -- drop remaining entries rather than overflow
         cv2.circle(strip, (x, _STRIP_HEIGHT // 2), 5, color, -1)
         cv2.putText(strip, label, (x + 10, baseline_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
         (lw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
@@ -342,16 +264,8 @@ def _draw_header_strip(width: int, t: float, frame_idx: int, n_frames: int) -> n
 
 
 def _merge_crossings(trial: Union[TrialMetrics, List[TrialMetrics]]) -> TrialMetrics:
-    """Collapse a recording's per-crossing trials into one whose
-    ``paw_events`` covers every crossing, for drawing purposes.
-
-    The validation video renders the whole recording in one pass, so it
-    needs every stance event in a single lookup regardless of which
-    crossing produced it. Crossing windows never overlap (see
-    :func:`alligaitor.gait.find_crossings`), so concatenating in frame
-    order is well-defined. Only ``paw_events`` is meaningful on the
-    result -- the averaged metrics are per crossing and are deliberately
-    not recombined here; nothing in the drawing path reads them.
+    """Collapse a recording's per-crossing trials into one whose ``paw_events`` covers every
+    crossing, for drawing purposes. Only ``paw_events`` is meaningful on the result.
     """
     if isinstance(trial, TrialMetrics):
         return trial
@@ -390,36 +304,19 @@ def export_validation_video(
     """Write one session's annotated validation video.
 
     Args:
-        session: Session configuration -- ``session.videos`` (the cropped,
-            model-input clips) are what's actually rendered.
+        session: Session configuration; ``session.videos`` (cropped, model-input clips) is
+            what's actually rendered.
         csv_path: This trial's ``pose_3d.csv``.
         cgroup: Calibrated camera group.
-        trial: This recording's already-computed
-            :class:`gait.TrialMetrics` (the same instances the group
-            workbook is built from) -- either one, or the per-crossing
-            list from :func:`alligaitor.gait.compute_crossing_metrics`.
-            The video covers the whole recording, so several crossings
-            are merged into one set of stance events for drawing; their
-            frame ranges are disjoint by construction, so nothing
-            overlaps.
+        trial: This recording's already-computed :class:`gait.TrialMetrics`, either one, or
+            the per-crossing list from :func:`alligaitor.gait.compute_crossing_metrics`.
         config: The :class:`GaitConfig` ``trial`` was computed with.
         output_path: Destination ``.mp4`` path.
-        disagreement_threshold_px: A node is drawn red, regardless of its
-            usual color, when its reprojection error exceeds this.
-        log: Receives discrete one-off messages (frame count at the
-            start) -- same contract as :func:`alligaitor.inference.run_inference`.
-        progress: Receives a live, redrawing tqdm-style progress line as
-            frames render (see :class:`_FrameProgress`), throttled the
-            same way inference's own progress line is. Defaults to
-            ``log`` if not given.
-        html_progress: Whether ``progress`` wants an HTML-rendered line
-            (a rich-text GUI widget) or plain text -- same meaning as
-            :func:`alligaitor.inference.run_inference`'s own flag.
-        on_redraw_closed: Called once the final frame's progress update
-            has been sent to ``progress``, so a caller redrawing a line
-            in place (the GUI does) can start the next thing sharing that
-            line -- e.g. the next session's own inference bar -- fresh
-            instead of overwriting this bar's completed state.
+        disagreement_threshold_px: A node is drawn red when its reprojection error exceeds this.
+        log: Receives discrete one-off messages.
+        progress: Receives a live, redrawing tqdm-style progress line as frames render.
+        html_progress: Whether ``progress`` wants an HTML-rendered line or plain text.
+        on_redraw_closed: Called once the final frame's progress update has been sent.
 
     Returns:
         ``output_path``.
@@ -438,7 +335,7 @@ def export_validation_video(
         sorted(t.crossing_window[0] for t in crossings if t.crossing_window is not None)
     )
     if crossing_starts.size == 0:
-        crossing_starts = np.array([0])  # no window info (e.g. a hand-built trial) -- treat as one crossing
+        crossing_starts = np.array([0])  # no window info -- treat as one crossing
     trial = _merge_crossings(trial)
     planted = gait.planted_mask(trial, n_frames)
 
@@ -456,14 +353,8 @@ def export_validation_video(
 
     caps = {role: cv2.VideoCapture(str(session.videos[role])) for role in CAMERA_ROLES}
     native_frame_counts = {role: int(caps[role].get(cv2.CAP_PROP_FRAME_COUNT)) for role in CAMERA_ROLES}
-    # What cap.read() will return next for each role absent a re-seek --
-    # same tracking gui/video_player_widget.py's goto_frame() uses. The
-    # reference role's native_idx is *always* i (see below), i.e. purely
-    # sequential -- calling cap.set() on every one of its frames anyway
-    # was forcing a real seek (nearest-keyframe + decode-forward on
-    # compressed footage) for what should just be the next read(), and
-    # was a large, easily-avoidable chunk of this function's per-frame
-    # cost across all three cameras.
+    # What cap.read() will return next for each role absent a re-seek, so a purely
+    # sequential reference role avoids an expensive cap.set() seek on every frame.
     next_native_idx = {role: 0 for role in CAMERA_ROLES}
 
     output_path = Path(output_path)
@@ -546,10 +437,8 @@ def export_validation_video(
             composite = np.vstack([header, *panels])
 
             if writer is None:
-                # "mp4v" (MPEG-4 Part 2) writes a technically-valid stream
-                # but many players (QuickTime, Safari, in-app previews)
-                # render it as garbled macroblocks rather than falling
-                # back gracefully -- "avc1" (H.264) is broadly playable.
+                # "avc1" (H.264) is broadly playable; "mp4v" renders as garbled macroblocks
+                # in many players (QuickTime, Safari).
                 fourcc = cv2.VideoWriter_fourcc(*"avc1")
                 writer = cv2.VideoWriter(str(output_path), fourcc, fps_by_role[reference_role], (composite.shape[1], composite.shape[0]))
             writer.write(composite)

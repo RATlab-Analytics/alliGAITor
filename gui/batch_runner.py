@@ -1,21 +1,14 @@
 """
-GUI-side handle for a batch run of the job queue. Delegates the actual
-pipeline work to a separate OS process
-(``batch_worker_process.run_batch_worker``) rather than a thread in this
-process -- see that module's docstring for why.
-
-Ported from RATlab-NOR's gui/batch_runner.py, with "video" progress
-renamed to "session" (alliGAITor's own unit of run progress). The
-``progress`` signal below is NOR's same tqdm-redraw mechanism, carried
-over for the same reason NOR needed it: without it, the live progress a
-long inference run is actually making (see
-:mod:`alligaitor.subprocess_streaming`) has nowhere to go, and a
-multi-minute session looks hung rather than working.
+GUI-side handle for a batch run of the job queue. Delegates pipeline work
+to a separate OS process (``batch_worker_process.run_batch_worker``)
+rather than a thread in this process.
 """
 
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
+import signal
 from typing import List, Optional
 
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -26,8 +19,8 @@ from job_queue import Job
 
 class BatchRunner(QObject):
     log = Signal(str)
-    progress = Signal(str)                   # same redrawing line updating -- see main_window.py's _on_progress_line
-    progress_closed = Signal()               # a redrawn line's final state was just sent -- start the next one fresh
+    progress = Signal(str)                   # redrawing progress line
+    progress_closed = Signal()               # redrawn line's final state was sent
     job_started = Signal(str)               # job_id
     job_progress = Signal(str, int, int)     # job_id, sessions_done, sessions_total
     job_finished = Signal(str, str, str)     # job_id, status, message
@@ -44,6 +37,8 @@ class BatchRunner(QObject):
         self._queue: mp.Queue = mp.Queue()
         self._process: Optional[mp.Process] = None
         self._saw_all_finished = False
+        # Set by force_stop() so _poll can tell "killed on purpose" from "crashed".
+        self.force_stopped = False
 
         self._timer = QTimer(self)
         self._timer.setInterval(150)
@@ -61,8 +56,27 @@ class BatchRunner(QObject):
     def request_stop(self):
         self._stop_event.set()
 
+    def force_stop(self):
+        """Kills the worker process (and its process group on POSIX,
+        reaching any `sleap-nn predict` subprocess) immediately, abandoning
+        whatever job is in flight. See request_stop() for the graceful
+        alternative."""
+        self.force_stopped = True
+        if self._process is None or not self._process.is_alive():
+            return
+        pid = self._process.pid
+        if pid is None:
+            return
+        if hasattr(os, "killpg"):
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+                return
+            except (ProcessLookupError, PermissionError, OSError):
+                pass  # fall through to killing just this process
+        self._process.kill()
+
     def wait(self, timeout_ms: int = 5000):
-        """Mirrors QThread.wait() -- used by MainWindow.closeEvent."""
+        """Mirrors QThread.wait()."""
         if self._process is not None:
             self._process.join(timeout=timeout_ms / 1000)
 
@@ -77,7 +91,7 @@ class BatchRunner(QObject):
             self._dispatch(msg)
 
         if self._process is not None and not self._process.is_alive():
-            if not self._saw_all_finished:
+            if not self._saw_all_finished and not self.force_stopped:
                 self.log.emit("Batch worker process exited unexpectedly.")
             self._timer.stop()
             self._process.join(timeout=2)

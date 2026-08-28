@@ -1,35 +1,23 @@
 """
 Job queue data model for the alliGAITor GUI.
 
-A "Job" is one group's worth of work (see
-:class:`alligaitor.config.PipelineConfig`): a folder of source videos, an
+A "Job" is one group's worth of work: a folder of source videos, an
 output location, and the group ``config.yaml`` that
 :func:`alligaitor.discovery.discover_sessions` and
 :func:`alligaitor.pipeline.run_group` both read. Jobs are queued in the
-GUI -- config editing and crop setup happen up front, per job -- then run
-one at a time by the batch runner.
+GUI, then run one at a time by the batch runner.
 
-This module owns:
-  - the Job dataclass + JobStatus enum
-  - persistence of the queue to ``app_data/queue.json``
-  - per-job output layout (``config.yaml``, ``cropped/``,
-    ``predictions_3d/``, ``reports/``)
-  - the "is this job ready to run" check
-
-No GUI or pipeline-execution code lives here -- pure data/state, reusable
-by the GUI, ``reset.py``, and the batch runner alike. It does import
-:mod:`alligaitor.config` (see :func:`refresh_job_readiness`) since that's
-pure dataclasses/YAML, not a heavy dependency.
-
-Ported from RATlab-NOR's gui/job_queue.py, restructured for alliGAITor's
-two setup gates (config, then crop) instead of NOR's one (object
-coordinates) -- see JobStatus.
+This module owns the Job dataclass and JobStatus enum, persistence to
+``app_data/queue.json``, per-job output layout, and the "is this job
+ready to run" check. Pure data/state, no GUI or pipeline-execution code.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
+import sys
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -42,12 +30,21 @@ from typing import List, Optional
 # App data location
 # ---------------------------------------------------------------------------
 
-def default_app_data_dir(repo_dir: Path) -> Path:
-    """Where the GUI stores its own state: the queue file. Lives
-    alongside the repo checkout (not a user Library folder nobody will
-    look in), so it moves/copies with it -- same reasoning as NOR's
-    ``default_app_data_dir``."""
-    return Path(repo_dir) / "app_data"
+def default_app_data_dir() -> Path:
+    """OS-standard per-user data directory for alliGAITor's settings and job queue."""
+    if sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    elif sys.platform.startswith("win"):
+        base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
+    else:
+        base = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+    return base / "alliGAITor"
+
+
+def default_models_dir(repo_dir: Path) -> Optional[Path]:
+    """Dev-checkout convenience fallback: repo_dir/models if it exists, else None."""
+    candidate = Path(repo_dir) / "models"
+    return candidate if candidate.is_dir() else None
 
 
 # ---------------------------------------------------------------------------
@@ -104,9 +101,7 @@ class Job:
 
     @property
     def config_path(self) -> Path:
-        """This job's group config.yaml -- the single source of truth
-        for what discover_sessions()/run_group() actually do; everything
-        else in this dataclass is queue bookkeeping layered around it."""
+        """This job's group config.yaml."""
         return Path(self.output_folder) / "config.yaml"
 
     @property
@@ -142,10 +137,8 @@ class Job:
 # ---------------------------------------------------------------------------
 
 def refresh_job_readiness(job: Job) -> Job:
-    """Recompute NEEDS_CONFIG / NEEDS_CROP / READY from what's actually
-    on disk -- the config.yaml's sessions and whether their (cropped)
-    video paths exist. Does not touch RUNNING/DONE/FAILED/CANCELED jobs
-    (those are runner-owned states)."""
+    """Recompute NEEDS_CONFIG / NEEDS_CROP / READY from what's on disk.
+    Does not touch RUNNING/DONE/FAILED/CANCELED jobs."""
     if job.status not in (JobStatus.NEEDS_CONFIG, JobStatus.NEEDS_CROP, JobStatus.READY):
         return job
 
@@ -180,9 +173,7 @@ def refresh_job_readiness(job: Job) -> Job:
 # ---------------------------------------------------------------------------
 
 class JobQueue:
-    """Ordered list of jobs, persisted to app_data/queue.json. Add-order
-    is run order -- no reordering/prioritization (by design, keeps this
-    and the GUI simple)."""
+    """Ordered list of jobs, persisted to app_data/queue.json. Add-order is run order."""
 
     def __init__(self, app_data_dir: Path):
         self.app_data_dir = Path(app_data_dir)
@@ -202,16 +193,8 @@ class JobQueue:
         return self
 
     def _recover_stale_running_jobs(self) -> None:
-        """A job can be left with status=RUNNING (or QUEUED -- handed to
-        the batch runner for a run that never reached it) in queue.json
-        if the app (or the batch worker process) was killed or crashed
-        mid-run instead of finishing normally -- nothing is actually
-        processing it, nor is anything ever going to dequeue it, by the
-        time we're loading this file fresh on startup. Left alone,
-        QUEUED would also stay permanently locked from editing/removing
-        (see main_window.MainWindow._job_locked_by_run), since that lock
-        is keyed on status alone -- there's no live BatchRunner left to
-        eventually flip it to RUNNING and then a terminal status."""
+        """Marks any job left RUNNING or QUEUED (from a crash or kill
+        mid-run) as FAILED on load, since nothing will resume it."""
         changed = False
         for job in self.jobs:
             if job.status in (JobStatus.RUNNING, JobStatus.QUEUED):
@@ -255,7 +238,5 @@ class JobQueue:
     # -- queries the batch runner needs --
 
     def runnable_jobs(self) -> List[Job]:
-        """Jobs in add-order that are ready to be picked up by a run.
-        Jobs still needing config/crop setup are left behind -- setup
-        happens interactively, up front, not mid-run."""
+        """Jobs in add-order that are ready to be picked up by a run."""
         return [j for j in self.jobs if j.status == JobStatus.READY]

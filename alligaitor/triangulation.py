@@ -101,23 +101,15 @@ def align_tracks_by_time(
 ) -> Dict[str, PoseTrack2D]:
     """Resample every camera view's 2D track onto a shared timeline.
 
-    The slowest camera's own frame times become the shared timeline (the
-    other views are only ever interpolated, never extrapolated beyond
-    their own recorded range), and every other view is linearly
-    interpolated onto it. See :mod:`alligaitor.timing` for why this is
-    necessary: the rig's cameras run at different, session-varying frame
-    rates, so raw frame index does not correspond to the same recording
-    moment across views.
+    The slowest camera's own frame times become the shared timeline; every other view is
+    linearly interpolated onto it, never extrapolated beyond its own recorded range.
 
     Args:
-        tracks: Mapping of camera role to that view's 2D predictions, one
-            entry per frame of that view's own source video.
-        fps_by_role: Mapping of camera role to that view's source video
-            frame rate (see :func:`alligaitor.timing.video_fps`).
+        tracks: Mapping of camera role to that view's 2D predictions.
+        fps_by_role: Mapping of camera role to that view's source video frame rate.
 
     Returns:
-        A new mapping of camera role to a 2D track resampled onto the
-        shared timeline; all tracks share the same frame count.
+        A new mapping of camera role to a 2D track resampled onto the shared timeline.
     """
     reference_role = min(fps_by_role, key=fps_by_role.get)
     reference_fps = fps_by_role[reference_role]
@@ -161,16 +153,10 @@ def triangulate(
     """Triangulate 3D keypoints from per-camera 2D predictions.
 
     Args:
-        tracks: Mapping of camera role (``left``/``right``/``bottom``) to
-            that view's 2D predictions, one entry per frame of that view's
-            own source video. All three roles must be present and track
-            the same skeleton nodes (matched by name, not necessarily the
-            same declared order).
-        cgroup: Calibrated camera group with camera names matching
-            ``left``/``right``/``bottom`` (see :mod:`alligaitor.calibration`).
-        fps_by_role: Mapping of camera role to that view's source video
-            frame rate, used to align views onto a shared timeline before
-            triangulating (see :func:`align_tracks_by_time`).
+        tracks: Mapping of camera role (``left``/``right``/``bottom``) to that view's 2D
+            predictions. All three roles must be present and track the same skeleton nodes.
+        cgroup: Calibrated camera group with camera names matching ``left``/``right``/``bottom``.
+        fps_by_role: Mapping of camera role to that view's source video frame rate.
 
     Returns:
         The triangulated 3D trajectory, at the slowest camera's frame rate.
@@ -230,59 +216,24 @@ def triangulate_axis_prioritized(
     up_direction: np.ndarray,
     blend_weight: float = 0.5,
 ) -> Pose3D:
-    """Like :func:`triangulate`, but for every (frame, node) where all
-    three cameras have a valid 2D detection, blends in a two-stage,
-    axis-prioritized reconstruction alongside aniposelib's uniform
-    multi-view least squares: height (position along ``up_direction``)
-    comes from triangulating the two side cameras alone, and X/Y comes
-    from intersecting the bottom camera's own ray with the plane at that
-    height.
+    """Like :func:`triangulate`, but where all three cameras have a valid detection, blends in
+    an axis-prioritized reconstruction: height comes from the two side cameras alone, X/Y from
+    intersecting the bottom camera's ray with the plane at that height.
 
-    This exists because the three cameras are not equally well
-    conditioned for every axis. The bottom camera's image plane is
-    roughly parallel to the platform, so it strongly constrains X/Y but
-    is poorly conditioned along its own near-vertical optical axis; the
-    side cameras are the reverse -- their image-vertical axis *is* world
-    up (see :func:`alligaitor.calibration.world_up_direction`, which is
-    derived from exactly that). Uniform least-squares triangulation
-    blends all three rays roughly symmetrically, which can land a point
-    between what each view actually saw rather than trusting whichever
-    view is actually reliable for a given axis -- consistent with
-    reprojected points visibly drifting off a paw that every single 2D
-    model tracked accurately.
-
-    The two estimates are blended in 3D (not hard-swapped) because a pure
-    axis-prioritized point turned out to have a real cost verified
-    against this rig's own data: on frames where the three 2D detections
-    already agree well, both methods land within a fraction of a
-    millimeter of each other, so blending changes essentially nothing.
-    But on frames where the detections disagree with each other (real
-    per-frame tracking noise, not a calibration issue -- verified by
-    checking the *uniform* method's own per-camera reprojection error on
-    such frames, which is large too), uniform least-squares damps that
-    disagreement by spreading it across all three views, while a hard
-    axis-prioritized commitment has no such redundancy and fully
-    inherits whichever camera's noise it trusted. Blending keeps some of
-    that damping while still leaning toward the better-conditioned view
-    per axis.
-
-    Falls back entirely to :func:`triangulate`'s standard result wherever
-    fewer than all three cameras have a valid detection (including the
-    degenerate case where the bottom camera's ray turns out
-    near-parallel to the height plane) -- axis-prioritized weighting
-    isn't meaningful, or even possible, with less than the full
-    three-view case.
+    The side cameras are better conditioned for height and the bottom camera for X/Y, so this
+    can outperform aniposelib's uniform least squares, which blends all three views symmetrically.
+    Estimates are blended rather than hard-swapped since uniform least squares still damps
+    per-frame detection noise better on disagreeing frames. Falls back to :func:`triangulate`
+    wherever fewer than all three cameras have a valid detection.
 
     Args:
         tracks: Same as :func:`triangulate`.
         cgroup: Same as :func:`triangulate`.
         fps_by_role: Same as :func:`triangulate`.
-        up_direction: Unit vector, in the calibration's reference frame,
-            pointing away from the platform surface.
-        blend_weight: How much of the axis-prioritized estimate to blend
-            in, from ``0.0`` (pure uniform least squares -- identical to
-            :func:`triangulate`) to ``1.0`` (pure axis-prioritized, the
-            original hard-commit version). ``0.5`` is an even blend.
+        up_direction: Unit vector, in the calibration's reference frame, pointing away from
+            the platform surface.
+        blend_weight: Blend fraction from ``0.0`` (pure uniform least squares) to ``1.0``
+            (pure axis-prioritized).
 
     Returns:
         The triangulated 3D trajectory, at the slowest camera's frame rate.

@@ -1,14 +1,7 @@
 """
 Main window shell for the alliGAITor GUI: job queue table, Load/Edit/
-Remove/Run controls (both a toolbar row and mirrored menu actions), a
-log panel, and a progress bar + ETA shown while a run is in flight.
-
-Ported from RATlab-NOR's gui/main_window.py's overall shape (menu bar,
-table+log+progress layout, BatchRunner wiring, Reset menu), with
-alliGAITor's two setup gates (config editor, then crop) replacing NOR's
-one (object-coordinate setup), and Model/Settings/Help menus built for
-alliGAITor's own needs (two model roles, discovery regex defaults, a
-GPLv3 About dialog).
+Remove/Run controls (toolbar row and mirrored menu actions), a log
+panel, and a progress bar + ETA shown while a run is in flight.
 """
 
 from __future__ import annotations
@@ -26,7 +19,7 @@ from PySide6.QtWidgets import (
     QPushButton, QTextEdit, QDialog, QDialogButtonBox, QFormLayout,
     QLineEdit, QMessageBox, QAbstractItemView, QSplitter,
     QProgressBar, QLabel, QTabWidget, QSpinBox, QDoubleSpinBox, QMenu,
-    QCheckBox,
+    QCheckBox, QFileDialog,
 )
 
 from job_queue import Job, JobQueue, JobStatus, refresh_job_readiness
@@ -72,36 +65,18 @@ def _int_spin(value: int, minimum: int, maximum: int, suffix: str = "", tooltip:
 
 
 class _PreferencesDialog(QDialog):
-    """Settings > Preferences, in two tabs:
-
-    - **General**: the id/camera regex and per-role default tokens a
-      newly loaded job's config editor is pre-filled with, and the
-      default output-base folder offered by the Load Job dialog. The
-      default tokens (e.g. "cam0" for Left) are a separate setting from
-      the camera regex itself: the regex says how to *extract* a token
-      from a filename, the tokens say which extracted value this lab
-      expects for each role, so a new job's role combos start pre-filled
-      with an actual guess instead of an arbitrary
-      first/second/third-discovered-token fallback that has no
-      connection to which camera is which.
-    - **Scoring & Triangulation**: the stance/swing detection thresholds
-      (alligaitor.config.GaitConfig) and the calibration
-      min_corners_extrinsic tunable, baked into every newly-saved job's
-      config.yaml the same way the selected models are (see
-      group_config_dialog.py's _on_save) -- not something an individual
-      job overrides in the editor UI, just what "new job" starts from.
-
-    Small enough to keep inline here rather than its own module.
-    """
+    """Settings > Preferences, in two tabs: General (default discovery
+    regex, per-role camera tokens, output folder) and Scoring &
+    Triangulation (default gait thresholds and calibration tunables for
+    new jobs)."""
 
     def __init__(self, app_data_dir: Path, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Preferences")
         self.app_data_dir = app_data_dir
 
-        # Built before the tabs' own content, since the regex help panel
-        # inside the General tab needs to call back into
-        # _sync_dialog_size(), which needs self._tabs to already exist.
+        # Built first: the regex help panel in the General tab calls
+        # back into _sync_dialog_size(), which needs self._tabs to exist.
         self._tabs = QTabWidget()
         self._tabs.currentChanged.connect(lambda _index: QTimer.singleShot(0, self._sync_dialog_size))
 
@@ -119,17 +94,10 @@ class _PreferencesDialog(QDialog):
     def _sync_dialog_size(self):
         """Resizes this dialog to fit whichever tab is current.
 
-        QTabWidget's internal QStackedWidget is documented Qt behavior
-        to size itself for the *largest* page it has ever shown, not the
-        current one -- so switching to a shorter tab, or collapsing the
-        regex help panel back down within the current tab, leaves the
-        dialog oversized under plain sizeHint()-based resizing (see
-        shrink_window_to_fit's docstring; that approach alone isn't
-        enough here). The only reliable fix is to bypass QStackedWidget's
-        own sizeHint entirely: give the tab widget an explicit fixed
-        height computed from the current page's own sizeHint(), which --
-        unlike the tab widget's -- always stays accurate regardless of
-        what other tabs have been shown.
+        QTabWidget's internal QStackedWidget sizes itself for the
+        largest page it has ever shown, not the current one, so this
+        gives the tab widget an explicit fixed height from the current
+        page's own sizeHint() instead.
         """
         page = self._tabs.currentWidget()
         if page is None:
@@ -143,6 +111,16 @@ class _PreferencesDialog(QDialog):
     def _build_general_tab(self) -> QWidget:
         id_regex, camera_regex = app_settings.get_default_regexes(self.app_data_dir)
         tokens = app_settings.get_default_camera_tokens(self.app_data_dir)
+        models_dir = app_settings.get_models_dir(self.app_data_dir)
+        self.models_dir_edit = QLineEdit(str(models_dir) if models_dir else "")
+        self.models_dir_edit.setReadOnly(True)
+        models_dir_browse_btn = QPushButton("Browse…")
+        models_dir_browse_btn.clicked.connect(self._browse_models_dir)
+        models_dir_row = QWidget()
+        models_dir_layout = QHBoxLayout(models_dir_row)
+        models_dir_layout.setContentsMargins(0, 0, 0, 0)
+        models_dir_layout.addWidget(self.models_dir_edit)
+        models_dir_layout.addWidget(models_dir_browse_btn)
         self.id_regex_edit = QLineEdit(id_regex)
         self.camera_regex_edit = QLineEdit(camera_regex)
         self.left_token_edit = QLineEdit(tokens["left"])
@@ -152,18 +130,16 @@ class _PreferencesDialog(QDialog):
         self.skip_validation_check = QCheckBox("Skip validation video generation")
         self.skip_validation_check.setChecked(app_settings.get_default_skip_validation_videos(self.app_data_dir))
         self.skip_validation_check.setToolTip(
-            "Starting default for a newly-saved job's config editor -- still editable per job there. "
-            "Unchecked means every run renders an annotated validation video per session."
+            "Starting default for a newly-saved job's config editor, still editable per job there."
         )
         self.bottom_fallback_check = QCheckBox("Use bottom-camera fallback for triangulation gaps (experimental)")
         self.bottom_fallback_check.setChecked(app_settings.get_default_bottom_fallback(self.app_data_dir))
         self.bottom_fallback_check.setToolTip(
-            "Starting default for a newly-saved job's config editor -- still editable per job there. "
-            "Fills triangulation gaps using the bottom camera's own monocular view wherever it alone "
-            "has a valid 2D detection; can only add usability a paw didn't already have."
+            "Starting default for a newly-saved job's config editor, still editable per job there."
         )
 
         form = QFormLayout()
+        form.addRow("Models folder:", models_dir_row)
         form.addRow("Default ID regex:", self.id_regex_edit)
         form.addRow("Default camera regex:", self.camera_regex_edit)
         form.addRow("Default token — Left camera:", self.left_token_edit)
@@ -253,7 +229,16 @@ class _PreferencesDialog(QDialog):
         tab.setLayout(layout)
         return tab
 
+    def _browse_models_dir(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Choose the folder containing your model subdirectories",
+            self.models_dir_edit.text() or str(Path.home()),
+        )
+        if folder:
+            self.models_dir_edit.setText(folder)
+
     def _on_save(self):
+        app_settings.set_models_dir(self.app_data_dir, self.models_dir_edit.text().strip() or None)
         app_settings.set_default_regexes(
             self.app_data_dir, self.id_regex_edit.text(), self.camera_regex_edit.text()
         )
@@ -281,46 +266,30 @@ class _PreferencesDialog(QDialog):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, job_queue: JobQueue, repo_dir: Path, parent=None):
+    def __init__(self, job_queue: JobQueue, repo_dir: Path, models_dir: Optional[Path] = None, parent=None):
         super().__init__(parent)
         self.job_queue = job_queue
         self.repo_dir = Path(repo_dir)
+        self.models_dir = Path(models_dir) if models_dir else None
         self.app_data_dir = job_queue.app_data_dir
         self.runner: BatchRunner | None = None
 
-        # Overall-run progress tracking (every job in the current run,
-        # not just the job currently executing), keyed by job id.
+        # Overall-run progress tracking across every job in the current
+        # run, keyed by job id.
         self._run_total_by_job: dict = {}
         self._run_done_by_job: dict = {}
         self._run_start_time: float | None = None
-        # ETA is a countdown snapshot, re-anchored only when real
-        # progress happens -- see _recompute_eta_snapshot's docstring for
-        # why recomputing the estimate on every 1Hz tick (against an
-        # ever-growing elapsed time with a numerator that's fixed between
-        # updates) made the displayed ETA count up instead of down.
-        self._eta_remaining_s: float | None = None
-        self._eta_snapshot_time: float | None = None
-        # EMA of whole-session wall-clock duration, measured between
-        # consecutive _on_job_progress calls (a session finishing) --
-        # deliberately session-granularity only, not per-bar/per-video.
-        # A finer-grained ETA (tracking each camera role's own inference
-        # progress live, accounting for bottom running faster than side,
-        # video-length differences between sessions, etc.) was tried and
-        # scrapped: it needed identifying *which* role a given progress
-        # bar belongs to, which nothing in the progress text actually
-        # says (see alligaitor.pipeline.run_session -- no per-role log
-        # message precedes each role's inference), so the correlation
-        # was too fragile to trust. Per-session is coarser (only updates
-        # once per session, which can be minutes) but robust: real data,
-        # no guessing at bar identity.
+        # EMA of whole-session wall-clock duration, updated when a
+        # session finishes. Session-granularity only: no reliable way to
+        # tell which camera role a given progress bar belongs to.
         self._eta_session_duration_ema: float | None = None
         self._eta_last_session_done_time: float | None = None
+        # ETA is a countdown snapshot, re-anchored only when a session finishes.
+        self._eta_remaining_s: float | None = None
+        self._eta_snapshot_time: float | None = None
 
-        # Whether the last line written to the log panel is a live
-        # progress-bar redraw (as opposed to a discrete log message) --
-        # see _on_progress_line/_log. Lets repeated redraws of "the same"
-        # tqdm line overwrite each other in place instead of each one
-        # adding a new line.
+        # Whether the last log-panel line is a live progress-bar redraw,
+        # so repeated redraws overwrite in place instead of stacking.
         self._progress_line_open = False
 
         self._progress_timer = QTimer(self)
@@ -398,13 +367,8 @@ class MainWindow(QMainWindow):
 
         top = QWidget()
         top_layout = QVBoxLayout(top)
-        # No left/right margins: `top` (holding the button row and the
-        # table) and log_panel are sibling children of the splitter
-        # below, but only `top` wraps its content in its own QVBoxLayout
-        # -- that layout's default margins were insetting the table by
-        # ~9px on each side while log_panel, added straight to the
-        # splitter with no such wrapper, had none, so the two ended up
-        # different widths despite both notionally spanning "the window".
+        # No left/right margins, so `top`'s table lines up with log_panel's
+        # own width (log_panel has no wrapping layout to inset it).
         top_layout.setContentsMargins(0, top_layout.contentsMargins().top(), 0, top_layout.contentsMargins().bottom())
         top_layout.addLayout(btn_row)
         top_layout.addLayout(progress_row)
@@ -450,15 +414,15 @@ class MainWindow(QMainWindow):
             lambda: self._on_reset_selected(clear_predictions=True, clear_output=True, clear_crops=True),
         )
 
-        model_menu = self.menuBar().addMenu("Model")
-        self._build_role_model_submenu(model_menu, "Side Model", "side")
-        self._build_role_model_submenu(model_menu, "Bottom Model", "bottom")
+        self._model_menu = self.menuBar().addMenu("Model")
+        self._rebuild_model_menu()
 
         run_menu = self.menuBar().addMenu("Run")
         run_menu.addAction("Run All", self._on_run_queue)
         run_menu.addAction("Run Selected Job(s)", self._on_run_selected)
         run_menu.addSeparator()
         run_menu.addAction("Stop", self._on_stop_queue)
+        run_menu.addAction("Force Stop", self._on_force_stop_queue)
 
         settings_menu = self.menuBar().addMenu("Settings")
         settings_menu.addAction("Preferences…", self._on_open_preferences)
@@ -466,14 +430,18 @@ class MainWindow(QMainWindow):
         help_menu = self.menuBar().addMenu("Help")
         help_menu.addAction("About alliGAITor…", self._on_open_about)
 
+    def _rebuild_model_menu(self):
+        self._model_menu.clear()
+        self._build_role_model_submenu(self._model_menu, "Side Model", "side")
+        self._build_role_model_submenu(self._model_menu, "Bottom Model", "bottom")
+
     def _build_role_model_submenu(self, parent_menu, label: str, role: str):
         submenu = parent_menu.addMenu(label)
-        models_dir = self.repo_dir / "models"
         candidates = sorted(
-            p.name for p in models_dir.iterdir() if p.is_dir() and role in p.name.lower()
-        ) if models_dir.is_dir() else []
+            p.name for p in self.models_dir.iterdir() if p.is_dir() and role in p.name.lower()
+        ) if self.models_dir and self.models_dir.is_dir() else []
         if not candidates:
-            action = submenu.addAction(f"(no {role} models found in models/)")
+            action = submenu.addAction(f"(no {role} models found — set a models folder in Preferences)")
             action.setEnabled(False)
             return
         current = app_settings.get_selected_model(self.app_data_dir, role)
@@ -488,42 +456,52 @@ class MainWindow(QMainWindow):
 
     def _on_select_model(self, role: str, name: str):
         app_settings.set_selected_model(self.app_data_dir, role, name)
-        updated = self._propagate_model_selection(role, name)
+        updated = 0
+        for job in self.job_queue.jobs:
+            if self._sync_job_to_selected_models(job):
+                updated += 1
+        if updated:
+            self.model.refresh()
         suffix = f" -- updated {updated} saved job(s)." if updated else " -- no saved jobs to update."
         self._log(f"{role.capitalize()} model set to '{name}'{suffix}")
 
-    def _propagate_model_selection(self, role: str, name: str) -> int:
-        """Writes the newly selected model straight into every already-saved
-        job's config.yaml, rather than leaving it to only apply the next time
-        each job's config editor happens to be re-saved -- checking a model in
-        this menu should mean every job now runs with it, not silently keep
-        stale jobs on whatever model they were saved with last."""
-        field = f"{role}_model_dir"
-        model_path = self.repo_dir / "models" / name
-        updated = 0
-        for job in self.job_queue.jobs:
-            if job.status in (JobStatus.RUNNING, JobStatus.QUEUED):
-                continue  # never rewrite the config out from under an active/pending run
-            if not job.config_path.exists():
+    def _sync_job_to_selected_models(self, job: Job) -> bool:
+        """Writes whatever's currently selected in the Model menu into
+        this job's config.yaml (both roles). Called both when the menu
+        selection changes and again right before a run, so what actually
+        executes always matches the menu. Returns whether anything changed."""
+        if job.status in (JobStatus.RUNNING, JobStatus.QUEUED):
+            return False  # never rewrite the config out from under an active/pending run
+        if not job.config_path.exists():
+            return False
+        try:
+            config = PipelineConfig.from_yaml(job.config_path)
+        except Exception:
+            return False
+
+        changes = {}
+        for role in ("side", "bottom"):
+            name = app_settings.get_selected_model(self.app_data_dir, role)
+            if not name or not self.models_dir:
                 continue
-            try:
-                config = PipelineConfig.from_yaml(job.config_path)
-            except Exception:
-                continue
-            if getattr(config.models, field) == model_path:
-                continue
-            config.models = replace(config.models, **{field: model_path})
-            config.to_yaml(job.config_path)
-            refresh_job_readiness(job)
-            self.job_queue.update(job)
-            updated += 1
-        if updated:
-            self.model.refresh()
-        return updated
+            field = f"{role}_model_dir"
+            model_path = self.models_dir / name
+            if getattr(config.models, field) != model_path:
+                changes[field] = model_path
+        if not changes:
+            return False
+
+        config.models = replace(config.models, **changes)
+        config.to_yaml(job.config_path)
+        refresh_job_readiness(job)
+        self.job_queue.update(job)
+        return True
 
     def _on_open_preferences(self):
         dialog = _PreferencesDialog(self.app_data_dir, parent=self)
         if dialog.exec() == QDialog.Accepted:
+            self.models_dir = app_settings.get_models_dir(self.app_data_dir)
+            self._rebuild_model_menu()
             self._log("Preferences saved.")
 
     def _on_open_about(self):
@@ -543,17 +521,13 @@ class MainWindow(QMainWindow):
 
     def _on_table_context_menu(self, pos):
         """Right-click menu on the job table: Edit / Crop / Run / Remove
-        / Reset, all scoped to whichever job(s) the click applies to --
-        same underlying handlers as the toolbar buttons and menu bar
-        actions, just reachable without leaving the row."""
+        / Reset, scoped to whichever job(s) the click applies to."""
         index = self.table.indexAt(pos)
         if not index.isValid():
             return
 
-        # Right-clicking a row outside the current selection selects just
-        # that row first (standard table convention) -- right-clicking
-        # within an existing multi-row selection leaves it alone, so a
-        # batch action (e.g. Reset) can still apply to all of them.
+        # Right-clicking outside the current selection selects just that
+        # row first; within an existing multi-row selection, leave it alone.
         selection_model = self.table.selectionModel()
         if not selection_model.isRowSelected(index.row(), QModelIndex()):
             self.table.selectRow(index.row())
@@ -566,10 +540,7 @@ class MainWindow(QMainWindow):
         menu.exec(self.table.viewport().mapToGlobal(pos))
 
     def _build_job_context_menu(self, jobs: list[Job]) -> QMenu:
-        """Split out from _on_table_context_menu so it can be constructed
-        (and its contents inspected) without also invoking the blocking,
-        modal QMenu.exec() -- handy for tests, and keeps the "what's in
-        the menu" logic separate from "where/when it pops up"."""
+        """Builds the menu without invoking the blocking, modal QMenu.exec()."""
         menu = QMenu(self)
         menu.addAction("Edit Job…", self._on_edit_job)
         menu.addAction("Crop…", self._on_recrop_selected)
@@ -613,11 +584,11 @@ class MainWindow(QMainWindow):
         self.model.refresh()
         self.statusBar().showMessage(f"{len(self.job_queue.jobs)} job(s) queued")
         self._log(f"Loaded job '{job.group_name}'.")
-        self._open_config_editor(job)  # opens on first load, per the design brief
+        self._open_config_editor(job)
 
     def _open_config_editor(self, job: Job):
         existing_names = {j.group_name for j in self.job_queue.jobs if j.id != job.id}
-        dialog = GroupConfigDialog(job, self.repo_dir, self.app_data_dir, existing_names, parent=self)
+        dialog = GroupConfigDialog(job, self.models_dir, self.app_data_dir, existing_names, parent=self)
         dialog.exec()
         if not dialog.saved:
             return  # canceled -- job's fields are untouched, nothing to persist
@@ -631,12 +602,8 @@ class MainWindow(QMainWindow):
             self._open_crop_step(job)
 
     def _job_locked_by_run(self, job: Job) -> bool:
-        """True while `job` is either actually RUNNING or still QUEUED
-        behind the running job in the current BatchRunner -- BatchRunner
-        snapshotted its own copy of every job at start() (see
-        batch_runner.py), so editing/removing/resetting a queued job
-        here wouldn't reach it and would leave the run working from
-        stale data."""
+        """True while `job` is RUNNING or still QUEUED behind the running
+        job, since BatchRunner already snapshotted its own copy at start()."""
         return job.status in (JobStatus.RUNNING, JobStatus.QUEUED)
 
     def _on_edit_job(self):
@@ -650,9 +617,8 @@ class MainWindow(QMainWindow):
         self._open_config_editor(job)
 
     def _on_table_double_clicked(self):
-        """A completed job opens the validation viewer, matching the
-        double-click's meaning in every other status ("show me what this
-        row means") -- everything else still opens the config editor."""
+        """A completed job opens the validation viewer; everything else
+        opens the config editor."""
         job = self._selected_job()
         if job is not None and job.status == JobStatus.DONE:
             self._open_validation_view(job)
@@ -668,11 +634,7 @@ class MainWindow(QMainWindow):
             self._open_validation_view(job)
 
     def _confirm_retry(self, jobs: list[Job]) -> bool:
-        """Shows each job's actual failure reason and asks to confirm
-        retrying it -- a job failed for a specific, possibly still-
-        unresolved reason, so retrying it silently would either waste
-        however long it takes to fail the same way again, or (worse)
-        succeed having silently masked whatever was actually wrong."""
+        """Shows each job's failure reason and confirms before retrying."""
         if len(jobs) == 1:
             job = jobs[0]
             reason = job.error_message or "(no error message recorded)"
@@ -688,21 +650,11 @@ class MainWindow(QMainWindow):
         return reply == QMessageBox.Yes
 
     def _retry_jobs(self, jobs: list[Job]) -> None:
-        """Moves FAILED job(s) back to READY (or NEEDS_CROP, if
-        refresh_job_readiness finds the crop step itself is why it's not
-        ready -- see that function) so they're picked up by Run All/Run
-        Selected again, same as any other READY job. Caller's
-        responsibility to confirm first (see _confirm_retry) and to
-        refresh the model/table after."""
+        """Moves FAILED job(s) back to READY (or NEEDS_CROP/NEEDS_CONFIG,
+        if disk state has drifted) so they're picked up by a run again.
+        Caller must confirm first and refresh the model/table after."""
         for job in jobs:
             job.error_message = ""
-            # refresh_job_readiness deliberately leaves FAILED (and
-            # RUNNING/DONE/CANCELED) alone -- those are runner-owned
-            # states it won't recompute out of (see its docstring).
-            # READY is the assumption to recompute *from*; it'll still
-            # correctly downgrade to NEEDS_CROP/NEEDS_CONFIG below if
-            # disk state has drifted since this job failed (e.g. a crop
-            # output got cleaned up).
             job.status = JobStatus.READY
             refresh_job_readiness(job)
             self.job_queue.update(job)
@@ -794,8 +746,8 @@ class MainWindow(QMainWindow):
 
         if side_videos:
             side_model = app_settings.get_selected_model(self.app_data_dir, "side")
-            if side_model:
-                side_w, side_h = side_crop_size_for_model(self.repo_dir / "models" / side_model)
+            if side_model and self.models_dir:
+                side_w, side_h = side_crop_size_for_model(self.models_dir / side_model)
             else:
                 side_w, side_h = CROP_TARGET_WIDTH, CROP_TARGET_HEIGHT
             dialog = CropSetupDialog(
@@ -845,14 +797,8 @@ class MainWindow(QMainWindow):
     # -- run --
 
     def _on_run_queue(self):
-        # A FAILED job sitting in the queue is exactly the case
-        # _retry_jobs exists for, and "Run All" is a reasonable place to
-        # offer that rather than requiring the user to already know
-        # about the separate Retry action (see _on_retry_failed) first.
-        # Checked unconditionally, not just when there's nothing else
-        # READY to run -- a FAILED job alongside a READY one should
-        # still get offered a retry, not silently skipped in favor of
-        # whatever else happens to be runnable.
+        # "Run All" also offers to retry any FAILED job in the queue,
+        # even alongside jobs that are already READY.
         failed = [j for j in self.job_queue.jobs if j.status == JobStatus.FAILED]
         if failed and self._confirm_retry(failed):
             self._retry_jobs(failed)
@@ -876,12 +822,10 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Already running", "A run is already in progress.")
             return
 
-        # Only the job actually executing should read RUNNING -- the rest
-        # of this batch reads QUEUED (not READY) until BatchRunner
-        # reaches it (see _on_job_started, which flips a job to RUNNING
-        # one at a time as it's dequeued). QUEUED, not READY, so it's
-        # still locked from editing/removing/resetting in the meantime --
-        # see _job_locked_by_run.
+        # Jobs read QUEUED (locked, see _job_locked_by_run) until
+        # BatchRunner flips each to RUNNING as it's dequeued.
+        for job in jobs:
+            self._sync_job_to_selected_models(job)
         for job in jobs:
             job.status = JobStatus.QUEUED
             job.sessions_done = 0
@@ -937,12 +881,8 @@ class MainWindow(QMainWindow):
             self.job_queue.update(job)
             self.model.refresh()
 
-        # A whole session just finished -- fold its wall-clock duration
-        # into the session-duration EMA (see __init__'s docstring for why
-        # this, rather than a cumulative since-start average: a real
-        # slowdown partway through a run should pull the estimate down
-        # within a few sessions, not stay diluted forever by however fast
-        # the run started out).
+        # Fold this session's wall-clock duration into the EMA, so a real
+        # slowdown pulls the estimate down within a few sessions.
         now = time.time()
         if self._eta_last_session_done_time is not None:
             duration = now - self._eta_last_session_done_time
@@ -973,6 +913,7 @@ class MainWindow(QMainWindow):
         self._log("Run complete.")
 
     def _on_runner_finished(self):
+        force_stopped = self.runner.force_stopped if self.runner is not None else False
         self.runner = None
         self._progress_timer.stop()
         self.progress_bar.setVisible(False)
@@ -981,38 +922,55 @@ class MainWindow(QMainWindow):
         self.run_selected_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
 
+        # A graceful Stop leaves nothing RUNNING/QUEUED by the time
+        # `finished` fires. Force Stop (or a crash) can leave a job stuck
+        # mid-interruption, so clean it up here.
+        changed = False
+        for job in self.job_queue.jobs:
+            if job.status not in (JobStatus.RUNNING, JobStatus.QUEUED):
+                continue
+            was_running = job.status == JobStatus.RUNNING
+            job.status = JobStatus.FAILED if was_running else JobStatus.CANCELED
+            if force_stopped:
+                job.error_message = "Force-stopped by user." if was_running else "Canceled -- the run was force-stopped."
+            else:
+                job.error_message = (
+                    "Interrupted -- the batch worker process exited unexpectedly." if was_running
+                    else "Canceled -- the batch worker process exited unexpectedly."
+                )
+            job.finished_at = datetime.now(timezone.utc).isoformat()
+            self.job_queue.update(job)
+            changed = True
+        if changed:
+            self.model.refresh()
+
     def _on_stop_queue(self):
         if self.runner is not None:
             self.runner.request_stop()
             self._log("Stop requested -- the current job will finish; remaining queued job(s) will be canceled.")
 
+    def _on_force_stop_queue(self):
+        if self.runner is None:
+            return
+        reply = QMessageBox.warning(
+            self, "Force stop",
+            "Force stop kills the currently running job immediately -- unlike Stop, it does not let "
+            "the job finish first, and any work it was in the middle of is lost. Any other job(s) "
+            "still queued in this run are canceled too.\n\nForce stop now?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.runner.force_stop()
+        self._log("Force stop requested -- killing the current job immediately.")
+
     def _recompute_eta_snapshot(self):
         """Re-anchors the ETA countdown to a fresh remaining-time estimate.
 
-        Called only when real progress actually happens -- a session
-        finishing (_on_job_progress) -- NOT every second; see
-        _update_progress_ui for the 1Hz countdown between calls. An
-        earlier version recomputed ``(total - done) / (done /
-        elapsed_since_start)`` on every 1Hz tick, with
-        ``elapsed_since_start`` growing continuously while ``done``
-        stayed fixed between session completions (often several minutes
-        apart) -- so the *average rate* it computed kept dropping every
-        tick, and the *remaining time* estimate grew right along with
-        it: the ETA counted up, not down, for however long a session
-        took. Recomputing only on real progress fixed the counting-up
-        bug, but a single ``done / elapsed_since_start`` rate was still
-        a *cumulative* average over the whole run -- once a run has done
-        a lot of fast progress early on, that history keeps dragging the
-        average up even after the run has since slowed right down, so
-        the ETA stayed optimistic and could never fully recover.
-
-        ``_eta_session_duration_ema`` (see __init__'s docstring) fixes
-        both: it's recency-weighted, so a real slowdown pulls the
-        estimate down within a few sessions, and it's only ever updated
-        from an actual completed session's real duration -- no attempt
-        is made to track progress *within* a session (that was tried and
-        scrapped; see __init__'s docstring for why). No estimate is
-        shown until at least one session has finished.
+        Called only when a session finishes, not every tick: recomputing
+        against continuously-growing elapsed time between session
+        completions would make the ETA count up instead of down. Uses
+        the recency-weighted EMA in ``_eta_session_duration_ema``.
         """
         if self._run_start_time is None:
             return
@@ -1044,23 +1002,11 @@ class MainWindow(QMainWindow):
     # -- logging --
 
     def _append_plain_line(self, text: str):
-        """QTextEdit has no appendPlainText() (that's QPlainTextEdit-only,
-        and this panel needs to be QTextEdit -- see its construction);
-        this reproduces the same "always start a new paragraph, insert
-        literal (non-HTML) text" behavior by hand.
-
-        Explicitly resets the cursor's character format first: a colored
-        progress-bar redraw (see _on_progress_line) very often leaves a
-        color "open" at the end of its content -- real tqdm output
-        constantly does this, since the color reset code (if any) is
-        wherever tqdm itself put it, not necessarily right at the end of
-        the line -- and insertBlock() alone does NOT clear that; it
-        carries the current character format into the new paragraph.
-        insertText() (unlike insertHtml() with genuinely unstyled
-        content, which does get a clean default) then uses that stale
-        format verbatim, so without this reset every plain log line
-        after any colored one would silently inherit its color.
-        """
+        """QTextEdit has no appendPlainText(); reproduces "start a new
+        paragraph, insert literal text" by hand. Explicitly resets the
+        cursor's character format first, since a colored progress-bar
+        redraw often leaves a color "open" that insertBlock() alone
+        wouldn't clear, and every later plain line would inherit it."""
         cursor = self.log_panel.textCursor()
         cursor.movePosition(QTextCursor.End)
         if not self.log_panel.document().isEmpty():
@@ -1121,17 +1067,9 @@ class MainWindow(QMainWindow):
         self._trim_log_panel()
 
     def _on_progress_closed(self):
-        """A redrawn progress line's definitive final state was just
-        shown (see BatchRunner.progress_closed /
-        alligaitor.subprocess_streaming's `on_redraw_closed`) -- ends
-        that redraw so the *next* progress update starts a fresh line
-        instead of immediately overwriting the state that was just
-        displayed. Without this, a session that prints more than one
-        tqdm bar in sequence (e.g. one for loading, a separate one for
-        predicting) would have the second bar's very first redraw
-        instantly overwrite the first bar's just-shown completion --
-        which reads as that line flashing before the "real" bar
-        reappears in its place, even though nothing was actually lost."""
+        """A redrawn progress line's final state was just shown; ends
+        that redraw so the next progress update starts a fresh line
+        instead of overwriting what was just displayed."""
         self._progress_line_open = False
 
     # -- shutdown --

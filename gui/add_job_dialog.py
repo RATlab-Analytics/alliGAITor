@@ -1,15 +1,8 @@
 """
-Load-job dialog: native OS folder pickers for the input video folder and
-output destination, a live "N videos found" readout, and validation
-against filesystem-unsafe / duplicate group names.
-
-Unlike NOR's AddJobDialog, nothing here triggers per-job setup directly --
-main_window.py opens the config editor (group_config_dialog.py)
-automatically right after this dialog accepts, so id/camera regex,
-camera roles, and calibration are all handled there, not here.
-
-Ported from RATlab-NOR's gui/add_job_dialog.py, trimmed to alliGAITor's
-job shape (no skip_validation, no config_overrides UI).
+Load-job dialog: folder pickers for input videos and output destination,
+a live "N videos found" readout, and validation against filesystem-unsafe
+or duplicate group names. Per-job config (regex, camera roles,
+calibration) is handled afterward by group_config_dialog.py.
 """
 
 from __future__ import annotations

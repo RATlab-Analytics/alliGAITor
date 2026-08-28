@@ -1,11 +1,9 @@
 """Auto-discovery of a group's sessions from a folder of videos, using
 regex-captured filename tokens for session identity and camera role.
 
-Used by the GUI's config editor (``gui/group_config_dialog.py``) to build
-:class:`alligaitor.config.SessionConfig` entries without hand-writing them
--- see :class:`alligaitor.config.DiscoveryConfig` for the rules this reads.
-Nothing here is lab-specific: id/camera regexes and the camera-token-to-
-role mapping are all supplied by the caller, not assumed.
+Used by the GUI's config editor to build
+:class:`alligaitor.config.SessionConfig` entries; see
+:class:`alligaitor.config.DiscoveryConfig` for the rules this reads.
 """
 
 from __future__ import annotations
@@ -31,8 +29,7 @@ def find_videos(folder: PathLike) -> List[Path]:
 
 def camera_tokens(videos: List[Path], camera_regex: str) -> List[str]:
     """Distinct camera tokens found across ``videos`` matching
-    ``camera_regex``, in first-encounter order -- used to populate the
-    config editor's per-role dropdowns."""
+    ``camera_regex``, in first-encounter order."""
     pattern = re.compile(camera_regex)
     tokens: List[str] = []
     seen = set()
@@ -45,10 +42,7 @@ def camera_tokens(videos: List[Path], camera_regex: str) -> List[str]:
 
 
 def representative_video_for_token(videos: List[Path], camera_regex: str, token: str) -> Optional[Path]:
-    """First video whose ``camera_regex`` match equals ``token`` -- used
-    to grab a preview-thumbnail frame for the config editor's per-role
-    field, since one token is assumed to apply to every video in the
-    group (a rig's physical camera assignment doesn't change mid-group)."""
+    """First video whose ``camera_regex`` match equals ``token``."""
     pattern = re.compile(camera_regex)
     for video in videos:
         m = pattern.search(video.name)
@@ -62,46 +56,28 @@ def discover_sessions(
     cropped_dir: PathLike,
     predictions_dir: PathLike,
 ) -> Tuple[List[SessionConfig], List[str]]:
-    """Group ``discovery.input_dir``'s videos into sessions.
+    """Group ``discovery.input_dir``'s videos into sessions using
+    ``discovery.id_regex`` (session name) and ``discovery.camera_regex``
+    (camera token, mapped to a role via ``discovery.camera_role_map``). A
+    session is only emitted if it has exactly one video per role in
+    :data:`alligaitor.config.CAMERA_ROLES`; anything else is reported in
+    the second return value.
 
-    Applies ``discovery.id_regex`` (group 1 = session name) and
-    ``discovery.camera_regex`` (group 1 = camera token, mapped to a role
-    via ``discovery.camera_role_map``) to every video under
-    ``discovery.input_dir``. A session is only emitted if it ends up with
-    exactly one video per role in :data:`alligaitor.config.CAMERA_ROLES`;
-    anything else (an unmatched filename, an unassigned camera token, a
-    role with zero or more than one video) is reported back in the second
-    return value instead of being silently dropped.
-
-    Each emitted session's ``videos[role]`` points at where cropping is
-    expected to write that video's cropped copy: ``<cropped_dir>/<path
-    relative to discovery.input_dir>`` -- not at the raw video in
-    ``discovery.input_dir``, and not namespaced by role (same-role
-    filenames are already unique across a group, since they still carry
-    their distinct camera token). This mirrors
-    ``tools/crop_setup_dialog.py``'s own ``_out_path_for`` convention
-    exactly, so ``config.yaml`` never needs rewriting once cropping
-    actually happens -- cropping just has to produce files at these
-    paths, which it already does when pointed at ``discovery.input_dir``
-    / ``cropped_dir`` as its input/output folders. It also means one
-    shared ``crop_positions.json`` under ``cropped_dir`` covers every
-    role, since ``video_key()`` is already relative-path-based.
-    ``output_dir`` is set to ``<predictions_dir>/<session name>``.
+    Each emitted session's ``videos[role]`` points at
+    ``<cropped_dir>/<path relative to discovery.input_dir>``, matching
+    where the crop tool writes its output. ``output_dir`` is set to
+    ``<predictions_dir>/<session name>``.
 
     Returns:
-        ``(sessions, problems)`` -- ``problems`` is a list of
-        human-readable strings describing anything that couldn't be
-        grouped, for the config editor to surface.
+        ``(sessions, problems)``, where ``problems`` describes anything
+        that couldn't be grouped.
     """
     id_pattern = re.compile(discovery.id_regex)
     camera_pattern = re.compile(discovery.camera_regex)
     cropped_dir = Path(cropped_dir)
     predictions_dir = Path(predictions_dir)
 
-    # A regex that compiles but has no capture group (e.g. "" during a
-    # config editor field mid-edit, or a plain literal with no
-    # parentheses) would otherwise crash below at .group(1) instead of
-    # being reported like any other bad regex.
+    # Guard against a regex with no capture group crashing at .group(1) below.
     if id_pattern.groups < 1:
         return [], [f"id regex has no capture group: {discovery.id_regex!r}"]
     if camera_pattern.groups < 1:
@@ -147,7 +123,7 @@ def discover_sessions(
     sessions: List[SessionConfig] = []
     for session_name, roles in sorted(by_session.items()):
         if session_name in collisions:
-            continue  # already reported above; don't also emit a partial session for it
+            continue  # already reported above
         missing = [r for r in CAMERA_ROLES if r not in roles]
         if missing:
             have = ", ".join(f"{r}={p.name}" for r, p in roles.items()) or "none"

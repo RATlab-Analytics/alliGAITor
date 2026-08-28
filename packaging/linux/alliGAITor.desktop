@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=alliGAITor
+Comment=Multi-camera 3D gait reconstruction pipeline for rats
+Exec=alliGAITor
+Icon=alligaitor
+Categories=Science;
+Terminal=false

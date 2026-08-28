@@ -7,12 +7,8 @@ PyYAML
 imageio-ffmpeg
 tqdm
 
-# GUI job queue (gui/) and crop tool (tools/) -- previously undeclared
-# even though tools/ already required them.
 PySide6
 opencv-python
 
-# Runs `sleap-nn predict` as a subprocess; install separately per
-# https://nn.sleap.ai for the correct PyTorch/accelerator build for this
-# machine (e.g. Apple Silicon MPS).
-# sleap-nn
+# sleap-nn: install separately per https://nn.sleap.ai for the correct
+# PyTorch/accelerator build for your machine.

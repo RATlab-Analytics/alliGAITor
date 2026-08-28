@@ -1,11 +1,6 @@
 """
 Qt table model wrapping a JobQueue, so the main window's table view stays
 in sync with the underlying job list without duplicating state.
-
-Ported from RATlab-NOR's gui/job_table_model.py, with alliGAITor's two
-setup-gate statuses (NEEDS_CONFIG, NEEDS_CROP) added and "videos" renamed
-to "sessions" (progress here is tracked per session, not per video --
-see job_queue.Job).
 """
 
 from __future__ import annotations
@@ -28,9 +23,7 @@ _STATUS_LABELS = {
     JobStatus.CANCELED: "Canceled",
 }
 
-# Brightened for readable contrast against the app's dark palette (see
-# gui/dark_theme.py) -- the original values were tuned for a light
-# background.
+# Brightened for readable contrast against the app's dark palette.
 _STATUS_COLORS = {
     JobStatus.NEEDS_CONFIG: QColor("#ffca28"),
     JobStatus.NEEDS_CROP: QColor("#ffca28"),
@@ -93,7 +86,6 @@ class JobTableModel(QAbstractTableModel):
         return self.job_queue.jobs[row]
 
     def refresh(self):
-        """Call after the underlying job_queue.jobs list or any job's
-        fields change, to repaint the view."""
+        """Call after the underlying jobs list or any job's fields change."""
         self.beginResetModel()
         self.endResetModel()

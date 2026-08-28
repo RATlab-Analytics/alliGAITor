@@ -1,12 +1,10 @@
 """Configuration schema for the alliGAITor calibration and triangulation pipeline.
 
 Camera role assignment (``left`` / ``right`` / ``bottom``) is resolved
-per session rather than by a fixed camera index, because the physical
-camera that lands on a given device index (``cam0`` / ``cam1`` / ``cam2``)
-is not consistent across recording sessions. Each :class:`SessionConfig`
-explicitly maps roles to video files; calibration is captured once against
-the same three role names and reused across sessions as long as the
-cameras have not been physically moved.
+per session rather than by a fixed camera index, since the physical
+camera on a given device index can vary across sessions. Each
+:class:`SessionConfig` explicitly maps roles to video files; calibration
+is captured once and reused across sessions while the cameras stay fixed.
 """
 
 from __future__ import annotations
@@ -83,23 +81,14 @@ class CalibrationConfig:
         output_path: Where the resulting camera calibration (aniposelib
             ``CameraGroup``, saved as TOML) is written or loaded from.
         board_preset: Which physical calibration board this recording
-            used — either ``"apriltag"`` (the flat AprilTag marker-grid
-            board, see :class:`alligaitor.calibration.AprilGridBoard`) or
-            a key into :data:`alligaitor.calibration.BOARD_PRESETS` for a
-            ChArUco board (currently ``"original"``, the 8x8/15mm board, or
-            ``"strip"``, the narrow 4x5/35mm board — both superseded by
-            ``"apriltag"`` for the bottom camera's 45-degree slit view).
-            Different recordings may use different physical boards; this
-            says which one to expect when detecting corners/markers for
-            this particular calibration. Also determines
-            :attr:`calibration_standard`.
+            used — ``"apriltag"`` (see
+            :class:`alligaitor.calibration.AprilGridBoard`) or a key into
+            :data:`alligaitor.calibration.BOARD_PRESETS` for a ChArUco
+            board. Also determines :attr:`calibration_standard`.
         min_corners_extrinsic: Minimum matched points a frame needs to
             link two cameras' poses during calibration (see
             :data:`alligaitor.calibration.MIN_CORNERS_EXTRINSIC`). Only
-            used when :attr:`calibration_standard` is ``"apriltag"`` —
-            ChArUco calibration always uses aniposelib's own hardcoded
-            floor (8) instead, since making it configurable there was
-            found to make calibration quality worse rather than better.
+            used when :attr:`calibration_standard` is ``"apriltag"``.
     """
 
     videos: Dict[str, Path]
@@ -112,14 +101,8 @@ class CalibrationConfig:
 
     @property
     def calibration_standard(self) -> str:
-        """Which calibration algorithm
-        :func:`alligaitor.calibration.calibrate` should run for this
-        recording: ``"apriltag"`` for the ``"apriltag"`` board preset, or
-        ``"charuco"`` for every ChArUco board preset. Derived from
-        ``board_preset`` rather than stored separately, since the two
-        can't disagree — a recording's calibration algorithm is
-        determined by which physical board it used.
-        """
+        """Calibration algorithm to run: ``"apriltag"`` or ``"charuco"``,
+        derived from ``board_preset``."""
         return "apriltag" if self.board_preset == "apriltag" else "charuco"
 
 
@@ -132,13 +115,10 @@ class SessionConfig:
         videos: Mapping of camera role to this session's video path.
         output_dir: Directory where 2D predictions and 3D output for this
             session are written.
-        rat_id: Which rat this trial belongs to. Video/session names
-            (e.g. ``"359a-BL"``) encode a trial letter and condition, not
-            a reliable rat identity, so this is a separate, explicit
-            field rather than something parsed from ``name``. Defaults to
-            ``name`` (i.e. each session is its own rat) when not given.
-            Sessions sharing a ``rat_id`` within one group are combined
-            onto that rat's tab in the gait-metrics spreadsheet (see
+        rat_id: Which rat this trial belongs to. Defaults to ``name``
+            (each session is its own rat) when not given. Sessions
+            sharing a ``rat_id`` within one group are combined onto that
+            rat's tab in the gait-metrics spreadsheet (see
             :mod:`alligaitor.gait`), one row per trial.
     """
 
@@ -157,143 +137,51 @@ class SessionConfig:
 class GaitConfig:
     """Tunable thresholds for stance/swing (paw ground-contact) detection.
 
-    A paw is considered planted on a frame when its frame-to-frame speed
-    stays below ``speed_threshold_mm_s``; see :mod:`alligaitor.gait` for
-    how that feeds into stride, step, and ground-contact-time
-    calculations.
-
-    A height-above-platform check was tried and dropped: drawing an
-    accurate height-threshold reference line requires knowing the current
-    frame's actual depth across the tunnel's width, and a single-anchor
-    approximation was visually misleading (a paw on the far side of the
-    tunnel could appear to cross a threshold line that was only valid for
-    a different depth) -- speed alone avoids that failure mode.
+    A paw is planted on a frame when its frame-to-frame speed stays below
+    ``speed_threshold_mm_s``; see :mod:`alligaitor.gait` for how that
+    feeds into stride, step, and ground-contact-time calculations.
 
     Attributes:
         speed_threshold_mm_s: Maximum frame-to-frame speed, in mm/s, for a
             paw to count as planted.
-        min_contact_frames: Minimum number of consecutive frames a paw
-            must satisfy that threshold to count as a real stance phase.
-            Originally meant to filter out single-frame tracking jitter,
-            but on real data (this rig, ~12.5fps) speed cleanly separates
-            into two well-defined clusters with almost nothing between
-            them -- a single frame landing in the low cluster is real
-            evidence of a (likely brief) stance, not noise near a fuzzy
-            boundary, and requiring 2 consecutive frames was discarding
-            most genuine forepaw stances (which are often only one frame
-            long at this frame rate). Defaults to ``1`` accordingly.
+        min_contact_frames: Minimum consecutive frames below threshold to
+            count as a real stance phase.
         max_bridge_gap_frames: Untriangulated runs of at most this many
             frames, bounded by a valid frame on both sides, are linearly
-            interpolated before speed/stance is computed at all -- jitter
-            and brief per-camera dropouts will always happen even with
-            good models, and this keeps a real stance phase from being
-            fragmented into pieces too short to individually survive
-            ``min_contact_frames`` just because of a momentary gap.
-            Longer gaps are left as real gaps (see
+            interpolated before speed/stance is computed. Longer gaps are
+            left as real gaps (see
             :func:`alligaitor.gait.find_camera_caused_discards`). ``0``
-            disables bridging entirely. Defaults to ``4``: measured gap
-            lengths on real trials cluster at 2-4 frames (motion-blur
-            dropouts during a single swing, not multi-swing outages), and
-            the previous default of ``2`` was leaving nearly every one of
-            those just barely un-bridged -- fragmenting genuinely
-            consecutive strides into short runs for no reason tied to data
-            quality. A bridged gap also stops counting as a camera-caused
-            discard (see ``find_camera_caused_discards``), which is why a
-            second, independent check
-            (``stride_length_outlier_ratio``) exists for strides a gap
-            *doesn't* explain: one silently missing entirely inside a
-            span that still reads as clean.
-        min_consecutive_strides: A paw's reported stride/step/ground-contact
-            averages are computed only from strides that are part of a run
-            of at least this many consecutive accepted stance events with
-            no camera-caused discard (see
-            :func:`alligaitor.gait.find_camera_caused_discards`) in the
-            swing between any pair -- an isolated good detection that
-            isn't part of such a run doesn't count, and a paw with no
-            qualifying run at all reports ``NaN`` rather than an average
-            built from too little (or too suspect) data. A step (paw vs.
-            the contralateral paw) is a different measurement from a
-            stride (paw vs. itself) and has its own evidence bar -- see
-            ``min_valid_steps`` below -- so this field governs stride,
-            ground-contact-time, and (indirectly, via the same run) step
-            length, but is named for what it actually counts: consecutive
-            strides. See :func:`alligaitor.gait.restrict_to_consecutive_runs`.
-        stillness_window_seconds: Width, in seconds, of the window the
-            whole-body speed below is measured across (see
-            :func:`alligaitor.gait.windowed_body_speed`). Frame-to-frame
-            speed of a single node is useless for this: measured on real
-            trials, ``mid-back`` swings +/-12mm from reconstruction
-            jitter alone while the rat stands still, which at ~12.5fps
-            pose sampling reads as 150-225 mm/s -- above any threshold
-            that would still sit below a real walking speed. Net
-            displacement across a window cancels that jitter (the node
-            comes back to nearly the same place) while leaving genuine
-            translation untouched. Defaults to ``0.4``: trimmed the same
-            frames at ``0.32`` across every measured trial, so it isn't
-            balanced on a knife's edge, while ``0.48`` started eating
-            genuine slow walking on the slowest trial.
+            disables bridging.
+        min_consecutive_strides: A paw's reported stride/step/ground-
+            contact averages are computed only from strides in a run of
+            at least this many consecutive accepted stance events with no
+            camera-caused discard between them; otherwise ``NaN``. See
+            :func:`alligaitor.gait.restrict_to_consecutive_runs`.
+        stillness_window_seconds: Width, in seconds, of the window
+            whole-body speed is measured across for stillness detection
+            (see :func:`alligaitor.gait.windowed_body_speed`); a window
+            cancels frame-to-frame reconstruction jitter that a single
+            node's instantaneous speed would not.
         stillness_window_speed_mm_s: Below this whole-body speed, in
-            mm/s, measured across ``stillness_window_seconds`` (not
-            between adjacent frames), the reference node (see
-            ``alligaitor.gait.REFERENCE_NODE``) counts as not
-            translating. Used to trim any leading/trailing stretch where
-            the rat has stopped moving -- once the body itself is
-            stationary, a paw's own position can still jitter across
-            ``speed_threshold_mm_s`` from tracking noise alone, which
-            would otherwise look like a run of real steps in place. This
-            asks whether the *animal* is translating at all, not whether
-            one paw is currently planted mid-stride, so it is not
-            comparable to ``speed_threshold_mm_s`` -- the two measure
-            different things over different spans. Defaults to ``100``,
-            which separated stopped stretches (windowed speed under
-            ~80) from walking (240+) on every measured trial, including
-            the slowest. Tune against real trials with
-            ``scripts/debug_gait.py``.
-        min_still_seconds: How long a stretch of sub-threshold body
-            speed, bordering either end of the trial, counts as
-            "stopped" rather than an ordinary brief slowdown mid-stride.
-            Only a stretch touching the very start or very end of the
-            trial is ever trimmed -- a pause in the middle is left
-            alone. In seconds rather than frames because ``pose_3d`` is
-            sampled at the slowest camera's frame rate (see
-            :func:`alligaitor.pipeline.run_session`), so a frame count
-            means a different real duration on every rig. See
+            mm/s, measured across ``stillness_window_seconds``, the
+            reference node (``alligaitor.gait.REFERENCE_NODE``) counts as
+            not translating. Used to trim leading/trailing stretches
+            where the rat has stopped moving.
+        min_still_seconds: How long a stretch of sub-threshold body speed
+            bordering either end of the trial counts as "stopped" rather
+            than a brief mid-stride slowdown. See
             :func:`alligaitor.gait.active_window`.
         min_valid_steps: Fewest valid steps (see
             :func:`alligaitor.gait._step_lengths`) a paw needs before its
-            average step length is reported at all; below this it is
-            ``NaN`` and flagged on its own, independently of stride
-            length and ground contact time. Step length is the one
-            metric that depends on a *second* paw -- it measures forward
-            distance from the contralateral paw's most recent touchdown
-            -- so it can be untrustworthy on a crossing where everything
-            else about this paw is clean, and needs a verdict of its
-            own. Defaults to ``5``, holding step length to the same
-            evidence bar a qualifying run must clear
-            (``min_consecutive_strides``); kept a separate field so
-            lowering that threshold to rescue runs doesn't silently
-            lower this one too.
+            average step length is reported; below this it is ``NaN``.
+            Step length depends on the contralateral paw's most recent
+            touchdown, so it has its own evidence bar separate from
+            ``min_consecutive_strides``.
         stride_length_outlier_ratio: A stride longer than this many times
-            a paw's own median stride length in the trial is flagged as
-            likely hiding a missed stance -- e.g. a real stance the speed
-            classifier failed to recognize -- rather than being one
-            genuine stride, and breaks a qualifying run the same way a
-            camera-caused discard does. This catches exactly what
-            ``max_bridge_gap_frames`` cannot: triangulation can be clean
-            the entire way through and still miss a real, brief stance.
-            A stride with zero or negative net forward progress breaks a
-            run the same way, unconditionally -- not scaled by this
-            ratio, since no multiple of a real stride's length justifies
-            a genuinely backward one. Investigated on real trials: these
-            traced to genuine, cleanly-triangulated paw movement during
-            a brief mid-crossing pause (grooming, sniffing) rather than
-            to turning or walking backward, but the *cause* doesn't
-            matter for this purpose -- directed locomotion shouldn't
-            produce a non-positive stride, so one is never trustworthy
-            regardless of why. This paw's own median (used for the
-            ratio check above) is computed from its positive strides
-            only, so a paused/backward one can't drag it down and mask
-            a real too-long outlier next to it.
+            a paw's own median stride length is flagged as likely hiding
+            a missed stance, and breaks a qualifying run the same way a
+            camera-caused discard does. A stride with zero or negative
+            net forward progress always breaks a run, unconditionally.
             See :func:`alligaitor.gait.find_stride_length_outliers`.
     """
 
@@ -310,35 +198,8 @@ class GaitConfig:
     @classmethod
     def from_raw(cls, raw: Optional[Dict[str, object]]) -> "GaitConfig":
         """Build from a config file's (or ``settings.json``'s) ``gait``
-        mapping, dropping keys that are no longer fields instead of
-        raising.
-
-        Keeps a ``config.yaml`` or ``app_data/settings.json`` written
-        before a tunable was renamed loadable -- a stale key would
-        otherwise be a ``TypeError`` on every load. Anything dropped
-        falls back to that field's current default, warned about rather
-        than done silently.
-
-        Both stillness tunables were renamed when
-        :func:`alligaitor.gait.active_window` moved to a windowed speed:
-        ``min_still_frames`` -> ``min_still_seconds`` (a frame count
-        means a different duration on every rig), and
-        ``stillness_speed_threshold_mm_s`` ->
-        ``stillness_window_speed_mm_s``. The second is a rename on
-        purpose even though the units didn't change: it compares against
-        a speed measured across ``stillness_window_seconds`` rather than
-        between adjacent frames, so an old file's value is off by more
-        than an order of magnitude and silently honoring it would leave
-        the check doing nothing.
-
-        ``min_consecutive_steps`` -> ``min_consecutive_strides`` was a
-        naming fix, not a behavior change: the field always counted
-        consecutive stance events feeding stride/ground-contact-time
-        averages (paw vs. itself), never the contralateral-paw
-        measurement a "step" actually is (see ``min_valid_steps``) -- an
-        old file's value means exactly what it always meant and just
-        gets dropped-and-defaulted like any other unrecognized key here.
-        """
+        mapping, dropping any keys that are no longer fields (falling back
+        to that field's default, with a warning) instead of raising."""
         values = dict(raw or {})
         known = {f.name for f in dataclasses.fields(cls)}
         unknown = sorted(set(values) - known)
@@ -354,35 +215,24 @@ class GaitConfig:
 @dataclass
 class DiscoveryConfig:
     """Rules for auto-discovering a group's sessions from a folder of
-    videos -- used by the GUI's config editor (see
-    :mod:`alligaitor.discovery`) to (re)build :attr:`PipelineConfig.sessions`
-    from ``input_dir`` rather than requiring them to be hand-written.
-
-    Not consumed by the plain CLI pipeline itself: ``sessions`` is always
-    written out fully resolved (see :meth:`PipelineConfig.to_yaml`), so a
-    GUI-authored config file stays a complete, valid :class:`PipelineConfig`
-    that ``python -m alligaitor.cli run`` can run standalone, with or
-    without this block.
+    videos, used by the GUI's config editor (see
+    :mod:`alligaitor.discovery`) to build :attr:`PipelineConfig.sessions`.
+    Not consumed by the plain CLI pipeline itself; ``sessions`` is always
+    written out fully resolved.
 
     Attributes:
         input_dir: Folder of source (pre-crop) videos to discover
             sessions from.
         id_regex: Applied to each video's filename; group 1 is the
-            session name (e.g. ``"359a-BL"`` from
-            ``"359a-BL_cam0_coded.mp4"``). Videos sharing a session name,
-            one per camera role, form one session.
+            session name. Videos sharing a session name, one per camera
+            role, form one session.
         camera_regex: Applied to each video's filename; group 1 is a
-            camera token (e.g. ``"cam0"``), mapped to a role via
-            :attr:`camera_role_map`.
-        camera_role_map: Camera token -> role (``"left"``/``"right"``/
-            ``"bottom"``). One mapping applies to every video in the
-            group -- a rig's physical camera assignment doesn't change
-            mid-group, unlike across groups (see the port-order caveat
-            on :class:`SessionConfig`).
+            camera token, mapped to a role via :attr:`camera_role_map`.
+        camera_role_map: Camera token -> role
+            (``"left"``/``"right"``/``"bottom"``).
         rat_id_overrides: Session name -> rat_id, for sessions where the
             same rat crosses more than once within this group (see
-            :attr:`SessionConfig.rat_id`). Empty unless the group
-            actually has repeat crossings.
+            :attr:`SessionConfig.rat_id`).
     """
 
     input_dir: Path
@@ -409,29 +259,14 @@ class PipelineConfig:
             in this group.
         discovery: How the GUI's config editor auto-discovered
             ``sessions`` from a folder of videos, if it did. Round-tripped
-            for editing but not read by :func:`run_pipeline`/`run_group` --
-            ``sessions`` is always the source of truth for a run.
-        skip_validation_videos: If ``True``, :func:`alligaitor.pipeline.run_group`
-            skips rendering an annotated validation video for every
-            session in this group (see
-            :func:`alligaitor.validation_video.export_validation_video`)
-            -- e.g. for a group where render time isn't worth it and the
-            spreadsheet/paw-usability summary alone is enough. Defaults to
-            ``False`` (videos are generated). Editable per group in the
-            config editor; new groups start from
-            ``app_settings.get_default_skip_validation_videos``.
-        bottom_fallback: If ``True``, :func:`alligaitor.pipeline.run_session`
-            fills triangulation gaps using the experimental bottom-camera
-            monocular fallback (see :mod:`alligaitor.bottom_fallback`)
-            wherever the bottom camera alone has a valid 2D detection.
-            :func:`alligaitor.pipeline.run_group` then guards every paw
-            that already had a usable run without the fallback, splicing
-            its exact pre-fallback numbers back in -- the fallback can
-            only ever add usability a paw didn't already have, never take
-            one away (see :func:`alligaitor.bottom_fallback.guard_against_regression`).
-            Defaults to ``False`` -- a group only pays for this if it
-            opts in, and a group that doesn't need it runs on plain
-            triangulation exactly as before.
+            for editing but not read by :func:`run_pipeline`/`run_group`.
+        skip_validation_videos: If ``True``, skip rendering an annotated
+            validation video for every session in this group (see
+            :func:`alligaitor.validation_video.export_validation_video`).
+            Defaults to ``False``.
+        bottom_fallback: If ``True``, fill triangulation gaps using the
+            bottom-camera monocular fallback (see
+            :mod:`alligaitor.bottom_fallback`). Defaults to ``False``.
     """
 
     models: ModelConfig
@@ -516,17 +351,7 @@ class PipelineConfig:
     def to_yaml(self, path: PathLike) -> None:
         """Write this config back out to YAML, in the same schema
         :meth:`from_yaml` reads. Paths are written relative to ``path``'s
-        parent directory where possible (matching :meth:`from_yaml`'s
-        resolution convention), falling back to absolute if a path isn't
-        actually under it.
-
-        Used by the GUI's config editor to persist a group's
-        ``config.yaml`` after auto-discovery -- the written file always
-        has ``sessions`` fully resolved, so it stays a complete, valid
-        config independent of the GUI (``discovery``, if present, is
-        extra metadata for re-opening the editor, not something a plain
-        ``alligaitor.cli run`` needs).
-        """
+        parent directory where possible, falling back to absolute."""
         path = Path(path)
         base_dir = path.parent
 

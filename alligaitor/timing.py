@@ -1,18 +1,8 @@
 """Wall-clock-time-based frame alignment across cameras.
 
-The three-camera rig's cameras do not run at a fixed, matched frame rate:
-auto-exposure trades frame rate for brightness independently per camera, so
-the achieved rate varies both between cameras within one recording and
-between recordings for the same camera. Matching frames across camera
-views by raw frame index (aniposelib's default, and a naive equal-length
-assumption elsewhere in this pipeline) therefore does not reliably
-correspond to the same real moment beyond the very start of a recording.
-
-Every cross-camera correspondence in this pipeline is resolved by
-estimated wall-clock time instead: a frame's time is its index divided by
-its own video's frame rate, and recordings are assumed to start in sync at
-frame 0 (no hardware genlock or per-frame timestamps are available from
-this rig).
+Camera frame rates vary independently (auto-exposure), so frames are matched across views by
+estimated wall-clock time (index / fps, recordings assumed synced at frame 0) rather than raw
+frame index.
 """
 
 from __future__ import annotations

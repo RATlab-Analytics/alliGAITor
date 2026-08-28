@@ -1,16 +1,7 @@
 """
 App-wide dark theme, applied once to the QApplication instance so every
-window and dialog in the app (MainWindow, the config editor, Add Job,
-Preferences, About, the crop tool, ...) picks it up automatically rather
-than needing its own styling.
-
-Uses the "Fusion" style rather than the platform-native one: native
-styles (macOS's in particular) largely ignore QPalette color roles for
-many widgets -- buttons, combo boxes, tab bars keep their native chrome
-regardless of what the palette says -- so a QPalette-only dark theme on
-the native style ends up half-applied. Fusion actually draws every
-widget from the palette, which is what makes a *complete* dark theme
-possible without hand-styling each widget class individually.
+window and dialog picks it up automatically. Uses the "Fusion" style,
+since native styles largely ignore QPalette colors for many widgets.
 """
 
 from __future__ import annotations
@@ -48,9 +39,7 @@ def apply_dark_theme(app: QApplication) -> None:
     palette.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
     palette.setColor(QPalette.PlaceholderText, _DISABLED_TEXT)
 
-    # Disabled-state colors, so a disabled button/label doesn't just look
-    # like an enabled one with slightly-off contrast against the dark
-    # background -- the default disabled shades assume a light theme.
+    # Disabled-state colors; defaults assume a light theme.
     palette.setColor(QPalette.Disabled, QPalette.WindowText, _DISABLED_TEXT)
     palette.setColor(QPalette.Disabled, QPalette.Text, _DISABLED_TEXT)
     palette.setColor(QPalette.Disabled, QPalette.ButtonText, _DISABLED_TEXT)

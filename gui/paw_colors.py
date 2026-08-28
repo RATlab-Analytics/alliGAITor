@@ -1,13 +1,6 @@
 """
-Shared per-paw identity colors for the validation-viewing dialogs --
-distinct from the red/green *usability* colors used elsewhere (see
-job_table_model.py's _STATUS_COLORS), since a paw's own color needs to
-stay recognizable across the validation list, the scrub bar's rows, and
-the Flag Paw(s) popup regardless of whether that paw is currently usable.
-
-Kept in its own module (rather than duplicated in validation_list_dialog.py
-and validation_video_dialog.py) so the two dialogs can't drift apart on
-which color means which paw.
+Shared per-paw identity colors for the validation dialogs, distinct from
+the red/green usability colors in job_table_model.py.
 """
 
 from __future__ import annotations
@@ -30,17 +23,11 @@ _PAW_COLORS = {
     "right-hind-paw": QColor(38, 198, 218),  # teal/cyan
 }
 
-# Semantic usable/unusable colors, matching job_table_model.py's
-# _STATUS_COLORS (JobStatus.DONE / JobStatus.FAILED) so "green means good,
-# red means bad" reads the same way everywhere in the app.
+# Matches job_table_model.py's _STATUS_COLORS for consistent usable/unusable coloring.
 COLOR_USABLE = QColor("#81c995")
 COLOR_UNUSABLE = QColor("#f28b82")
-# A run that's still usable but leans heavily on the experimental
-# bottom-camera fallback (see alligaitor.gait.BOTTOM_FALLBACK_WARN_THRESHOLD)
-# -- the same amber job_table_model.py's _STATUS_COLORS uses for
-# NEEDS_CONFIG/NEEDS_CROP, so "needs a second look" reads consistently
-# across the app. Never used in place of COLOR_UNUSABLE -- only ever on
-# top of a paw that's already usable.
+# Usable but relying heavily on the bottom-camera fallback; only ever
+# layered on top of a usable paw, never in place of COLOR_UNUSABLE.
 COLOR_FALLBACK_WARNING = QColor("#ffca28")
 
 
@@ -49,16 +36,10 @@ def paw_color(paw: str) -> QColor:
 
 
 def grayed_paw_color(paw: str) -> QColor:
-    """A heavily desaturated blend of `paw`'s own color, used on the
-    scrub bar for an unusable paw's fallback (longest-raw-run) window --
-    muted enough to read as "not trustworthy" at a glance (paired with a
-    thinner segment -- see video_player_widget.py's _MultiRowScrubBar)
-    while keeping just enough of a tint to still tell which paw it is,
-    rather than collapsing every unusable paw into one indistinguishable
-    gray."""
+    """Desaturated blend of `paw`'s color, for an unusable paw's fallback window on the scrub bar."""
     c = _PAW_COLORS[paw]
     gray = 120
-    blend = 0.85  # fraction gray -- was 0.55; too close to the full-color segments to read as "muted" at a glance
+    blend = 0.85  # fraction gray
     return QColor(
         round(c.red() * (1 - blend) + gray * blend),
         round(c.green() * (1 - blend) + gray * blend),

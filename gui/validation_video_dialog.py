@@ -1,22 +1,14 @@
 """
-Validation video viewer: plays one session's already-annotated validation
-video (see alligaitor/validation_video.py) with the standard transport
-controls (video_player_widget.py) and one scrub-bar row per paw showing
-its used (or, if unusable, longest raw) run per crossing -- see
-alligaitor.gait.paw_usability_windows. A recording with several crossings
-(the rat walks out, turns, walks back) gets one colored segment per
-crossing on that paw's row, since a paw can be usable on one crossing and
-not another; the row's label shows how many of the recording's crossings
-that paw was even visible in.
+Validation video viewer: plays one session's annotated validation video
+with transport controls and one scrub-bar row per paw, showing its used
+(or longest raw, if unusable) run per crossing. A recording with several
+crossings gets one colored segment per crossing on that paw's row.
 
-"Flag Paw(s)..." lets a reviewer mark a paw's run as not actually
-trustworthy on one specific crossing, despite passing the automatic
-threshold (or clear a previous flag on that crossing) -- a paw can be
-fine on crossing 1 and flagged on crossing 2 of the same recording. The
-popup defaults to whichever crossing the playhead is currently in. The
-flag is stored per session, keyed by crossing (validation.save_manual_flags)
-and immediately patched into just that crossing's block in the group's
-Excel report (gait.annotate_manual_flag) -- no pipeline rerun needed.
+"Flag Paw(s)..." lets a reviewer mark a paw's run on one crossing as not
+actually trustworthy (or clear a previous flag), defaulting to whichever
+crossing the playhead is in. The flag is saved per session/crossing and
+patched into the group's Excel report immediately, with no pipeline
+rerun needed.
 """
 
 from __future__ import annotations
@@ -35,15 +27,10 @@ from video_player_widget import VideoPlayerWidget
 
 
 class _FlagPawsDialog(QDialog):
-    """Small popup: which paw(s) to flag as invalid on one crossing, plus
-    an optional shared note -- pre-checked to whatever's currently
-    flagged on that crossing, so it doubles as an editor (checking/
-    unchecking a box adds/removes that paw's flag) rather than a purely
-    additive action. A recording with more than one crossing gets a
-    crossing picker up top (defaulting to `initial_crossing_number`);
-    switching it reloads the checkboxes/note for whichever crossing is
-    now selected. Only the crossing selected when OK is pressed is
-    actually saved -- edit one crossing per popup invocation."""
+    """Popup to flag/unflag paw(s) as invalid on one crossing, with an
+    optional note. Pre-checked to whatever's currently flagged. A
+    multi-crossing recording gets a crossing picker; only the crossing
+    selected when OK is pressed is saved."""
 
     def __init__(self, crossings: list, initial_crossing_number: int, flags_by_crossing: dict, parent=None):
         super().__init__(parent)
@@ -101,9 +88,7 @@ class _FlagPawsDialog(QDialog):
         for paw, box in self.checkboxes.items():
             box.setChecked(paw in flagged_paws)
             visible = paws_here.get(paw) is not None
-            # A paw never detected on this crossing has nothing to flag --
-            # disabled unless it's somehow already flagged (shouldn't
-            # normally happen, but let the user still clear it if so).
+            # Disabled if never detected on this crossing, unless already flagged.
             box.setEnabled(visible or paw in flagged_paws)
             box.setToolTip("" if visible else "Not detected on this crossing")
         self.note_edit.setText(note)
@@ -115,10 +100,8 @@ class _FlagPawsDialog(QDialog):
 
 class ValidationVideoDialog(QDialog):
     """Plays `session`'s validation video with per-paw, per-crossing scrub
-    markers and the Flag Paw(s) action. `xlsx_path` is the group's
-    already-written report (alligaitor.config.PipelineConfig.output_xlsx)
-    -- patched in place, one crossing's block at a time, when a flag
-    changes."""
+    markers and the Flag Paw(s) action. `xlsx_path` is the group's report,
+    patched in place when a flag changes."""
 
     def __init__(self, job, session, xlsx_path, parent=None):
         super().__init__(parent)
@@ -162,11 +145,8 @@ class ValidationVideoDialog(QDialog):
         return validation.crossings_or_fallback(self.summary)
 
     def _crossing_at_frame(self, frame_idx: int) -> int:
-        """Which crossing (1-based) `frame_idx` falls inside, for
-        defaulting the Flag Paw(s) popup to wherever the playhead
-        currently is -- falls back to the first crossing if none of
-        them carry frame-range info, or the frame lands in a gap between
-        crossings (a pause/turn)."""
+        """Which crossing (1-based) `frame_idx` falls inside; falls back
+        to the first crossing if none match."""
         for crossing in self._crossings():
             window = crossing.get("window")
             if window and window[0] <= frame_idx <= window[1]:
