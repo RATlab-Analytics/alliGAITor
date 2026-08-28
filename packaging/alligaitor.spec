@@ -3,6 +3,7 @@
 # Run from the repo root, or pass --distpath/--workpath to relocate output.
 
 import sys
+from importlib import metadata as _im
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_submodules, copy_metadata
@@ -12,18 +13,17 @@ GUI_DIR = REPO_ROOT / "gui"
 TOOLS_DIR = REPO_ROOT / "tools"
 ICONS_DIR = REPO_ROOT / "packaging" / "icons"
 
-# The About dialog reads dependency versions via importlib.metadata, which
-# needs each package's dist-info bundled explicitly -- PyInstaller doesn't
-# include it by default. sleap-nn is optional (run as a subprocess, not
-# imported), so it's skipped if not installed in the build environment.
-METADATA_PACKAGES = [
-    "aniposelib", "sleap-nn", "sleap-io", "numpy", "pandas", "openpyxl",
-    "PyYAML", "PySide6", "opencv-python", "imageio-ffmpeg",
-]
+# PyInstaller doesn't bundle a package's dist-info by default, which breaks
+# two things: the About dialog's importlib.metadata.version() lookups, and
+# -- less obviously -- some packages (e.g. imageio, pulled in transitively by
+# sleap_io) call importlib.metadata.version() on *themselves* at import time
+# to set __version__, and crash outright if their own metadata is missing.
+# Bundling every installed distribution's metadata (cheap: just small text
+# files) avoids chasing these one crash at a time.
 metadata_datas = []
-for pkg in METADATA_PACKAGES:
+for dist_name in {d.metadata.get("Name") for d in _im.distributions() if d.metadata.get("Name")}:
     try:
-        metadata_datas += copy_metadata(pkg)
+        metadata_datas += copy_metadata(dist_name)
     except Exception:
         pass
 
@@ -40,6 +40,11 @@ FLAT_MODULES = [
 
 hiddenimports = list(FLAT_MODULES)
 hiddenimports += collect_submodules("alligaitor")
+# sleap_io lazy-loads its io/model/codecs/rendering submodules via the
+# lazy_loader package (see sleap_io/__init__.py's lazy.attach() call), which
+# resolves them dynamically at runtime through __getattr__ -- invisible to
+# PyInstaller's static import analysis, so they're never otherwise bundled.
+hiddenimports += collect_submodules("sleap_io")
 
 if sys.platform == "darwin":
     icon_file = str(ICONS_DIR / "alligaitor.icns")

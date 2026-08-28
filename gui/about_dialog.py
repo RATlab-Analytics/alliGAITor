@@ -23,6 +23,9 @@ THIRD_PARTY_NOTICES.md (this dialog only points to it, not reproduces it).
 
 from __future__ import annotations
 
+import re
+import shutil
+import subprocess
 from importlib import metadata
 from typing import List
 
@@ -30,20 +33,36 @@ from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QPlainTextEdit,
 
 import alligaitor
 
-_DEPENDENCIES = [
-    "aniposelib", "sleap-nn", "sleap-io", "numpy", "pandas", "openpyxl",
+# sleap-nn runs as an external subprocess (see alligaitor/inference.py), not
+# an import of this app's own frozen interpreter, so importlib.metadata can
+# never see it -- it's resolved via PATH and its own --version output instead.
+_IMPORTED_DEPENDENCIES = [
+    "aniposelib", "sleap-io", "numpy", "pandas", "openpyxl",
     "PyYAML", "PySide6", "opencv-python", "imageio-ffmpeg",
 ]
 
 
+def _sleap_nn_version() -> str:
+    exe = shutil.which("sleap-nn")
+    if exe is None:
+        return "not installed"
+    try:
+        result = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=10)
+        match = re.search(r"\d+\.\d+(\.\d+)?", result.stdout + result.stderr)
+        return match.group(0) if match else "installed (version unknown)"
+    except Exception:
+        return "installed (version unknown)"
+
+
 def _dependency_versions() -> List[str]:
     lines = []
-    for name in _DEPENDENCIES:
+    for name in _IMPORTED_DEPENDENCIES:
         try:
             version = metadata.version(name)
         except metadata.PackageNotFoundError:
             version = "not installed"
         lines.append(f"{name}  {version}")
+    lines.append(f"sleap-nn  {_sleap_nn_version()}")
     return lines
 
 
