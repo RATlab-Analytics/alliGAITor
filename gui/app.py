@@ -24,10 +24,37 @@ Run with:
 from __future__ import annotations
 
 import multiprocessing
+import os
+import subprocess
 import sys
 from pathlib import Path
 
 REPO_DIR = Path(__file__).resolve().parent.parent
+
+
+def _fix_path_env() -> None:
+    """A GUI app launched from Finder/Dock (or an AppImage/desktop entry on
+    Linux) doesn't inherit the user's shell PATH, only Windows does -- so a
+    CLI tool installed via pip/conda and only added to PATH in .zshrc/.bashrc
+    (e.g. sleap-nn) is invisible here even though it works from a terminal.
+    Merge in the user's actual login-shell PATH so subprocess calls resolve it."""
+    if sys.platform.startswith("win"):
+        return
+    shell = os.environ.get("SHELL", "/bin/zsh")
+    try:
+        result = subprocess.run(
+            [shell, "-ilc", 'echo -n "$PATH"'],
+            capture_output=True, text=True, timeout=5,
+        )
+        lines = result.stdout.strip().splitlines()
+        shell_path = lines[-1] if lines else ""
+    except Exception:
+        return
+    if not shell_path:
+        return
+    current = os.environ.get("PATH", "")
+    merged = list(dict.fromkeys(shell_path.split(":") + current.split(":")))
+    os.environ["PATH"] = ":".join(p for p in merged if p)
 
 # Ensure repo root and tools/ are on sys.path in case this runs before
 # gui/__init__.py's own setup (e.g. `python gui/app.py` directly).
@@ -50,6 +77,7 @@ def _icon_path() -> Path:
 
 
 def main():
+    _fix_path_env()
     app = QApplication(sys.argv)
     app.setApplicationName("alliGAITor")
     app.setApplicationDisplayName("alliGAITor")

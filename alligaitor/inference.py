@@ -24,6 +24,7 @@ array keyed by skeleton node name.
 from __future__ import annotations
 
 import re
+import shutil
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -172,6 +173,13 @@ def run_inference(
     data_path = video_path
     if force_grayscale:
         data_path = preprocessing.ensure_grayscale_video(video_path, output_path.parent)
+
+    if shutil.which("sleap-nn") is None:
+        raise RuntimeError(
+            "sleap-nn isn't on PATH. Install it (see https://nn.sleap.ai) and make sure "
+            "it's reachable from a fresh shell -- if it works in a terminal but not from "
+            "this app, check that it's installed for the same user this app runs as."
+        )
 
     cmd = [
         "sleap-nn",
