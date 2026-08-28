@@ -21,4 +21,4 @@ calibration and triangulation (aniposelib) to reconstruct 3D keypoint
 trajectories from three fixed cameras (left side, right side, bottom-up).
 """
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
