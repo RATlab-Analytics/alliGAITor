@@ -21,12 +21,10 @@ jobs:
           pip install pyinstaller
       - name: Build .app
         run: pyinstaller packaging/alligaitor.spec --noconfirm
-      - name: Zip .app
-        run: ditto -c -k --sequesterRsrc --keepParent dist/alliGAITor.app dist/alliGAITor-macos-arm64.zip
       - uses: actions/upload-artifact@v4
         with:
           name: alliGAITor-macos-arm64
-          path: dist/alliGAITor-macos-arm64.zip
+          path: dist/alliGAITor.app
 
   windows-x86_64:
     runs-on: windows-latest
@@ -42,12 +40,10 @@ jobs:
           pip install pyinstaller
       - name: Build .exe
         run: pyinstaller packaging/alligaitor.spec --noconfirm
-      - name: Zip build
-        run: Compress-Archive -Path dist/alliGAITor -DestinationPath dist/alliGAITor-windows-x86_64.zip
       - uses: actions/upload-artifact@v4
         with:
           name: alliGAITor-windows-x86_64
-          path: dist/alliGAITor-windows-x86_64.zip
+          path: dist/alliGAITor
 
   linux:
     strategy:
