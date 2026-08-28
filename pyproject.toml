@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "alligaitor"
-version = "1.0.1"
+version = "1.0.2"
 description = "Multi-camera 3D gait reconstruction pipeline for rats"
 readme = "README.md"
 license = { text = "GPL-3.0-or-later" }
