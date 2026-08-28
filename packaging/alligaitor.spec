@@ -78,7 +78,7 @@ if sys.platform == "darwin":
         info_plist={
             "CFBundleName": "alliGAITor",
             "CFBundleDisplayName": "alliGAITor",
-            "CFBundleShortVersionString": "0.1.0",
+            "CFBundleShortVersionString": "1.0.0",
             "NSHighResolutionCapable": True,
         },
     )
