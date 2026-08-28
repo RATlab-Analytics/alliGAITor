@@ -1,55 +1,18 @@
-"""
-"Crop Videos…" dialog -- walks through videos one at a time, letting you
-drag a fixed-size (width x height) crop window into place per video.
-The camera/tunnel framing isn't guaranteed to repeat exactly across
-every recording, so this defaults to per-video positioning rather than
-one uniform crop for a whole folder.
+"""Crop Videos dialog -- walks through videos one at a time, letting you drag a fixed-size
+crop window into place per video, since framing can shift between recordings.
 
-Confirming a video (Forward) crops it immediately (a single video, on
-the main thread -- brief and bounded). A "Use This Position for All
-Remaining" button skips the rest of the walkthrough when the framing
-hasn't moved: it crops every remaining video in one shot via CropRunner,
-a separate process (see crop_worker_process.py for why cropping a whole
-batch can't just happen inline here).
+Confirming a video (Forward) crops it immediately on the main thread. "Use This Position for All
+Remaining" crops every remaining video in one shot via CropRunner, a separate process. Positions
+are cached per video at ``<output_folder>/crop_positions.json``, so reopening this dialog resumes
+rather than re-asking for videos already cropped.
 
-Positions are cached per video (video_crop.load_positions/
-save_positions, keyed with frame_utils.video_key()) at
-<output_folder>/crop_positions.json, so reopening this dialog on the
-same input/output folder resumes rather than re-asking for videos
-already cropped.
+The ``mode`` constructor argument controls how the color-correction UI is offered:
 
-The ``mode`` constructor argument controls how the color-correction UI is
-offered, since alliGAITor's GUI job queue always knows in advance whether
-a given crop pass is side or bottom footage (it runs each role as its
-own separate pass), unlike the original NOR-derived "pick per video"
-design:
-
-  - ``"manual"`` (default): the original side/bottom-up radio pair,
-    for the standalone ``scripts/crop_tool_main.py`` entry point, which
-    doesn't know a folder's camera roles ahead of time.
-  - ``"bottom"``: a single "Apply bottom-up color correction" checkbox
-    (plus the strength slider) in place of the radio pair, pre-checked
-    from ``default_color_grade`` -- for the job queue's bottom-only pass.
-  - ``"side"``: no color-correction UI at all -- ``color_grade`` is
-    always ``False``. For the job queue's side-only pass, where grading
-    was never an option to begin with, not just a default.
-
-Ported from RATlab-NOR's gui/crop_setup_dialog.py, with two changes:
-
-  1. The `object_picker`/`object_setup_dialog` imports (NOR-specific
-     modules that don't exist here) are replaced with frame_utils.py, a
-     minimal extraction of just the three functions this dialog
-     actually used from them.
-  2. _CropCanvas now scales the displayed frame (and crop box with it)
-     to fit whatever size the dialog window currently is, letterboxed
-     to preserve aspect ratio, instead of forcing the window to the
-     video's native resolution -- NOR's original version called
-     setFixedSize(pixmap.size()), which made sense for its ~1000px
-     arena footage but is unusable for e.g. a 1920x1080 source frame on
-     a laptop screen. self.x/self.y/self.crop_w/self.crop_h stay in
-     native-frame pixel coordinates throughout (the same coordinates
-     video_crop.crop_video() takes); only paintEvent and the mouse
-     handlers convert to/from the current display scale.
+  - ``"manual"`` (default): a side/bottom-up radio pair, for the standalone
+    ``scripts/crop_tool_main.py`` entry point.
+  - ``"bottom"``: a single "Apply bottom-up color correction" checkbox, pre-checked from
+    ``default_color_grade``.
+  - ``"side"``: no color-correction UI -- ``color_grade`` is always ``False``.
 """
 
 from __future__ import annotations
@@ -72,24 +35,14 @@ from crop_runner import CropRunner
 _RECT_COLOR = QColor(255, 140, 0)
 _RECT_COLOR_BAD = QColor(200, 40, 40)
 
-# Floor on the letterboxed display scale -- without this, a very small
-# dialog on a small screen could shrink a 1280-wide frame down to where
-# the crop rectangle becomes un-clickable (sub-pixel wide). The user can
-# still resize the window bigger; this just stops things from going
-# unusably tiny rather than silently degrading dragging.
+# Floor on the letterboxed display scale, so the crop rectangle never shrinks below clickable size.
 _MIN_DISPLAY_SCALE = 0.05
 
 
 class _CropCanvas(QWidget):
-    """Shows the loaded preview frame, letterboxed/scaled to fill
-    whatever size this widget currently is, with a draggable rectangle
-    marking the crop window (drag, click-to-place, arrow-key nudge).
-    self.x/self.y/self.crop_w/self.crop_h are always in *frame*
-    (native-resolution) pixel coordinates -- the same coordinates
-    video_crop.crop_video() takes -- regardless of how the frame is
-    currently being scaled for display; only paintEvent and the mouse
-    handlers ever deal with the display-space <-> frame-space
-    conversion."""
+    """Shows the loaded preview frame, letterboxed/scaled to fill this widget, with a draggable
+    rectangle marking the crop window. self.x/self.y/self.crop_w/self.crop_h are always in native
+    frame pixel coordinates; only paintEvent and the mouse handlers convert to/from display scale."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -137,12 +90,8 @@ class _CropCanvas(QWidget):
     # -- display-space <-> frame-space mapping --
 
     def _display_geometry(self):
-        """Returns (scale, offset_x, offset_y) for the current widget
-        size: scale maps frame-space lengths to displayed/widget-space
-        lengths, offsets center the (aspect-ratio-preserved) scaled
-        frame within whatever space is available -- letterboxed, so a
-        wide/short 1280x170-shaped frame doesn't get stretched into a
-        squarer widget."""
+        """(scale, offset_x, offset_y) for the current widget size: scale maps frame-space
+        lengths to widget-space, offsets center the letterboxed, aspect-ratio-preserved frame."""
         if not self.pixmap or self.frame_w <= 0 or self.frame_h <= 0:
             return 1.0, 0.0, 0.0
         avail_w = max(1, self.width())
@@ -194,16 +143,8 @@ class _CropCanvas(QWidget):
     def mouseReleaseEvent(self, event):
         self._dragging = False
 
-    # No keyPressEvent here on purpose -- CropSetupDialog handles every
-    # keyboard shortcut (including arrow-key nudging) itself, rather than
-    # splitting handling between this canvas and its parent dialog and
-    # relying on Qt's focus/event-bubbling behavior to route things
-    # correctly.
-    #
-    # No resizeEvent override needed either -- Qt already schedules a
-    # repaint on resize, and paintEvent recomputes _display_geometry()
-    # from self.width()/height() fresh every time, so the frame and crop
-    # box just rescale automatically as the dialog is resized.
+    # No keyPressEvent here -- CropSetupDialog handles keyboard shortcuts itself. No resizeEvent
+    # needed either -- paintEvent recomputes _display_geometry() from current widget size each time.
 
 
 class CropSetupDialog(QDialog):
@@ -234,8 +175,7 @@ class CropSetupDialog(QDialog):
                 v for v in video_paths if video_key(v, self.input_folder) not in self.positions
             ]
             if not self.session_videos:
-                # Everything's already cropped -- fall back to reviewing
-                # all of them rather than opening an empty dialog.
+                # Everything's already cropped; review all rather than open an empty dialog.
                 self.session_videos = list(video_paths)
 
         self.last_known_xy = None
@@ -257,17 +197,8 @@ class CropSetupDialog(QDialog):
         self.width_spin.valueChanged.connect(self._on_size_changed)
         self.height_spin.valueChanged.connect(self._on_size_changed)
 
-        # Color-correction UI: video_crop.apply_bottom_up_color_correction()
-        # reproduces the paw/body color-contrast boost the original
-        # (now-lost) bottom-up preprocessing produced, without the noise
-        # it also introduced (see video_crop.py's module docstring) --
-        # only ever meaningful for bottom-up (tunnel) footage. How it's
-        # offered depends on self.mode (see the class docstring): the job
-        # queue always knows in advance whether a given pass is side or
-        # bottom footage, so "manual" mode's side/bottom-up radio pair
-        # (for the standalone crop_tool_main.py, which doesn't know a
-        # folder's camera roles ahead of time) is replaced by a single
-        # checkbox in "bottom" mode, or nothing at all in "side" mode.
+        # Color-correction UI, only meaningful for bottom-up (tunnel) footage. Offered as a
+        # radio pair in "manual" mode, a single checkbox in "bottom" mode, or not at all in "side".
         self.side_radio = None
         self.bottomup_radio = None
         self.grade_checkbox = None
@@ -284,17 +215,10 @@ class CropSetupDialog(QDialog):
             self.grade_checkbox = QCheckBox("Apply bottom-up color correction")
             self.grade_checkbox.setChecked(default_color_grade)
             self.grade_checkbox.toggled.connect(self._on_grade_changed)
-        # mode == "side": no color-grade control at all -- self.color_grade
-        # stays False unconditionally (see that property).
+        # mode == "side": self.color_grade stays False unconditionally.
 
-        # Strength slider -- the bottom camera has more ambient light than
-        # the side-angle footage this correction was tuned against, so the
-        # full-strength recipe (video_crop._BC_LAYERS) can look starker
-        # than intended on real bottom-up footage. Scales
-        # apply_bottom_up_color_correction()'s effect linearly, 0% = no-op,
-        # 100% = the documented recipe as-is. Only shown/enabled where
-        # grading itself is offered (not "side" mode), and only enabled
-        # while grading is actually turned on.
+        # Strength slider: scales apply_bottom_up_color_correction()'s effect linearly,
+        # 0% = no-op, 100% = full recipe. Shown/enabled only where grading is offered.
         self.strength_slider = None
         self.strength_label = None
         if self.mode != "side":
@@ -307,14 +231,8 @@ class CropSetupDialog(QDialog):
             self.strength_slider.setEnabled(self.color_grade)
             self.strength_label.setEnabled(self.color_grade)
 
-        # "Advanced" mode: exposes all four Brightness/Contrast layer
-        # parameters (see video_crop._BC_LAYERS) directly, instead of the
-        # single strength knob that scales both layers together. The
-        # bottom camera's exposure varies enough across setups that
-        # sometimes one layer needs pushing harder than the other to get
-        # a clean result -- strength alone can't reach that, since it
-        # scales both layers by the same factor. Only offered alongside
-        # the strength slider (i.e. wherever grading itself is offered).
+        # "Advanced" mode exposes the per-layer brightness/contrast params (video_crop._BC_LAYERS)
+        # directly, instead of the single strength knob that scales both layers together.
         self.advanced_checkbox = None
         self.layer_sliders = None  # [(brightness_slider, brightness_label, contrast_slider, contrast_label), ...]
         if self.mode != "side":
@@ -409,9 +327,7 @@ class CropSetupDialog(QDialog):
                 row.addWidget(QLabel(f"Layer {i} contrast:"))
                 row.addWidget(c_slider, stretch=1)
                 row.addWidget(c_label)
-                # Wrapped in a QWidget (rather than added as a bare
-                # QHBoxLayout) so the whole row can be hidden as a unit --
-                # a QLayout itself has no setVisible, only its widgets do.
+                # Wrapped in a QWidget so the whole row can be hidden as a unit (QLayout has no setVisible).
                 row_widget = QWidget()
                 row_widget.setLayout(row)
                 row_widget.setVisible(False)  # advanced mode starts off
@@ -434,18 +350,14 @@ class CropSetupDialog(QDialog):
         if layer_rows is not None:
             for row_widget in layer_rows:
                 layout.addWidget(row_widget)
-        layout.addWidget(self.canvas, stretch=1)  # the one thing that should grow when the dialog is resized
+        layout.addWidget(self.canvas, stretch=1)  # grows when the dialog is resized
         layout.addWidget(self.info_label)
         layout.addLayout(nav_row)
         layout.addWidget(self.apply_all_btn)
         layout.addWidget(self.bulk_progress)
         layout.addWidget(self.bulk_log)
 
-        # Dialog is resizable by default (no setFixedSize anywhere in this
-        # class); just pick a sensible starting size instead of whatever
-        # Qt's layout would otherwise shrink-to-fit, and cap it well under
-        # the screen so it opens fully on-screen regardless of the source
-        # video's native resolution.
+        # Pick a sensible starting size, capped well under the screen so it opens fully on-screen.
         screen = QApplication.primaryScreen()
         avail = screen.availableGeometry() if screen else None
         if avail is not None:
@@ -468,7 +380,7 @@ class CropSetupDialog(QDialog):
             return self.bottomup_radio.isChecked()
         if self.mode == "bottom":
             return self.grade_checkbox.isChecked()
-        return False  # "side" -- grading was never offered, not just off by default
+        return False  # "side": grading isn't offered
 
     @property
     def color_grade_strength(self) -> float:
@@ -482,9 +394,8 @@ class CropSetupDialog(QDialog):
 
     @property
     def color_grade_layers(self) -> list[tuple[float, float]] | None:
-        """Explicit per-layer (brightness, contrast) values from the
-        Advanced sliders, or None to fall back to color_grade_strength
-        scaling the default recipe (see apply_bottom_up_color_correction)."""
+        """Explicit per-layer (brightness, contrast) values from the Advanced sliders, or None to
+        fall back to color_grade_strength scaling the default recipe."""
         if not self.advanced or self.layer_sliders is None:
             return None
         return [(b_slider.value(), c_slider.value()) for b_slider, _, c_slider, _ in self.layer_sliders]
@@ -530,12 +441,8 @@ class CropSetupDialog(QDialog):
             c_label.setEnabled(enabled)
 
     def _update_preview(self):
-        """Re-renders the canvas's displayed frame from the last-loaded
-        raw frame -- called whenever the angle toggle, strength slider,
-        or advanced per-layer sliders change, so the preview reflects
-        what the crop will actually produce without re-reading the
-        video. Preserves the current crop box position (set_frame
-        re-clamps rather than resetting it)."""
+        """Re-renders the canvas's displayed frame from the last-loaded raw frame, reflecting
+        the current color-grade settings without re-reading the video."""
         if self._current_raw_frame is None:
             return
         frame = self._current_raw_frame
@@ -559,10 +466,7 @@ class CropSetupDialog(QDialog):
         self.idx = idx
         video_path = self.session_videos[idx]
         try:
-            # A frame from partway through the recording, not frame 0 --
-            # frame 0 is frequently just the empty tunnel/rig before the
-            # rat is placed in it, which makes positioning the crop box
-            # (and judging the color-correction preview) impossible.
+            # A frame from partway through the recording, not frame 0, which is often empty.
             frame = grab_middle_frame(video_path)
         except Exception as exc:
             QMessageBox.warning(self, "Couldn't load video", f"Could not read {video_path.name}:\n{exc}")
@@ -695,9 +599,7 @@ class CropSetupDialog(QDialog):
         self.bulk_progress.setValue(done)
 
     def _on_bulk_video_done(self, video_path_str):
-        # Recorded incrementally (rather than only at the very end) so a
-        # later failure in the same batch doesn't leave already-cropped
-        # videos looking un-positioned in the cache.
+        # Recorded incrementally so a later failure doesn't leave already-cropped videos unpositioned.
         key = video_key(Path(video_path_str), self.input_folder)
         self.positions[key] = list(self._bulk_xy)
         vc.save_positions(self.positions_path, self.positions)

@@ -46,28 +46,11 @@ _COLOR_TOKEN = "color"
 
 def model_trained_on_color(model_dir: Path) -> bool:
     """Whether ``model_dir`` was trained on genuine color content, judged
-    by a ``color`` token in the model directory's own name.
-
-    This is deliberately NOT read from sleap-nn's own
-    ``ensure_rgb``/``ensure_grayscale`` training-config fields (see
-    ``_read_color_mode``) -- those only describe the channel *shape* a
-    model expects (3-channel vs 1-channel), not the actual pixel content
-    it was trained on. Content is decided independently, upstream, by
-    :mod:`alligaitor.preprocessing`'s grayscale re-encode (or an
-    equivalent conversion done by hand before labeling) -- e.g. the
-    existing side model is ``ensure_rgb: true``-shaped (matches its
-    ConvNeXt backbone) but was still trained on force-grayscale-converted,
-    achromatic content, so shape alone would give the wrong answer here.
-
-    Instead this follows the same convention every model directory here
-    already uses to record what makes it different from the last one
-    (``ConvNeXt``, ``single_instance``, ``n=252``, ...): name a
-    color-trained model's directory with ``color`` as one of its
-    ``.``/``_``/``-``-delimited components (e.g.
-    ``alliGAITor_bottom_slim_v1.1.0.color.n=310``) and it's picked up
-    automatically, no separate marker file or registration step needed.
-    A directory name without that token is assumed grayscale-only -- the
-    correct read for every model trained so far.
+    by a ``color`` token in the model directory's own name (e.g.
+    ``..._color_n=310``). This is separate from the model's
+    ``ensure_rgb``/``ensure_grayscale`` channel shape (see
+    ``_read_color_mode``), which describes input shape, not training
+    content. A directory name without the token is assumed grayscale-only.
     """
     parts = re.split(r"[^a-zA-Z0-9]+", Path(model_dir).name.lower())
     return _COLOR_TOKEN in parts
@@ -75,16 +58,7 @@ def model_trained_on_color(model_dir: Path) -> bool:
 
 def _read_color_mode(model_dir: Path) -> "tuple[Optional[bool], Optional[bool]]":
     """Read ``(ensure_rgb, ensure_grayscale)`` from a model's own training
-    config, or ``(None, None)`` if that config can't be found/parsed.
-
-    The model directory is the single source of truth for what color mode
-    a model expects -- it's set once at training time and every consumer
-    (inference's own color-mode flags, and whether to strip color from the
-    input video before inference even runs -- see ``run_inference``'s
-    ``force_grayscale``) should derive from it rather than assuming every
-    model is grayscale, which stops being true the moment a color-trained
-    model exists alongside the grayscale ones.
-    """
+    config, or ``(None, None)`` if that config can't be found/parsed."""
     config_path = model_dir / "training_config.yaml"
     if not config_path.exists():
         config_path = model_dir / "initial_config.yaml"
@@ -110,16 +84,9 @@ def _read_color_mode(model_dir: Path) -> "tuple[Optional[bool], Optional[bool]]"
 
 
 def _color_mode_flags(model_dir: Path) -> List[str]:
-    """Build explicit ``--ensure_rgb``/``--ensure_grayscale`` flags for a model.
-
-    ``sleap-nn predict`` is documented to fall back to the values recorded
-    in the model's own ``training_config.yaml`` when these are left unset,
-    but that fallback happens on the far side of a subprocess call and a
-    silent mismatch (e.g. feeding an RGB-trained model grayscale input, or
-    vice versa) degrades accuracy without raising an error. Reading the
-    training config here and passing the flags explicitly makes the
-    color mode an assertion instead of an assumption.
-    """
+    """Build explicit ``--ensure_rgb``/``--ensure_grayscale`` flags for a
+    model, so a color-mode mismatch fails loudly instead of silently
+    degrading accuracy via ``sleap-nn predict``'s own fallback."""
     ensure_rgb, ensure_grayscale = _read_color_mode(model_dir)
     if ensure_rgb is None:
         return []
@@ -151,48 +118,20 @@ def run_inference(
         output_path: Destination ``.slp`` path. Defaults to
             ``<video_path>.predictions.slp``.
         device: Torch device to run on (``auto``, ``cpu``, ``cuda``, ``mps``).
-        tracking: Whether to run SLEAP-NN's tracker on the predictions.
-            These are single-instance models, so tracking is only useful
-            here for its identity-smoothing effect on left/right paw
-            flicker between frames.
-        force_grayscale: Whether to re-encode the video to true
-            single-channel grayscale content (see
-            :mod:`alligaitor.preprocessing`) before inference, stripping
-            any color/chroma content regardless of the channel *count*
-            ``model_dir`` expects. Left as ``None`` (the default), this
-            is decided by :func:`model_trained_on_color` -- grayscale is
-            forced unless ``model_dir``'s own name has a ``color`` token,
-            so color-trained and grayscale-trained models can coexist
-            without the caller having to know which is which.
-            Pass ``True``/``False`` explicitly to override -- e.g.
-            ``False`` if ``video_path`` is already a verified
-            grayscale-content file and re-encoding would be wasted work.
-        peak_threshold: Minimum confidence map value for a detection to be
-            kept; anything below is dropped entirely rather than returned
-            as a low-confidence point. Defaults to ``sleap-nn predict``'s
-            own default (``0.2``) when left as ``None``. Lower this to
-            compare against SLEAP's GUI inference, which may use a
-            different default.
-        log: Receives discrete one-off messages (the command being run;
-            the full subprocess output if it fails -- see
-            :mod:`alligaitor.subprocess_streaming`).
-        progress: Receives ``sleap-nn predict``'s own live tqdm progress
-            output as it runs -- repeated calls for what's conceptually
-            the same redrawing line, as opposed to ``log``'s discrete
-            messages, so a caller that wants to show that in place (the
-            GUI does) can tell the two apart. Defaults to ``log`` if not
-            given.
-        html_progress: If True, ``progress`` receives an HTML rendering
-            of ``sleap-nn predict``'s own colored progress bar instead
-            of plain text -- for a caller wired up to a rich-text widget
-            (the GUI is; see :mod:`alligaitor.ansi_html`). Leave False
-            for a plain-text/print()-based ``progress``.
+        tracking: Whether to run SLEAP-NN's tracker on the predictions,
+            for its identity-smoothing effect on left/right paw flicker.
+        force_grayscale: Whether to re-encode the video to grayscale
+            before inference. Defaults to :func:`model_trained_on_color`'s
+            inverse when left ``None``.
+        peak_threshold: Minimum confidence for a detection to be kept.
+            Defaults to ``sleap-nn predict``'s own default (``0.2``).
+        log: Receives discrete one-off messages.
+        progress: Receives ``sleap-nn predict``'s live tqdm progress
+            output. Defaults to ``log`` if not given.
+        html_progress: If True, ``progress`` receives an HTML rendering of
+            the colored progress bar instead of plain text.
         on_redraw_closed: Forwarded to
-            :func:`alligaitor.subprocess_streaming.stream_subprocess` --
-            called whenever a redrawn progress line's definitive final
-            state has just been sent to ``progress``, so a caller
-            redrawing in place can start the next update fresh instead
-            of immediately overwriting it.
+            :func:`alligaitor.subprocess_streaming.stream_subprocess`.
 
     Returns:
         Path to the written ``.slp`` predictions file.
@@ -205,16 +144,9 @@ def run_inference(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if output_path.exists():
-        # A prior run already wrote these predictions -- reuse them rather
-        # than re-running the (expensive, GPU-bound) sleap-nn subprocess
-        # for no reason. This is what makes reset.py's "--output-only"
-        # tier (clear 3D output + report, keep predictions) actually save
-        # time on a re-run instead of just documenting an intent that
-        # never took effect: a job re-run after only a gait-setting
-        # change now skips straight to triangulation for every session
-        # whose .slp files are still on disk. Delete the .slp (reset.py's
-        # default/--all tiers do) to force fresh inference, e.g. after
-        # switching models.
+        # Reuse prior predictions rather than re-running the expensive,
+        # GPU-bound sleap-nn subprocess. Delete the .slp to force fresh
+        # inference.
         log(f"  Reusing existing predictions: {output_path}")
         return output_path
 
@@ -275,8 +207,7 @@ def load_predictions(slp_path: Path) -> PoseTrack2D:
         return PoseTrack2D(node_names=node_names, points=points, scores=scores)
 
     # Mean confidence per (frame, instance), skipping NaN nodes without
-    # nanmean's "Mean of empty slice" warning on all-NaN instances (frames
-    # with zero real detections still occupy a slot in this array).
+    # nanmean's "Mean of empty slice" warning on all-NaN instances.
     conf = points_all[..., 2]
     valid = ~np.isnan(conf)
     counts = valid.sum(axis=2)

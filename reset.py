@@ -1,8 +1,6 @@
 """
-Clears cached/generated data for a queued GUI job so you can re-run part
-or all of the pipeline from scratch -- handy for testing, or after
-changing a model/gait setting that only invalidates some of a job's
-output.
+Clears cached/generated data for a queued GUI job so you can re-run part or all of the
+pipeline from scratch.
 
 Usage:
     python reset.py --job "Cohort 1"               # predictions + 3D output + report (default)
@@ -11,17 +9,9 @@ Usage:
     python reset.py --job "Cohort 1" --yes          # skip the confirmation prompt
     python reset.py --list-jobs                     # list queued group names and exit
 
-``crop_positions.json`` is never touched by any of these, including
-``--all`` -- unlike RATlab-NOR's object coordinates, it's a position
-cache rather than setup state that gates job readiness, so a later
-re-crop resumes from cached positions instead of re-asking. This module
-is also what ``gui/main_window.py``'s Reset menu calls directly
-(``describe_job_targets``/``perform_job_reset``), so the CLI and GUI stay
-in exact agreement about what each tier clears.
-
-Modeled on RATlab-NOR's reset.py, simplified: alliGAITor has no "legacy
-single-folder" CLI mode to preserve alongside the job queue, since every
-run has always been config.yaml/group-based.
+``crop_positions.json`` is never touched by any of these, including ``--all``. This module
+is also what ``gui/main_window.py``'s Reset menu calls directly, so the CLI and GUI agree
+about what each tier clears.
 """
 
 from __future__ import annotations
@@ -71,8 +61,7 @@ def _session_names(job: Job) -> List[str]:
 # ---------------------------------------------------------------------------
 
 def describe_job_targets(job: Job, clear_predictions=False, clear_output=False, clear_crops=False) -> List[str]:
-    """Human-readable list of what perform_job_reset() would touch, for
-    confirmation prompts/dialogs -- doesn't delete anything."""
+    """Human-readable list of what perform_job_reset() would touch. Doesn't delete anything."""
     lines = []
     sessions = _session_names(job)
     if clear_predictions:
@@ -90,11 +79,10 @@ def describe_job_targets(job: Job, clear_predictions=False, clear_output=False, 
 
 def perform_job_reset(job: Job, clear_predictions=False, clear_output=False, clear_crops=False, log=print) -> int:
     """Clears one job's own cache/output -- does not touch any other job.
-    Predictions, 3D output, and cropped videos are cleared independently
-    (see the module docstring for why clear_output alone keeps cached
-    .slp predictions -- a re-run reuses them instead of re-tracking,
-    useful after changing a gait-only setting). ``crop_positions.json``
-    is preserved in every case."""
+
+    Predictions, 3D output, and cropped videos are cleared independently.
+    ``crop_positions.json`` is preserved in every case.
+    """
     total = 0
     sessions = _session_names(job)
 
@@ -155,7 +143,7 @@ def main() -> None:
     parser.add_argument("--list-jobs", action="store_true", help="list queued group names and exit")
     args = parser.parse_args()
 
-    app_data_dir = default_app_data_dir(REPO_DIR)
+    app_data_dir = default_app_data_dir()
 
     if args.list_jobs:
         queue = JobQueue(app_data_dir).load()
@@ -198,11 +186,8 @@ def main() -> None:
     fresh = queue.get(job.id)
     if fresh is not None:
         from job_queue import JobStatus, refresh_job_readiness
-        # NEEDS_CROP is always in refresh_job_readiness's refreshable set,
-        # regardless of whether this job was previously DONE/FAILED/
-        # CANCELED -- refresh then promotes it back to READY if the
-        # cropped videos are still all in place (predictions/output-only
-        # reset), or leaves it at NEEDS_CROP if not (--all).
+        # Refresh promotes back to READY if cropped videos are still in place, or leaves
+        # it at NEEDS_CROP otherwise.
         fresh.status = JobStatus.NEEDS_CROP
         refresh_job_readiness(fresh)
         queue.update(fresh)

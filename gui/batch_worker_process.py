@@ -1,24 +1,15 @@
 """
 Runs queued jobs' pipeline (``alligaitor.pipeline.run_group``) in a
-separate OS process, one job at a time -- kept out of the GUI process for
-the same reason ``tools/crop_worker_process.py`` is: SLEAP-NN inference
-(itself a subprocess) and heavy video I/O alongside a live Qt event loop
-is a real crash risk, not just a performance concern, and a failure here
-shouldn't take the GUI down with it.
+separate OS process, one job at a time, so SLEAP-NN inference and heavy
+video I/O can't crash the GUI's Qt event loop.
 
-Stop only takes effect between jobs, not mid-job -- ``run_group()`` is one
-long blocking call per job with no internal cancellation point, so a job
-already in progress when Stop is requested always finishes (or fails) on
-its own before the run actually halts.
-
-Ported from RATlab-NOR's gui/batch_worker_process.py: only the
-process/queue plumbing carries over, since alliGAITor's actual per-job
-work (``alligaitor.pipeline.run_group``) has nothing in common with NOR's
-per-video sniff-scoring loop.
+Stop only takes effect between jobs, not mid-job: ``run_group()`` is one
+long blocking call per job with no internal cancellation point.
 """
 
 from __future__ import annotations
 
+import os
 import sys
 import traceback
 from pathlib import Path
@@ -26,6 +17,11 @@ from pathlib import Path
 
 def run_batch_worker(repo_dir: str, job_dicts: list, queue, stop_event,
                       device: str = "auto", tracking: bool = False) -> None:
+    # New POSIX process group so BatchRunner.force_stop's os.killpg() also
+    # reaches any `sleap-nn predict` subprocess, not just this process.
+    if hasattr(os, "setpgrp"):
+        os.setpgrp()
+
     repo_dir = Path(repo_dir)
     for p in (repo_dir, repo_dir / "gui"):
         if str(p) not in sys.path:
@@ -39,22 +35,13 @@ def run_batch_worker(repo_dir: str, job_dicts: list, queue, stop_event,
         queue.put(("log", message))
 
     def progress(message: str):
-        # Live tqdm-style line from inference (see
-        # alligaitor.subprocess_streaming) -- kept as its own message
-        # kind, not "log", so the GUI can redraw it in place instead of
-        # appending a new line for every update (this is what makes a
-        # long-running session's inference stage visible while it's
-        # happening, instead of the log going quiet and looking hung).
+        # Live tqdm-style line from inference; sent separately from "log"
+        # so the GUI can redraw it in place instead of appending lines.
         queue.put(("progress", message))
 
     def on_redraw_closed():
-        # A redrawn line's definitive final state was just sent via
-        # progress() above -- tells the GUI to start the next progress
-        # update on a fresh line instead of overwriting that final state
-        # (matters when inference prints more than one tqdm bar in
-        # sequence on the same terminal line; without this, one bar's
-        # true completion flashes on screen for an instant before the
-        # next bar's first redraw immediately overwrites it in place).
+        # Redrawn line's final state was just sent; next progress update
+        # should start on a fresh line.
         queue.put(("progress_closed",))
 
     for job_dict in job_dicts:

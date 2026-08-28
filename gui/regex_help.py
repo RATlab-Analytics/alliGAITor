@@ -1,10 +1,6 @@
 """
 A small collapsible "How regex works" panel, shown next to the id/camera
-regex fields in both the Preferences dialog (default regexes) and the
-group config editor (per-job regexes) -- these fields are aimed at lab
-members setting up a rig, not necessarily anyone who's written a regex
-before, so a plain-language reference belongs right where they're typed,
-not just in a README.
+regex fields in the Preferences dialog and the group config editor.
 """
 
 from __future__ import annotations
@@ -37,27 +33,14 @@ each of a session's three videos should produce a different camera token.</p>
 
 def shrink_window_to_fit(widget: QWidget) -> None:
     """Force ``widget``'s top-level window to resize down to fit its
-    current content.
+    current content. Qt only auto-grows a shown top-level widget on a
+    layout change, never auto-shrinks it, so this walks up the parent
+    chain recomputing layouts before resizing to a fresh sizeHint.
 
-    A plain ``window.adjustSize()`` doesn't shrink a window back down
-    after a child widget's visibility changes made its content smaller --
-    Qt only auto-*grows* a shown top-level widget to satisfy a layout
-    change, never auto-shrinks it. This forces every layout between
-    ``widget`` and the top-level window to actually recompute
-    (``updateGeometry()`` + ``layout().activate()``, walking up the
-    parent chain) before reading a fresh ``sizeHint()`` back off the
-    window and resizing to it.
-
-    This is *not* sufficient on its own when ``widget`` sits inside a
-    QTabWidget: QTabWidget's internal QStackedWidget is documented to
-    size itself for the largest page it's ever shown, not the current
-    one, and that has nothing to do with cached/stale sizeHints -- it's
-    the actual intended behavior, so no amount of invalidating layouts
-    changes what it reports. A tabbed container needs to bypass
-    QStackedWidget's own sizeHint entirely (see
-    ``_PreferencesDialog._sync_dialog_size`` in main_window.py for how);
-    this function alone only handles the non-tabbed case (e.g.
-    group_config_dialog.py's scroll area).
+    Not sufficient when ``widget`` sits inside a QTabWidget, since its
+    internal QStackedWidget sizes itself for the largest page it's ever
+    shown; see ``_PreferencesDialog._sync_dialog_size`` in main_window.py
+    for that case.
     """
     window = widget.window()
     if window is None:
@@ -80,12 +63,9 @@ def build_regex_help_panel(parent=None, on_toggled=None) -> QWidget:
     """Returns a widget with a collapsed-by-default toggle button; add it
     to a layout right after the regex fields it explains.
 
-    ``on_toggled``, if given, is called (with no arguments) after the
-    panel's own visibility change -- for an embedder where
-    :func:`shrink_window_to_fit` isn't enough on its own (a QTabWidget
-    page; see its docstring), so the embedder can run its own resize
-    logic instead of the default. When omitted, this panel resizes its
-    own top-level window via :func:`shrink_window_to_fit`.
+    ``on_toggled``, if given, is called after the panel's visibility
+    change so the embedder can run its own resize logic (needed inside a
+    QTabWidget page). Otherwise defaults to :func:`shrink_window_to_fit`.
     """
     container = QWidget(parent)
     layout = QVBoxLayout(container)
@@ -107,8 +87,7 @@ def build_regex_help_panel(parent=None, on_toggled=None) -> QWidget:
     def _on_toggled(checked: bool):
         toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
         help_label.setVisible(checked)
-        # Deferred one event-loop tick so this runs after the show/hide
-        # has actually been processed, not before.
+        # Deferred one tick so this runs after the show/hide is processed.
         if on_toggled is not None:
             QTimer.singleShot(0, on_toggled)
         else:

@@ -1,21 +1,9 @@
-"""
-Runs video_crop.crop_folder() (or the per-position variant) in a
-separate OS process -- OpenCV video I/O (reads every frame of every
-video via cv2.VideoCapture) running alongside an active Qt event loop in
-the same process is a real macOS segfault risk once it's on anything
-other than the main thread, and cropping a whole folder can take a
-while -- long enough that it needs to not block the GUI, i.e. it can't
-just run synchronously on the main thread either.
+"""Runs video_crop.crop_folder() (or the per-position variant) in a separate OS process, since
+OpenCV video I/O alongside an active Qt event loop off the main thread risks a macOS segfault,
+and a full-folder crop can take too long to run synchronously on the main thread.
 
-Ported from RATlab-NOR's gui/crop_worker_process.py unchanged apart from
-the sys.path anchor argument being renamed from nor_classifier_dir to
-tools_dir (this project has no "classifier" concept -- it's just the
-folder video_crop.py lives in).
-
-Message-passing contract: a multiprocessing.Queue of small plain-data
-tuples, and a stop_event (multiprocessing.Event) checked between videos
-for a clean "finish the current video, then stop" cancel.
-"""
+Reports progress via a multiprocessing.Queue of plain-data tuples, and checks a stop_event
+between videos for a clean "finish current video, then stop" cancel."""
 
 from __future__ import annotations
 
@@ -86,17 +74,10 @@ def run_crop_worker_positions(tools_dir: str, input_folder: str, output_folder: 
                                positions: list, width: int, height: int, queue, stop_event,
                                color_grade: bool = False, color_grade_strength: float = 1.0,
                                color_grade_layers=None):
-    """Like run_crop_worker(), but each video has its own (x, y) --
-    `positions` is a plain list of (video_path_str, x, y) tuples (not a
-    dict, to keep this a simple pickle-safe argument across the process
-    boundary). Used by CropSetupDialog's "use this position for all
-    remaining" bulk action.
-
-    Emits ("video_done", video_path_str) after each video that
-    successfully crops, so the GUI can persist that video's position to
-    the on-disk cache incrementally -- rather than only finding out
-    all-or-nothing at the end, which would leave successfully-cropped
-    videos looking unrecorded if a later one in the batch fails."""
+    """Like run_crop_worker(), but each video has its own (x, y): `positions` is a plain list of
+    (video_path_str, x, y) tuples, pickle-safe across the process boundary. Emits
+    ("video_done", video_path_str) after each successful crop so the GUI can persist that video's
+    position incrementally, rather than only finding out all-or-nothing at the end."""
     if tools_dir not in sys.path:
         sys.path.insert(0, tools_dir)
 

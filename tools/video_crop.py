@@ -1,30 +1,9 @@
-"""
-Crops videos down to a fixed target size -- for footage recorded at some
-resolution other than what a model was trained on (see config.py's
-CROP_TARGET_WIDTH/HEIGHT). Deliberately explicit/visual (via a GUI crop
-dialog, wired in later) rather than letting the 2D pose model's own
-inference-time preprocessing pad or resize oversized frames implicitly,
-since a resize (as opposed to a pixel-for-pixel crop) would distort the
-pixel-space keypoint coordinates that triangulation depends on.
+"""Crops videos to a fixed target size, for footage recorded at a resolution other than what a
+model was trained on. Uses an explicit pixel-for-pixel crop rather than a resize, since a resize
+would distort the pixel-space keypoint coordinates that triangulation depends on.
 
-Ported from RATlab-NOR (github.com/RATlab-Analytics/RATlab-NOR,
-video_crop.py) unchanged -- the module was already fully generic (width/
-height/x/y are parameters, nothing hardcoded to NOR's own 294x292 crop
-size), so alliGAITor's 1280x170 tunnel-strip crop is just a different
-config value, not a code change. See config.py's CROP_TARGET_WIDTH/HEIGHT.
-
-No GUI/Qt dependency -- usable from the CLI, tests, or a GUI worker
-process alike. Pipes raw frames to ffmpeg directly rather than
-cv2.VideoWriter, since cv2.VideoWriter's built-in encoders were confirmed
-(in RATlab-NOR) to visibly degrade quality across a full sequence.
-
-alliGAITor-specific note: unlike NOR's roughly-square crop, this is a
-wide horizontal strip (1280x170, ~1/10 the source frame height) --
-video_crop.py itself needs no changes for that, but when wiring up the
-GUI crop dialog later, double-check the crop-rectangle canvas still
-renders/drags sanely for a very short, wide box (RATlab-NOR's
-CropSetupDialog was built and tested against a much more square crop).
-"""
+No GUI/Qt dependency. Pipes raw frames to ffmpeg directly rather than cv2.VideoWriter, whose
+built-in encoders visibly degrade quality across a full sequence."""
 
 from __future__ import annotations
 
@@ -43,45 +22,15 @@ _FFMPEG_CRF = 12
 
 # --- bottom-up color correction ---------------------------------------
 #
-# Ground truth from the colleague who actually did this in Photoshop
-# (not reverse-engineered from pixel stats): two stacked Brightness/
-# Contrast adjustment layers, each set to roughly Brightness -100 /
-# Contrast +100 (the first) and Brightness -100 / Contrast +75-100 (the
-# second). No colorize/gradient-map/hue-remap step at all -- every
-# earlier theory involving a constructed hue gradient or color-balance
-# zone shift was wrong (confirmed by testing this exact recipe on
-# same-rig side-angle test frames: it reproduces the black background,
-# yellow-green rat, and red/green speckle noise closely without any
-# hue-remapping step).
+# Two stacked Photoshop-style Brightness/Contrast layers. Because B/C applies the same nonlinear
+# curve independently to each channel, at high contrast tiny real per-channel differences (color
+# cast, sensor noise, fur/skin reflectance) get blown into saturated per-channel outputs -- which
+# is how this produces color from a nominally white/gray rat.
 #
-# Why this alone produces color from a nominally-white/gray rat: PS's
-# Brightness/Contrast applies the *same* nonlinear curve independently
-# to R, G, and B. At Contrast +100 that curve is steep enough to swing
-# from ~0 to ~255 across a narrow input range, so tiny real per-channel
-# differences (a faint warm-light color cast, sensor/compression chroma
-# noise, real reflectance differences between fur and paw skin) that are
-# invisible in the original frame get blown into strongly different
-# per-channel outputs -- one channel clips to 255 while another clips to
-# 0 -- which is what shows up as saturated, sometimes-inconsistent color.
-# Doing it twice compounds that steepness further, which is also why the
-# result looks posterized/high-contrast rather than smoothly graded.
-#
-# _BC_LAYERS is the *full-strength* (100%) recipe -- a plain list so a
-# third stacked layer (or different per-layer values) can be added/tuned
-# without touching apply_bottom_up_color_correction() itself. Re-tune
-# against more side-angle test frames if the vividness looks off once
-# this runs on real bottom-up footage.
-#
-# The bottom camera view has more ambient light than the side-angle test
-# footage this was tuned against, so full strength looks starker there
-# than intended -- hence `strength` on apply_bottom_up_color_correction()
-# below: it linearly scales every layer's brightness/contrast toward 0
-# (identity/no-op) at strength=0.0, full recipe at strength=1.0. This is
-# what the GUI's strength slider drives (see crop_setup_dialog.py).
-#
-# Side-angle footage was never run through this originally and should
-# stay untouched -- hence this being an opt-in toggle (color_grade=False
-# by default everywhere below) rather than always-on.
+# _BC_LAYERS is the full-strength (100%) recipe; `strength` on apply_bottom_up_color_correction()
+# scales it linearly toward a no-op, since the bottom camera's brighter ambient light needs a
+# gentler correction than this was tuned against. Opt-in only (color_grade=False by default) --
+# side-angle footage should stay untouched.
 _BC_LAYERS = [
     (-100, 100),  # (brightness, contrast), Photoshop's -100..100 dialog range
     (-100, 75),
@@ -89,12 +38,9 @@ _BC_LAYERS = [
 
 
 def _apply_brightness_contrast(frame: np.ndarray, brightness: float, contrast: float) -> np.ndarray:
-    """One Photoshop-style (legacy) Brightness/Contrast adjustment layer,
-    applied identically to every channel -- brightness/contrast in
-    Photoshop's -100..100 dialog range. Operates in float and does NOT
-    clip to uint8 internally, so stacking layers (see _BC_LAYERS) composes
-    the way stacked Photoshop adjustment layers do rather than clipping
-    prematurely between layers."""
+    """One Photoshop-style Brightness/Contrast layer, applied identically to every channel.
+    Operates in float and doesn't clip to uint8 internally, so stacking layers (_BC_LAYERS)
+    composes without clipping prematurely between them."""
     out = frame.astype(np.float32)
     if brightness != 0:
         if brightness > 0:
@@ -112,22 +58,9 @@ def _apply_brightness_contrast(frame: np.ndarray, brightness: float, contrast: f
 def apply_bottom_up_color_correction(
     frame_bgr: np.ndarray, strength: float = 1.0, layers: list[tuple[float, float]] | None = None,
 ) -> np.ndarray:
-    """Stacks two Brightness/Contrast layers (see module docstring above)
-    on a single BGR frame (uint8), clipping to uint8 only once at the end.
-
-    strength scales every layer's brightness/contrast linearly -- 1.0 is
-    the full _BC_LAYERS recipe as documented by the colleague who did
-    this in Photoshop, 0.0 is a no-op, values in between fade toward that
-    no-op (e.g. for the bottom camera's brighter ambient light needing a
-    less stark correction than the side-angle test frames this was tuned
-    against).
-
-    layers, if given, overrides _BC_LAYERS/strength entirely with an
-    explicit [(layer1_brightness, layer1_contrast), (layer2_brightness,
-    layer2_contrast)] pair in Photoshop's -100..100 range -- this is what
-    the GUI's "Advanced" per-layer sliders drive (see
-    crop_setup_dialog.py), for hand-tuning the correction on input
-    exposures the single strength knob can't reach cleanly."""
+    """Stacks two Brightness/Contrast layers (see _BC_LAYERS) on a BGR uint8 frame, clipping only
+    once at the end. strength (0.0-1.0) scales every layer's brightness/contrast linearly toward
+    a no-op. layers, if given, overrides _BC_LAYERS/strength with explicit per-layer values."""
     if layers is None:
         strength = max(0.0, min(1.0, strength))
         layers = [(b * strength, c * strength) for b, c in _BC_LAYERS]
@@ -167,14 +100,12 @@ def probe_resolution(video_path) -> tuple[int, int] | None:
 
 
 def scan_resolutions(folder) -> dict[tuple[int, int], list[Path]]:
-    """Groups every video under `folder` by (width, height) -- the usual
-    first question before cropping: which videos already match the
-    target size, and which don't."""
+    """Groups every video under `folder` by (width, height)."""
     groups: dict[tuple[int, int], list[Path]] = {}
     for video_path in find_videos(folder):
         res = probe_resolution(video_path)
         if res is None:
-            res = (-1, -1)  # unreadable -- grouped together rather than dropped silently
+            res = (-1, -1)  # unreadable; grouped together rather than dropped silently
         groups.setdefault(res, []).append(video_path)
     return groups
 
@@ -186,20 +117,12 @@ class CropRegionError(ValueError):
 def crop_video(video_path, out_path, x: int, y: int, width: int, height: int,
                 log=print, color_grade: bool = False, color_grade_strength: float = 1.0,
                 color_grade_layers: list[tuple[float, float]] | None = None) -> Path:
-    """Crop a single video to the `width`x`height` window starting at
-    (x, y), writing to out_path. Raises CropRegionError if that window
-    doesn't fit inside the source frame -- never silently clamps, since a
-    silently-shifted crop would put keypoints at the wrong pixel
-    coordinates without any visible sign something's off.
+    """Crop a single video to the `width`x`height` window starting at (x, y), writing to out_path.
+    Raises CropRegionError if that window doesn't fit inside the source frame -- never silently
+    clamps, since a shifted crop would put keypoints at the wrong pixel coordinates unnoticed.
 
-    color_grade=True applies apply_bottom_up_color_correction() to every
-    cropped frame before it's written -- for bottom-up (tunnel) footage
-    only. Leave False for side-angle footage, which was never processed
-    this way. color_grade_strength (0.0-1.0) scales how strong that
-    correction is; ignored when color_grade is False. color_grade_layers,
-    if given, overrides color_grade_strength with explicit per-layer
-    (brightness, contrast) values -- see apply_bottom_up_color_correction().
-    """
+    color_grade=True applies apply_bottom_up_color_correction() to every frame before writing;
+    color_grade_strength and color_grade_layers are passed through to it."""
     video_path = Path(video_path)
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -230,9 +153,7 @@ def crop_video(video_path, out_path, x: int, y: int, width: int, height: int,
 
     ffmpeg_cmd = [
         ffmpeg_exe, "-y", "-loglevel", "error",
-        # -s must match the CROPPED frame size actually being piped below,
-        # not the source video's size -- ffmpeg trusts this blindly for a
-        # raw byte stream, it can't infer it from the data itself.
+        # -s must match the cropped frame size being piped below, not the source video's size.
         "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{width}x{height}", "-r", str(fps),
         "-i", "-",
         "-c:v", "libx264", "-crf", str(_FFMPEG_CRF), "-pix_fmt", "yuv420p",
@@ -285,15 +206,10 @@ def crop_folder(
     log=print, on_progress=None, color_grade: bool = False, color_grade_strength: float = 1.0,
     color_grade_layers: list[tuple[float, float]] | None = None,
 ) -> list[Path]:
-    """Crops every video under input_folder into the equivalent relative
-    path under output_folder. A video already exactly the target size
-    (at (0,0)) is copied through as-is rather than re-encoded, to avoid
-    a pointless quality-losing round trip through the codec -- unless
-    color_grade is set, in which case every video still needs to go
-    through crop_video() to actually get color-corrected.
-
-    on_progress(index, total), if given, is called before each video.
-    """
+    """Crops every video under input_folder into the equivalent relative path under output_folder.
+    A video already exactly the target size (at (0,0)) is copied through unchanged rather than
+    re-encoded, unless color_grade is set. on_progress(index, total), if given, is called before
+    each video."""
     input_folder = Path(input_folder)
     output_folder = Path(output_folder)
     videos = find_videos(input_folder)
@@ -323,9 +239,7 @@ def crop_folder(
     return written
 
 
-# --- per-video crop positions (for a future CropSetupDialog -- the ---
-# --- tunnel isn't guaranteed to be framed identically in every video, ---
-# --- unlike crop_folder()'s single position applied uniformly) --------
+# --- per-video crop positions ---
 
 def load_positions(positions_path) -> dict:
     positions_path = Path(positions_path)
@@ -348,9 +262,8 @@ def crop_videos_with_positions(
     log=print, on_progress=None, color_grade: bool = False, color_grade_strength: float = 1.0,
     color_grade_layers: list[tuple[float, float]] | None = None,
 ) -> list[Path]:
-    """Like crop_folder(), but each video gets its own (x, y) -- for
-    sessions where the camera/tunnel framing shifted between recordings
-    rather than staying fixed for the whole folder."""
+    """Like crop_folder(), but each video gets its own (x, y), for sessions where framing
+    shifted between recordings."""
     input_folder = Path(input_folder)
     output_folder = Path(output_folder)
     total = len(positions)

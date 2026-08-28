@@ -1,24 +1,11 @@
-"""Converts a line of ANSI-colored terminal text into HTML, so a Qt rich
-text widget can render it with (approximately) the same colors the
-terminal would have -- e.g. sleap-nn's tqdm progress bar, which colors
-the bar fill and percentage.
+"""Converts a line of ANSI-colored terminal text into HTML for a Qt rich
+text widget, approximating the terminal's colors (e.g. tqdm progress bars).
 
-Handles the SGI (Select Graphic Rendition, the ``...m``-terminated CSI
-subset that carries color/style rather than cursor movement) parameters
-tqdm/rich-based CLIs actually use: the standard and bright 16-color
-palette, 256-color, 24-bit truecolor, bold/italic/underline, and reverse
-video. Any other CSI sequence (cursor movement, line clearing, show/hide
-cursor, and so on) is stripped before the SGI codes are even parsed --
-meaningless once redrawn as static HTML rather than replayed into a real
-terminal, and left in place they'd otherwise show up as literal garbage
-text exactly the way an unstripped ``\\x1b[?25h`` cursor-show code once
-did in the plain-text log (see alligaitor.subprocess_streaming's own,
-narrower fix for that same class of bug).
-
-Whitespace is preserved with ``&nbsp;`` rather than relying on CSS
-``white-space: pre`` support, since a progress bar's alignment (spaces
-between the percentage, the bar, and the counts) has to survive however
-the HTML ends up rendered.
+Handles SGI (color/style) CSI sequences: 16/256-color, truecolor, bold/
+italic/underline, reverse video. Other CSI sequences (cursor movement,
+line clearing, etc.) are stripped first. Spaces are rendered as
+``&nbsp;`` so progress-bar alignment survives regardless of the widget's
+``white-space`` handling.
 """
 
 from __future__ import annotations
@@ -27,29 +14,14 @@ import html
 import re
 from typing import Dict, List, Optional
 
-# Matches only SGI sequences (color/style, "...m") -- run against the
-# input *after* _NON_SGI_CSI_RE below has already removed every other
-# kind of CSI sequence, so this never has to tell them apart itself.
+# Matches SGI (color/style) CSI sequences only; run after _NON_SGI_CSI_RE
+# has stripped every other CSI sequence.
 _SGI_RE = re.compile(r"\x1b\[([0-9;]*)m")
 
-# Any CSI sequence that ISN'T an SGI one -- same [0-?]*[ -/]* parameter/
-# intermediate-byte range as alligaitor.subprocess_streaming's own
-# _ANSI_ESCAPE_RE, but with the final byte restricted to everything in
-# '@'-'~' *except* 'm' (['@'-'l''n'-'~'], since 'm' sits alphabetically
-# between them), so SGI sequences are left for _SGI_RE to parse instead
-# of being swallowed here too. This runs first specifically because a
-# single buffered progress-bar redraw can contain both kinds mixed
-# together (e.g. tqdm wrapping a color code around a `\x1b[?25h`
-# cursor-show it emits mid-line) -- subprocess_streaming's own stripper
-# only ever sees the fully-cleaned *plain* copy it keeps for
-# deduplication, never the raw, still-ANSI-coded buffer this module
-# actually receives.
+# Matches any CSI sequence except SGI ones, so those are left for _SGI_RE.
 _NON_SGI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-ln-~]")
 
-# Approximate xterm/VS-Code-terminal palette -- close enough to whatever
-# the real terminal would have shown that colors are still
-# distinguishable and read as "the same bar", without claiming to be
-# any particular terminal's exact values.
+# Approximate xterm/VS-Code palette.
 _PALETTE_16: Dict[int, str] = {
     0: "#000000", 1: "#cd3131", 2: "#0dbc79", 3: "#e5e510",
     4: "#2472c8", 5: "#bc3fbc", 6: "#11a8cd", 7: "#e5e5e5",
@@ -71,9 +43,7 @@ def _ansi_256_to_hex(n: int) -> str:
 
 
 class _SgiState:
-    """Current text attributes as SGI codes accumulate -- reused as-is
-    across an entire line, since a redrawing progress bar typically only
-    resets/recolors partway through, not at the very start."""
+    """Current text attributes as SGI codes accumulate across a line."""
 
     def __init__(self):
         self.fg: Optional[str] = None
@@ -152,15 +122,8 @@ def _escape_preserving_spaces(text: str) -> str:
 
 def ansi_line_to_html(raw: str) -> str:
     """Converts one line of (possibly) ANSI-colored text to an HTML
-    fragment suitable for ``QTextCursor.insertHtml()``: color/bold/
-    italic/underline/reverse-video are rendered as inline-styled
-    ``<span>`` elements, literal text is HTML-escaped, and spaces are
-    turned into ``&nbsp;`` so alignment survives regardless of the rich
-    text engine's ``white-space`` support. Every CSI sequence that isn't
-    a color/style one (cursor movement, line clear, show/hide cursor,
-    ...) is stripped first -- see ``_NON_SGI_CSI_RE`` -- so it never
-    reaches the parser below and can't leak through as literal text.
-    """
+    fragment for ``QTextCursor.insertHtml()``. Color/style are rendered
+    as inline-styled ``<span>`` elements; other CSI sequences are stripped."""
     raw = _NON_SGI_CSI_RE.sub("", raw)
     state = _SgiState()
     parts: List[str] = []

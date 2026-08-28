@@ -1,14 +1,9 @@
 """
 Validation list: one row per session in a completed job, showing each
-paw's used-run duration (green if usable, red if not -- see
-alligaitor.validation.effective_usability), the fraction of the
-recording's crossings that paw was even visible in (for a multi-crossing
-session), and the fraction of paws usable overall, so a reviewer can spot
-problem sessions at a glance before double-clicking into the video
-(validation_video_dialog.py).
-
-Opened by double-clicking a DONE job in main_window.py's table, or via
-its "View Validation..." context-menu action.
+paw's used-run duration (green if usable, red if not), the fraction of
+crossings that paw was usable on, and overall usable-paw fraction.
+Opened by double-clicking a DONE job, or via its "View Validation..."
+context-menu action.
 """
 
 from __future__ import annotations
@@ -105,12 +100,17 @@ class ValidationListDialog(QDialog):
                 validation.usable_paws_with_fallback_warning(summary, flags_by_crossing)
                 if summary is not None else None
             )
+            usable_counts = (
+                validation.usable_crossing_counts(summary, flags_by_crossing)
+                if summary is not None else None
+            )
 
             self._rows.append({
                 "session": session,
                 "summary": summary,
                 "usability": usability,
                 "fallback_warning": fallback_warning,
+                "usable_counts": usable_counts,
                 "video_path": video_path,
             })
 
@@ -128,6 +128,7 @@ class ValidationListDialog(QDialog):
             summary = row["summary"]
             usability = row["usability"]
             fallback_warning = row["fallback_warning"]
+            usable_counts = row["usable_counts"]
 
             if usability is None:
                 session_item = QTableWidgetItem(f"{session.name}  (no validation data yet)")
@@ -141,9 +142,7 @@ class ValidationListDialog(QDialog):
 
             all_usable = all(usability.values())
             title_color = COLOR_USABLE if all_usable else COLOR_UNUSABLE
-            # A recording can hold several crossings (rat walks out, turns, walks
-            # back...). The per-paw columns below are rolled up across them by
-            # save_validation_summary, so say how many are behind that roll-up.
+            # A recording can hold several crossings, rolled up into the per-paw columns below.
             crossings = validation.crossings_or_fallback(summary)
             n_crossings = len(crossings)
             label = session.name if n_crossings <= 1 else f"{session.name}  ({n_crossings} crossings)"
@@ -154,11 +153,9 @@ class ValidationListDialog(QDialog):
             for col, paw in enumerate(ordered_paws(), start=1):
                 window = summary.get("paws", {}).get(paw)
                 duration_text = f"{window['duration_s']:.2f}s" if window else "0.00s"
-                n_visible = sum(1 for c in crossings if c.get("paws", {}).get(paw) is not None)
-                # Only worth showing once there's more than one crossing to
-                # be a fraction of -- a single-crossing session's fraction
-                # is always trivially 0/1 or 1/1 and would just be noise.
-                text = duration_text if n_crossings <= 1 else f"{duration_text}  ({n_visible}/{n_crossings})"
+                n_usable = usable_counts[paw]
+                # Only show the fraction when there's more than one crossing.
+                text = duration_text if n_crossings <= 1 else f"{duration_text}  ({n_usable}/{n_crossings})"
                 heavy_fallback = usability[paw] and fallback_warning.get(paw, False)
                 if not usability[paw]:
                     color = COLOR_UNUSABLE
@@ -168,7 +165,7 @@ class ValidationListDialog(QDialog):
                     color = COLOR_USABLE
                 item = QTableWidgetItem(text)
                 item.setForeground(QBrush(color))
-                tooltip = f"Visible (tracked) in {n_visible} of {n_crossings} crossing(s)"
+                tooltip = f"Usable in {n_usable} of {n_crossings} crossing(s)"
                 if heavy_fallback:
                     fraction = (window or {}).get("bottom_fallback_fraction", 0.0)
                     tooltip += f"\n{fraction:.0%} of this run came from the 2D bottom-camera fallback"

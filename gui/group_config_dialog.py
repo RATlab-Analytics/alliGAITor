@@ -1,16 +1,9 @@
 """
-Group config editor: builds one job's config.yaml (see
-alligaitor.config.PipelineConfig) from a folder of videos, an id/camera
-regex pair, a manual camera-role assignment, and a calibration.
-
-Opens automatically right after a job is added (first load) and again on
-every double-click (gui/main_window.py) -- see alligaitor.discovery for
-the auto-discovery this dialog drives live as the regex/role fields
-change.
-
-Model selection is deliberately NOT a field here -- it's app-wide, via
-the Model menu (gui/app_settings.py), applied to every job's run at
-run time; this dialog just blocks Save until one's been picked.
+Group config editor: builds one job's config.yaml from a folder of
+videos, an id/camera regex pair, a manual camera-role assignment, and a
+calibration. Opens automatically after a job is added, and again on
+every double-click. Model selection is app-wide (via the Model menu),
+not a field here; this dialog just blocks Save until one's picked.
 """
 
 from __future__ import annotations
@@ -66,16 +59,15 @@ def _file_row(initial_text: str = ""):
 
 
 class GroupConfigDialog(QDialog):
-    def __init__(self, job: Job, repo_dir: Path, app_data_dir: Path,
+    def __init__(self, job: Job, models_dir: Optional[Path], app_data_dir: Path,
                  existing_group_names: Set[str], parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Group Config — {job.group_name}")
         self.setMinimumSize(760, 700)
 
         self.job = job
-        self.repo_dir = Path(repo_dir)
         self.app_data_dir = Path(app_data_dir)
-        self.models_dir = self.repo_dir / "models"
+        self.models_dir = Path(models_dir) if models_dir else None
         self._existing_group_names = {n.lower() for n in existing_group_names}
 
         self.saved = False
@@ -145,15 +137,8 @@ class GroupConfigDialog(QDialog):
         layout.addWidget(regex_box)
 
         # -- camera roles --
-        # Thumbnails are keyed by *token*, not by role: pairing a preview
-        # with a role dropdown (as if the dropdown's current selection
-        # determined which frame to show) means the thumbnail is only
-        # ever correct once you've already gotten the role assignment
-        # right -- exactly backwards, since the thumbnail's whole job is
-        # to help you figure out the assignment in the first place. A
-        # token gallery, unambiguous and independent of what's currently
-        # selected in any dropdown, does that instead; the three role
-        # dropdowns below it just pick a token by name.
+        # Thumbnails are keyed by token, not by role, so previews stay
+        # correct regardless of the current dropdown selections.
         roles_box = QGroupBox("Camera roles")
         roles_layout = QVBoxLayout(roles_box)
 
@@ -163,10 +148,7 @@ class GroupConfigDialog(QDialog):
         self.token_gallery_layout.setContentsMargins(0, 0, 0, 0)
         roles_layout.addWidget(self.token_gallery)
 
-        # Side by side rather than stacked (QFormLayout rows): matches
-        # the gallery's own horizontal layout above, and three role
-        # pickers read fine in a row -- no need for the vertical space
-        # a label-per-row form would cost here.
+        # Side by side rather than stacked, to match the gallery above.
         role_row = QHBoxLayout()
         self.role_combos: Dict[str, QComboBox] = {}
         for role in _ROLES:
@@ -275,12 +257,8 @@ class GroupConfigDialog(QDialog):
             else get_default_bottom_fallback(self.app_data_dir)
         )
 
-        # Block textChanged -> _rescan while both fields are set here:
-        # setting id_regex_edit alone would otherwise fire a rescan with
-        # camera_regex_edit still at its old/empty text, which can crash
-        # discover_sessions on a regex with no capture group (see its
-        # own guard against that too -- this just avoids the wasted,
-        # visibly-erroring intermediate rescan in the first place).
+        # Block textChanged -> _rescan while both fields are set, so a
+        # rescan doesn't fire with one field still at its old/empty text.
         self.id_regex_edit.blockSignals(True)
         self.camera_regex_edit.blockSignals(True)
         config = self._existing_config
@@ -307,9 +285,8 @@ class GroupConfigDialog(QDialog):
             calib = config.calibration
             self.board_preset_combo.setCurrentText(calib.board_preset)
             # Save() sets every role's video to calib.output_path itself
-            # (a placeholder -- never actually read) when "use existing
-            # calibration file" was checked; that's the unambiguous
-            # signal for round-tripping which mode was in effect.
+            # when "use existing calibration file" was checked -- the
+            # signal used to round-trip which mode was in effect.
             used_existing_file = all(
                 calib.videos.get(role) == calib.output_path for role in _ROLES
             )
@@ -445,13 +422,9 @@ class GroupConfigDialog(QDialog):
         self._refresh_session_table()
 
     def _update_token_gallery(self, discovery: Optional[DiscoveryConfig]):
-        """Rebuilds the token->thumbnail gallery from scratch: one cell
-        per distinct camera token actually found in the input folder,
-        each labeled with that token and a preview frame from a
-        representative video -- independent of what's currently selected
-        in any of the three role dropdowns, so the preview a token shows
-        can never be wrong relative to some *other* token's dropdown
-        (unlike pairing a thumbnail with a role's current selection)."""
+        """Rebuilds the token->thumbnail gallery: one cell per distinct
+        camera token found in the input folder, each with a preview
+        frame from a representative video."""
         while self.token_gallery_layout.count():
             item = self.token_gallery_layout.takeAt(0)
             widget = item.widget()
@@ -576,10 +549,7 @@ class GroupConfigDialog(QDialog):
                 QMessageBox.warning(self, "Calibration file missing", "Pick an existing calibration (.toml) file.")
                 return
             output_path = Path(existing_path).resolve()
-            # _require_roles() only checks that these three keys are
-            # present, not that the paths exist -- they're never read,
-            # since pipeline._load_or_calibrate() loads output_path
-            # directly whenever it already exists instead of calibrating.
+            # These paths are never read; only the output_path is used.
             calib_videos = {role: output_path for role in _ROLES}
         else:
             calib_videos = {}
@@ -628,10 +598,7 @@ class GroupConfigDialog(QDialog):
             bottom_fallback=self.bottom_fallback_check.isChecked(),
         )
 
-        # Update the job's own fields (and therefore job.config_path,
-        # derived from output_folder) before writing, so the config is
-        # saved to wherever this save just set output_folder to -- not
-        # wherever it pointed before this dialog was opened.
+        # Update job fields (config_path derives from output_folder) before writing.
         self.job.group_name = group_name
         self.job.input_folder = input_folder
         self.job.output_folder = output_folder

@@ -18,28 +18,12 @@ from aniposelib.cameras import CameraGroup
 
 
 def _baseline_pose_3d_csv_path(session: SessionConfig) -> Path:
-    """Where :func:`run_session` writes the pre-fallback triangulation
-    when ``bottom_fallback`` is on -- a plain-triangulation reference
-    :func:`run_group` reads back to guard against the fallback ever
-    making an already-usable paw run worse (see
-    :func:`alligaitor.bottom_fallback.guard_against_regression`). A
-    shared helper so the two functions can't drift onto different
-    filenames for the same thing.
-    """
+    """Path for the pre-fallback triangulation CSV, shared by :func:`run_session` and :func:`run_group`."""
     return session.output_dir / f"{session.name}.pose_3d.pre_fallback.csv"
 
 
 def load_track(video_path: Path, slp_path: Path) -> PoseTrack2D:
-    """Load one camera view's 2D predictions, corrected into its uncropped source frame.
-
-    ``slp_path`` was predicted on ``video_path``, which is typically a
-    crop (the models are trained on cropped footage), so its keypoints
-    come out in that crop's own local pixel coordinates. Triangulation
-    needs coordinates in the same *uncropped* frame calibration was
-    computed against, so this adds back ``video_path``'s crop offset
-    (see :mod:`alligaitor.cropping`) -- a no-op if ``video_path`` isn't a
-    tracked crop.
-    """
+    """Load one camera view's 2D predictions, shifted from crop-local into uncropped frame coordinates."""
     track = inference.load_predictions(slp_path)
     offset_x, offset_y = cropping.crop_offset_for_video(video_path)
     if offset_x or offset_y:
@@ -65,25 +49,10 @@ def run_session(
     Args:
         session: Session configuration (video paths, output directory).
         models: Trained model directories.
-        cgroup: Calibrated camera group (see :mod:`alligaitor.calibration`).
-        device: Torch device passed through to SLEAP-NN inference.
+        cgroup: Calibrated camera group.
+        device: Torch device passed to SLEAP-NN inference.
         tracking: Whether to run SLEAP-NN's tracker during inference.
-        log: Forwarded to :func:`alligaitor.inference.run_inference` for
-            each of this session's three camera roles -- discrete
-            one-off messages (the command run, full output on failure).
-        progress: Forwarded to :func:`alligaitor.inference.run_inference`
-            -- the live tqdm-style progress line for whichever camera
-            role is currently running inference. Defaults to ``log`` if
-            not given (see that function's own docstring).
-        html_progress: Forwarded to :func:`alligaitor.inference.run_inference`
-            -- whether ``progress`` wants HTML-rendered color or plain text.
-        on_redraw_closed: Forwarded to
-            :func:`alligaitor.inference.run_inference` -- called whenever
-            a redrawn progress line's definitive final state has just
-            been sent to ``progress``.
         bottom_fallback: See :attr:`alligaitor.config.PipelineConfig.bottom_fallback`.
-            Imported and applied only when ``True``, so this experimental
-            path is never even loaded for a group that doesn't opt in.
 
     Returns:
         Path to the written 3D trajectory CSV.
@@ -103,15 +72,6 @@ def run_session(
         tracks[role] = load_track(video_path, slp_path)
         fps_by_role[role] = video_fps(video_path)
 
-    # triangulation.triangulate_axis_prioritized() also exists (see its
-    # docstring), but isn't used here: on real data it barely applies to
-    # paws at all (they almost never have all three cameras valid
-    # simultaneously) and measurably worsens body-node reprojection
-    # error, apparently because the calibration's side cameras disagree
-    # on world "up" by ~30 degrees (see
-    # calibration.world_up_direction's own warning), undermining the
-    # "sides are reliable for height" assumption it's built on. Revisit
-    # once that calibration issue is understood/fixed.
     baseline_pose_3d = triangulation.triangulate(tracks, cgroup, fps_by_role)
     pose_3d = baseline_pose_3d
     fallback_mask = None
@@ -119,16 +79,12 @@ def run_session(
         from alligaitor import bottom_fallback as _bottom_fallback  # local import: see PipelineConfig.bottom_fallback
 
         pose_3d, fallback_mask = _bottom_fallback.fill_gaps(baseline_pose_3d, tracks, cgroup, fps_by_role)
-    # Matches triangulation.align_tracks_by_time's choice of reference
-    # timeline: the pose is resampled onto the slowest camera's own frame
-    # times, so that view's fps gives the true seconds-per-row of pose_3d.
+    # Pose is resampled onto the slowest camera's frame times, so that fps is the true seconds-per-row.
     reference_fps = min(fps_by_role.values())
 
     csv_path = session.output_dir / f"{session.name}.pose_3d.csv"
     save_pose_3d_csv(pose_3d, reference_fps, csv_path, fallback_mask=fallback_mask)
     if bottom_fallback:
-        # Kept purely for run_group's regression guard (see
-        # _baseline_pose_3d_csv_path) -- not otherwise read by anything.
         save_pose_3d_csv(baseline_pose_3d, reference_fps, _baseline_pose_3d_csv_path(session))
     return csv_path
 
@@ -139,14 +95,8 @@ def save_pose_3d_csv(
     """Write a triangulated pose to a long-format CSV: frame, time_s, node, x, y, z, error, fallback.
 
     Args:
-        fallback_mask: Boolean ``(n_frames, n_nodes)`` array, ``True``
-            wherever that point came from
-            :func:`alligaitor.bottom_fallback.fill_gaps` rather than real
-            triangulation (see that function's return value). ``None``
-            (the default -- always the case when
-            ``PipelineConfig.bottom_fallback`` is off) writes the column
-            as all ``False``, so every ``pose_3d.csv`` has the same
-            schema regardless of whether the fallback ran.
+        fallback_mask: Boolean ``(n_frames, n_nodes)`` array, ``True`` where a point came from
+            the bottom-fallback fill rather than real triangulation. Defaults to all ``False``.
     """
     n_frames, n_nodes, _ = pose_3d.points.shape
     frame_idx, node_idx = np.meshgrid(np.arange(n_frames), np.arange(n_nodes), indexing="ij")
@@ -177,11 +127,9 @@ def _load_or_calibrate(calib_config) -> CameraGroup:
 
 
 def aligned_camera_validity(session: SessionConfig) -> "dict":
-    """Per paw, per camera role, whether that camera had a valid 2D
-    detection on each shared-timeline frame -- reloads and re-aligns
-    each role's cached ``<role>.predictions.slp`` (must already exist,
-    e.g. from :func:`run_session`) rather than rerunning inference. See
-    :func:`alligaitor.gait.cam_valid_by_paw_from_aligned`.
+    """Per paw, per camera role, whether that camera had a valid 2D detection on each shared-timeline frame.
+
+    Reloads and re-aligns each role's cached ``<role>.predictions.slp`` rather than rerunning inference.
     """
     from alligaitor import gait  # local import: avoids a pipeline<->gait import cycle
 
@@ -229,57 +177,19 @@ def run_group(
 ) -> Path:
     """Run the full pipeline for every session in a group and write its gait-metrics workbook.
 
-    This is the entry point a job queue (see the module docstring in
-    :mod:`alligaitor.gait`) should call per queued group: it triangulates
-    every session, computes gait metrics for each from its 3D trajectory,
-    and writes one Excel workbook for the group with one tab per distinct
-    ``rat_id``.
+    Triangulates every session, computes gait metrics from each 3D trajectory, and writes one
+    Excel workbook for the group with one tab per distinct ``rat_id``.
 
     Args:
         progress_callback: If given, called as
-            ``progress_callback(session.name, sessions_done, sessions_total)``
-            immediately after each session finishes (inference,
-            triangulation, and gait metrics -- everything but the final
-            group-wide workbook write, which only happens once at the
-            end). Lets a GUI job queue show per-session progress without
-            this function needing to know anything about how progress is
-            displayed.
-        log: Forwarded to :func:`run_session` for each session -- discrete
-            one-off messages, not the live per-video progress line.
-        progress: Forwarded to :func:`run_session` -- the live tqdm-style
-            progress line from whichever camera role is currently running
-            inference. This is what makes a long-running session's
-            inference stage visible while it's happening, rather than
-            the log going quiet for however long it takes (see
-            :func:`alligaitor.inference.run_inference`). Distinct from
-            ``progress_callback`` above, which only fires once *between*
-            sessions, not during one.
-        html_progress: Forwarded to :func:`run_session` -- whether
-            ``progress`` wants HTML-rendered color (a rich-text GUI
-            widget; see :mod:`alligaitor.ansi_html`) or plain text.
-        on_redraw_closed: Forwarded to :func:`run_session` -- called
-            whenever a redrawn progress line's definitive final state
-            has just been sent to ``progress``, so a caller redrawing in
-            place can start the next update fresh instead of immediately
-            overwriting it (matters when a session's inference prints
-            more than one tqdm bar in sequence -- otherwise one bar's
-            true completion flashes for an instant before the next bar's
-            first redraw overwrites it in the same spot).
-        validation_dir: If given, an annotated validation video (see
-            :func:`alligaitor.validation_video.export_validation_video`) is
-            rendered for every session into
-            ``validation_dir/<session.name>.validation.mp4``, reusing the
-            same ``log``/``progress``/``html_progress``/``on_redraw_closed``
-            as inference above -- so rendering shows its own live,
-            tqdm-styled progress line the same way a camera role's
-            inference does, rather than the log going quiet for however
-            long a render takes. Rendering is best-effort: a failure is
-            logged via ``log`` and skipped rather than failing the whole
-            run -- the workbook and every other session's video are still
-            produced. ``None`` (the default) skips video export entirely,
-            as does ``config.skip_validation_videos`` -- a per-group
-            opt-out (see :class:`alligaitor.config.PipelineConfig`) that
-            takes effect even when a ``validation_dir`` is given.
+            ``progress_callback(session.name, sessions_done, sessions_total)`` after each session.
+        log: Forwarded to :func:`run_session` for discrete one-off messages.
+        progress: Forwarded to :func:`run_session` for the live per-video progress line.
+        html_progress: Forwarded to :func:`run_session`; whether ``progress`` wants HTML color or plain text.
+        on_redraw_closed: Forwarded to :func:`run_session`.
+        validation_dir: If given, an annotated validation video is rendered for every session into
+            ``validation_dir/<session.name>.validation.mp4``. Best-effort: a failure is logged and
+            skipped rather than failing the run. ``None`` or ``config.skip_validation_videos`` skips export.
 
     Returns:
         Path to the written gait-metrics workbook.
@@ -296,9 +206,7 @@ def run_group(
             log=log, progress=progress, html_progress=html_progress, on_redraw_closed=on_redraw_closed,
             bottom_fallback=config.bottom_fallback,
         )
-        # One recording can hold several crossings (the rat walks the tunnel,
-        # turns, walks back, turns, walks again). Each is its own trial with
-        # its own direction of travel -- see gait.compute_crossing_metrics.
+        # One recording can hold several crossings, each its own trial with its own travel direction.
         crossings = gait.compute_crossing_metrics(
             csv_path,
             session_name=session.name,

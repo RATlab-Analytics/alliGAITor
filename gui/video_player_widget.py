@@ -1,18 +1,8 @@
 """
 Reusable video-playback widget: frame-by-frame stepping, real-time
-Play/Pause, and Rewind/Fast-Forward acceleration (2x, 5x, 10x -- resetting
-back to a configurable "normal" speed rather than jumping). Used by
-validation_video_dialog.py to play a session's already-annotated
-validation video (see alligaitor/validation_video.py) -- no overlay
-drawing of its own.
-
-Ported from RATlab-NOR's gui/video_player_widget.py: transport controls are
-carried over essentially verbatim (see that module's own docstring for why
-this stays plain OpenCV + Qt paint events rather than QMediaPlayer -- a
-past macOS segfault with threaded video decode). The one real change is
-_ScrubBar -> _MultiRowScrubBar: alliGAITor needs one highlighted range per
-paw, stacked in its own labeled row so overlapping paw windows stay
-visually distinct, rather than NOR's single overlapping-marker line.
+Play/Pause, and Rewind/Fast-Forward acceleration (2x, 5x, 10x, resetting
+back to a configurable "normal" speed rather than jumping). Uses plain
+OpenCV + Qt paint events rather than QMediaPlayer.
 """
 
 from __future__ import annotations
@@ -24,26 +14,20 @@ from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QL
 
 
 def _monospace_font() -> QFont:
-    """A fixed-pitch font via Qt's own font-matching rather than a
-    "font-family: monospace" stylesheet string -- see NOR's original for
-    why (avoids a startup "missing font family" warning on some
-    platforms)."""
+    """Fixed-pitch font via Qt's font-matching, avoiding a startup
+    "missing font family" warning some platforms give for a stylesheet
+    "font-family: monospace" string."""
     font = QFont()
     font.setStyleHint(QFont.Monospace)
     font.setFixedPitch(True)
     return font
 
 
-# Rewind/Fast-Forward acceleration steps -- each successive click in the
-# same direction advances to the next (higher) magnitude, clamped at the
-# last entry; a click in the other direction, or Play/Pause, resets back
-# to the current "normal" speed (see NORMAL_SPEEDS/default_speed).
+# Rewind/Fast-Forward acceleration steps; each same-direction click
+# advances to the next magnitude, clamped at the last entry.
 ACCEL_STEPS = [2.0, 5.0, 10.0]
 
-# Baseline ("normal") forward speed, cycled by the Speed button --
-# independent of Rewind/Fast-Forward's own acceleration. Play/Pause (and
-# switching accel direction) always resets back to whichever of these is
-# currently selected.
+# Baseline forward speed, cycled by the Speed button.
 NORMAL_SPEEDS = [0.25, 0.5, 1.0, 2.0, 4.0]
 
 
@@ -51,14 +35,14 @@ def bgr_frame_to_qimage(frame) -> QImage:
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     h, w = rgb.shape[:2]
     qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
-    return qimg.copy()  # own the buffer -- `rgb` goes out of scope after this call
+    return qimg.copy()  # own the buffer, since `rgb` goes out of scope
 
 
 _SCRUB_MARGIN = 8
 _SCRUB_LABEL_WIDTH = 92
 _SCRUB_ROW_HEIGHT = 22
 _SCRUB_MARKER_WIDTH = 9
-_SCRUB_MARKER_WIDTH_MUTED = 3  # an unusable/flagged segment -- thinner, on top of its already-grayed color
+_SCRUB_MARKER_WIDTH_MUTED = 3  # unusable/flagged segment: thinner
 _SCRUB_TRACK_COLOR = QColor(190, 190, 190)
 _SCRUB_HANDLE_COLOR = QColor(40, 90, 200)
 _SCRUB_HANDLE_BORDER = QColor(20, 50, 120)
@@ -67,18 +51,9 @@ _SCRUB_LABEL_COLOR = QColor(220, 220, 220)
 
 class _MultiRowScrubBar(QWidget):
     """Click/drag horizontal seek bar with one labeled row per paw, each
-    showing that paw's highlighted window(s) (see
-    alligaitor.gait.PawWindow) as colored segments on its own track --
-    rows stack top to bottom rather than overlapping on one line, so e.g.
-    all four paws' windows stay independently readable even when they
-    overlap in time. A row can hold more than one segment -- a
-    multi-crossing recording gives each paw its own window per crossing,
-    and crossings never overlap in frame range (see
-    alligaitor.validation_video's docstring), so multiple segments on one
-    row never collide. A single vertical playhead line spans every row,
-    and clicking/dragging anywhere (regardless of which row's y) seeks,
-    since every row shares the same frame -> x mapping.
-    """
+    showing that paw's highlighted window(s) as colored segments on its
+    own track. A single playhead line spans every row; clicking/dragging
+    anywhere seeks, since every row shares the same frame -> x mapping."""
 
     seek_requested = Signal(int)
 
@@ -101,16 +76,10 @@ class _MultiRowScrubBar(QWidget):
         self.update()
 
     def set_paw_windows(self, rows):
-        """`rows`: iterable of (label, segments), one entry per paw, in
-        the order they should be stacked top to bottom. `segments` is a
-        list of (start_frame, end_frame, QColor, usable) tuples -- one
-        per crossing that has a highlighted window for this paw, normally
-        just one for a single-crossing recording. `usable` draws a
-        thinner segment for a `False` entry (an unusable/flagged
-        crossing), on top of its already-muted color, so a bad crossing
-        reads as visually lighter-weight than a good one at a glance
-        rather than requiring a close look at hue alone. An empty list
-        means nothing to highlight for that paw (never detected at all)."""
+        """`rows`: iterable of (label, segments), stacked top to bottom.
+        `segments` is a list of (start_frame, end_frame, QColor, usable)
+        tuples, one per crossing. `usable=False` draws a thinner segment.
+        An empty list means nothing to highlight for that paw."""
         self.rows = list(rows)
         self._relayout()
         self.update()
@@ -189,8 +158,7 @@ class _MultiRowScrubBar(QWidget):
 
 
 class _PlayerCanvas(QWidget):
-    """Paints the current frame -- no overlay hook needed here, since
-    every alliGAITor caller plays an already-annotated video."""
+    """Paints the current frame; no overlay hook, videos are pre-annotated."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -211,9 +179,8 @@ class _PlayerCanvas(QWidget):
 
 
 class VideoPlayerWidget(QWidget):
-    """Drop into any layout. Owns its own cv2.VideoCapture -- call
-    release() when done with it (e.g. from the host dialog's
-    closeEvent/reject)."""
+    """Drop into any layout. Owns its own cv2.VideoCapture; call
+    release() when done with it."""
 
     frame_changed = Signal(int)
 
@@ -228,7 +195,7 @@ class VideoPlayerWidget(QWidget):
         self.n_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
         self.current_frame_idx = 0
-        self._decoder_next_idx = 0  # what cap.read() will return next, absent a re-seek
+        self._decoder_next_idx = 0  # what cap.read() returns next, absent a re-seek
 
         self.default_speed = 1.0
         self.playback_rate = self.default_speed
@@ -275,11 +242,8 @@ class VideoPlayerWidget(QWidget):
 
         self._space_shortcut = None
         if enable_space_shortcut:
-            # WindowShortcut (not WidgetWithChildrenShortcut) -- this
-            # widget is normally embedded inside a larger dialog alongside
-            # other focusable widgets (e.g. the Flag Paw(s) button) that
-            # are its *siblings*, not descendants -- see NOR's original
-            # for the full reasoning.
+            # WindowShortcut, not WidgetWithChildrenShortcut: this widget
+            # is normally embedded alongside sibling focusable widgets.
             self._space_shortcut = QShortcut(QKeySequence(Qt.Key_Space), self)
             self._space_shortcut.setContext(Qt.WindowShortcut)
             self._space_shortcut.activated.connect(self.toggle_play_pause)
@@ -318,8 +282,7 @@ class VideoPlayerWidget(QWidget):
         self.goto_frame(frame_idx)
 
     def set_paw_windows(self, rows):
-        """Mark each paw's highlighted window on the scrub bar -- see
-        _MultiRowScrubBar.set_paw_windows."""
+        """Mark each paw's highlighted window on the scrub bar."""
         self.scrub_bar.set_paw_windows(rows)
 
     def _update_frame_label(self):
@@ -353,9 +316,8 @@ class VideoPlayerWidget(QWidget):
         self.timer.stop()
 
     def _reset_speed(self):
-        """Drop any Rewind/Fast-Forward acceleration and go back to the
-        current "normal" speed (self.default_speed, set via the Speed
-        button -- 1x unless changed)."""
+        """Drop any Rewind/Fast-Forward acceleration and return to the
+        current normal speed."""
         self._accel_dir = None
         self._accel_idx = -1
         self.playback_rate = self.default_speed
@@ -364,9 +326,7 @@ class VideoPlayerWidget(QWidget):
             self._restart_timer()
 
     def toggle_play_pause(self):
-        """Space and the Play/Pause button both land here -- always
-        resets any Rewind/Fast-Forward acceleration back to the current
-        normal speed, then toggles play/pause."""
+        """Resets any acceleration to normal speed, then toggles play/pause."""
         was_playing = self.playing
         self._reset_speed()
         if was_playing:

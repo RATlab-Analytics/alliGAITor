@@ -1,18 +1,8 @@
-"""
-GUI-side handle for a crop-folder run: the actual work happens in a
-separate OS process, polled via a QTimer rather than a QThread -- see
-crop_worker_process.py's docstring for why.
+"""GUI-side handle for a crop-folder run. The work happens in a separate OS process
+(crop_worker_process.py), polled via a QTimer.
 
-Supports two modes (mutually exclusive):
-  - uniform (x, y): same crop position for every video in input_folder
-    (crop_worker_process.run_crop_worker).
-  - positions=[(video_path, x, y), ...]: a specific position per video
-    (crop_worker_process.run_crop_worker_positions) -- used by
-    CropSetupDialog's "use this position for all remaining" button.
-
-Ported from RATlab-NOR's gui/crop_runner.py unchanged apart from the
-nor_classifier_dir -> tools_dir rename (see crop_worker_process.py).
-"""
+Supports two mutually exclusive modes: a uniform (x, y) for every video in input_folder, or
+positions=[(video_path, x, y), ...] for a specific position per video."""
 
 from __future__ import annotations
 
@@ -26,9 +16,9 @@ from crop_worker_process import run_crop_worker, run_crop_worker_positions
 class CropRunner(QObject):
     log = Signal(str)
     progress = Signal(int, int)          # done, total
-    video_done = Signal(str)             # video_path_str -- only emitted in positions mode
+    video_done = Signal(str)             # video_path_str; only emitted in positions mode
     finished_run = Signal(str, str)      # status ("done"/"failed"/"canceled"), message
-    finished = Signal()                  # fires once the worker process has fully exited
+    finished = Signal()                  # worker process has fully exited
 
     def __init__(self, tools_dir, input_folder, output_folder, width, height,
                  x=None, y=None, positions=None, parent=None, color_grade=False,
