@@ -125,6 +125,12 @@ Once your job has finished, double-click on it to open the validation report. Th
 will show you which videos were unable to produce usable data. If you have generated
 validation videos, you can watch them by double-clicking on a session.
 
+## AI Notice
+
+This app was built with the help of Claude Sonnet 5 and Opus 5 (Anthropic PBC). Design
+was directed by a human author and all functionality and output was tested for 
+reliability and accuracy by human reviewers.
+
 ## License
 
 Copyright (C) 2026 Mitchell Carson
