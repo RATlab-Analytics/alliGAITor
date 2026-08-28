@@ -14,10 +14,11 @@ ICONS_DIR = REPO_ROOT / "packaging" / "icons"
 
 # The About dialog reads dependency versions via importlib.metadata, which
 # needs each package's dist-info bundled explicitly -- PyInstaller doesn't
-# include it by default. sleap-nn is optional (run as a subprocess, not
-# imported), so it's skipped if not installed in the build environment.
+# include it by default. sleap-nn isn't listed here: it runs as an external
+# subprocess, not an import of this interpreter, so it's checked via PATH
+# + `sleap-nn --version` instead (see gui/about_dialog.py).
 METADATA_PACKAGES = [
-    "aniposelib", "sleap-nn", "sleap-io", "numpy", "pandas", "openpyxl",
+    "aniposelib", "sleap-io", "numpy", "pandas", "openpyxl",
     "PyYAML", "PySide6", "opencv-python", "imageio-ffmpeg",
 ]
 metadata_datas = []
@@ -40,6 +41,11 @@ FLAT_MODULES = [
 
 hiddenimports = list(FLAT_MODULES)
 hiddenimports += collect_submodules("alligaitor")
+# sleap_io lazy-loads its io/model/codecs/rendering submodules via the
+# lazy_loader package (see sleap_io/__init__.py's lazy.attach() call), which
+# resolves them dynamically at runtime through __getattr__ -- invisible to
+# PyInstaller's static import analysis, so they're never otherwise bundled.
+hiddenimports += collect_submodules("sleap_io")
 
 if sys.platform == "darwin":
     icon_file = str(ICONS_DIR / "alligaitor.icns")
