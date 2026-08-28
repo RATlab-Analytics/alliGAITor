@@ -5,12 +5,27 @@
 import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_submodules, copy_metadata
 
 REPO_ROOT = Path(SPECPATH).resolve().parent
 GUI_DIR = REPO_ROOT / "gui"
 TOOLS_DIR = REPO_ROOT / "tools"
 ICONS_DIR = REPO_ROOT / "packaging" / "icons"
+
+# The About dialog reads dependency versions via importlib.metadata, which
+# needs each package's dist-info bundled explicitly -- PyInstaller doesn't
+# include it by default. sleap-nn is optional (run as a subprocess, not
+# imported), so it's skipped if not installed in the build environment.
+METADATA_PACKAGES = [
+    "aniposelib", "sleap-nn", "sleap-io", "numpy", "pandas", "openpyxl",
+    "PyYAML", "PySide6", "opencv-python", "imageio-ffmpeg",
+]
+metadata_datas = []
+for pkg in METADATA_PACKAGES:
+    try:
+        metadata_datas += copy_metadata(pkg)
+    except Exception:
+        pass
 
 # gui/ and tools/ import each other with flat module names (see gui/__init__.py),
 # so PyInstaller's static analysis needs these listed explicitly.
@@ -37,7 +52,7 @@ a = Analysis(
     [str(GUI_DIR / "app.py")],
     pathex=[str(REPO_ROOT), str(GUI_DIR), str(TOOLS_DIR)],
     binaries=[],
-    datas=[(str(ICONS_DIR / "alligaitor_256.png"), "packaging/icons")],
+    datas=[(str(ICONS_DIR / "alligaitor_256.png"), "packaging/icons")] + metadata_datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
